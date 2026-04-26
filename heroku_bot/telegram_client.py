@@ -176,6 +176,57 @@ class TelegramService:
         await self.ensure_peer_cached(chat_id)
         return await self.read_call("resolve_peer", lambda: self.app.resolve_peer(chat_id))
 
+    async def copy_message_to_topic(
+        self,
+        chat_id: int | str,
+        from_chat_id: int | str,
+        topic_id: int,
+        message_id: int,
+    ):
+        await self.ensure_peer_cached(chat_id)
+        return await self.write_call(
+            "copy_message_to_topic",
+            lambda: self.app.copy_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                reply_to_message_id=topic_id,
+            ),
+        )
+
+    async def download_media_to_path(
+        self,
+        message: Message,
+        target_path: Path | str,
+        progress=None,
+    ) -> str:
+        return await self.write_call(
+            "download_media",
+            lambda: self.app.download_media(
+                message,
+                file_name=str(target_path),
+                progress=progress,
+            ),
+        )
+
+    async def send_file_to_topic(
+        self,
+        chat_id: int,
+        topic_id: int,
+        file_path: Path,
+        caption: str | None = None,
+    ) -> Message:
+        await self.ensure_peer_cached(chat_id)
+        return await self.write_call(
+            "send_file_to_topic",
+            lambda: self.app.send_document(
+                chat_id=chat_id,
+                document=str(file_path),
+                caption=caption,
+                reply_to_message_id=topic_id,
+            ),
+        )
+
     async def get_chat(self, chat_id: int | str) -> Chat:
         await self.ensure_peer_cached(chat_id)
         return await self.read_call("get_chat", lambda: self.app.get_chat(chat_id))

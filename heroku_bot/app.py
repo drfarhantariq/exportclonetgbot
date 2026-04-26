@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -232,7 +233,9 @@ def _bundle_help_text() -> str:
         "[--limit N] [--delay-sec S] [--batch-size N] [--message-ids 1,2,3] [--dry-run] "
         "[--continue-on-error] [--hide-sender-name]\n"
         "/clone last or /clone resume\n"
-        "/status"
+        "/status\n"
+        "/cancel\n"
+        "/restart"
     )
 
 
@@ -260,10 +263,64 @@ def _normalize_clone_command(command_text: str) -> str:
     return stripped
 
 
+ACTIVE_CLONE_TASK: asyncio.Task | None = None
+ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
+
+
 def _format_status_payload(payload: dict[str, Any] | None) -> str:
     if payload is None:
         return "None"
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _format_clone_status(state: dict[str, Any]) -> str:
+    parts = []
+    phase = state.get("phase", "unknown")
+    parts.append(f"Phase: {phase.title()}")
+
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
+    source = payload.get("source_link", "n/a")
+    dest = payload.get("destination_link", "n/a")
+    parts.append(f"Source: {source}")
+    parts.append(f"Destination: {dest}")
+
+    if phase in {"running", "queued"}:
+        parts.append(
+            f"Progress: {state.get('current_index', 0)}/{state.get('total_messages', 0)}"
+        )
+        parts.append(
+            f"Success: {state.get('success', 0)} | Failed: {state.get('failed', 0)}"
+        )
+        current_message_id = state.get("current_message_id")
+        if current_message_id:
+            parts.append(f"Current message: {current_message_id}")
+        if state.get("error"):
+            parts.append(f"Last error: {state.get('error')}")
+        if phase == "running":
+            parts.append("Cancel: /cancel")
+    else:
+        if state.get("success") is not None or state.get("failed") is not None:
+            parts.append(
+                f"Success: {state.get('success', 0)} | Failed: {state.get('failed', 0)}"
+            )
+        if state.get("error"):
+            parts.append(f"Error: {state.get('error')}")
+
+    started_at = state.get("started_at")
+    updated_at = state.get("updated_at")
+    if started_at is not None:
+        parts.append(f"Started: {time.ctime(float(started_at))}")
+    if updated_at is not None:
+        parts.append(f"Updated: {time.ctime(float(updated_at))}")
+
+    return "\n".join(parts)
+
+
+async def _save_clone_state(store: MongoStateStore, label: str, state: dict[str, Any]) -> None:
+    try:
+        await store.save(f"clone:{label}", state)
+    except Exception:
+        _write_json_file(_snapshot_path(f"clone_{label}"), state)
 
 
 async def _run_export_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
@@ -296,7 +353,17 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
 
 
 async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
-    await store.save("clone:last", {"phase": "queued", "payload": payload})
+    global ACTIVE_CLONE_TASK, ACTIVE_CLONE_CANCEL_EVENT
+
+    ACTIVE_CLONE_CANCEL_EVENT = asyncio.Event()
+    ACTIVE_CLONE_TASK = asyncio.current_task()
+
+    async def _save_state_inner(state: dict[str, Any]) -> None:
+        wrapper = dict(state)
+        wrapper["payload"] = payload
+        await _save_clone_state(store, "last", wrapper)
+
+    await _save_clone_state(store, "last", {"phase": "queued", "payload": payload})
     status = await message.reply_text("Clone started.")
     try:
         success, failed = await run_clone(
@@ -311,18 +378,41 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             dry_run=bool(payload["dry_run"]),
             continue_on_error=bool(payload["continue_on_error"]),
             hide_sender_name=bool(payload["hide_sender_name"]),
+            status_callback=_save_state_inner,
+            cancel_event=ACTIVE_CLONE_CANCEL_EVENT,
         )
+    except asyncio.CancelledError:
+        await _save_clone_state(
+            store,
+            "last",
+            {
+                "phase": "cancelled",
+                "payload": payload,
+                "error": "Cancelled by user",
+            },
+        )
+        await status.edit_text("Clone cancelled.")
+        raise
     except Exception as exc:
-        await store.save(
-            "clone:last",
+        await _save_clone_state(
+            store,
+            "last",
             {"phase": "failed", "payload": payload, "error": str(exc)},
         )
         await status.edit_text(f"Clone failed: {exc}")
         raise
     else:
-        result = {"phase": "completed", "payload": payload, "success": success, "failed": failed}
-        await store.save("clone:last", result)
+        result = {
+            "phase": "completed",
+            "payload": payload,
+            "success": success,
+            "failed": failed,
+        }
+        await _save_clone_state(store, "last", result)
         await status.edit_text(f"Clone complete. Success: {success}, Failed: {failed}")
+    finally:
+        ACTIVE_CLONE_TASK = None
+        ACTIVE_CLONE_CANCEL_EVENT = None
 
 
 async def run_bot() -> None:
@@ -384,8 +474,41 @@ async def run_bot() -> None:
             return
         export_state = await store.load("export:last")
         clone_state = await store.load("clone:last")
-        payload = {"export": export_state, "clone": clone_state}
-        await message.reply_text(_format_status_payload(payload))
+        messages = []
+        if clone_state:
+            messages.append("<b>Clone Status</b>")
+            messages.append(_format_clone_status(clone_state))
+        else:
+            messages.append("No saved clone state.")
+        if export_state:
+            messages.append("\n<b>Export Status</b>")
+            messages.append(_format_status_payload(export_state))
+        await message.reply_text("\n\n".join(messages), parse_mode="html")
+
+    @bot.on_message(filters.private & filters.command("cancel", prefixes="/"))
+    async def cancel_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+        if ACTIVE_CLONE_CANCEL_EVENT is None or ACTIVE_CLONE_CANCEL_EVENT.is_set():
+            await message.reply_text("No active clone task to cancel.")
+            return
+        ACTIVE_CLONE_CANCEL_EVENT.set()
+        if ACTIVE_CLONE_TASK is not None and not ACTIVE_CLONE_TASK.done():
+            ACTIVE_CLONE_TASK.cancel()
+        await message.reply_text("Clone cancellation requested.")
+
+    @bot.on_message(filters.private & filters.command("restart", prefixes="/"))
+    async def restart_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+        await message.reply_text("Restarting bot now...")
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     @bot.on_message(filters.private & filters.command("export", prefixes="/"))
     async def export_handler(client, message) -> None:

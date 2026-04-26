@@ -6,12 +6,17 @@ import json
 import logging
 import os
 import shlex
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from secrets import token_hex
+from time import time
+from typing import Any, Awaitable, Callable, Optional
 from urllib import error, request
 
 from pyrogram import Client, filters
+from pyrogram.errors import ChatForwardsRestricted
 
 from config import ConfigError, load_settings
 from message_classifier import (
@@ -63,6 +68,26 @@ def _parse_ids_csv(raw: str) -> list[int]:
 
 def _ensure_runtime_dirs() -> None:
     HEROKU_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+StatusCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+async def _save_clone_status(
+    status_callback: Optional[StatusCallback],
+    phase: str,
+    payload: dict[str, Any],
+    **extra: Any,
+) -> None:
+    if status_callback is None:
+        return
+    state = dict(payload)
+    state["phase"] = phase
+    state["updated_at"] = time.time()
+    if "started_at" not in state and phase == "running":
+        state["started_at"] = state["updated_at"]
+    state.update(extra)
+    await status_callback(state)
 
 
 def _snapshot_path(name: str) -> Path:
@@ -242,6 +267,77 @@ def _resolve_endpoints(
     )
 
 
+async def _clone_message_with_hidden_sender(
+    telegram: TelegramService,
+    endpoints: CloneEndpoints,
+    source_message: Any,
+) -> bool:
+    if source_message is None or getattr(source_message, "empty", False):
+        raise RuntimeError("Source message is missing")
+
+    classification = classify_message(source_message)
+    if classification.kind == MessageKind.TEXT:
+        text, entities, disable_preview = extract_text_payload(source_message)
+        await telegram.send_text_to_topic(
+            endpoints.destination_chat_id,
+            endpoints.destination_topic_id,
+            text=text,
+            entities=entities,
+            disable_web_page_preview=disable_preview,
+        )
+        return True
+
+    if classification.kind == MessageKind.DIRECT_MEDIA:
+        file_id = extract_reusable_file_id(source_message)
+        caption, caption_entities = extract_caption_payload(source_message)
+        if file_id:
+            try:
+                await telegram.send_cached_media_to_topic(
+                    endpoints.destination_chat_id,
+                    endpoints.destination_topic_id,
+                    file_id=file_id,
+                    caption=caption,
+                    caption_entities=caption_entities,
+                )
+                return True
+            except ChatForwardsRestricted:
+                pass
+            except Exception:
+                logging.getLogger("topic_clone").warning(
+                    "send_cached_media_to_topic failed, falling back to download",
+                    exc_info=True,
+                )
+
+    return False
+
+
+async def _download_and_upload_message(
+    telegram: TelegramService,
+    source_message: Any,
+    endpoints: CloneEndpoints,
+) -> None:
+    if source_message is None or getattr(source_message, "empty", False):
+        raise RuntimeError("Source message is missing")
+
+    caption, _ = extract_caption_payload(source_message)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        download_path = Path(temp_dir)
+        download_result = await telegram.download_media_to_path(
+            source_message,
+            download_path,
+        )
+        if not download_result:
+            raise RuntimeError("Failed to download restricted media")
+
+        downloaded_file = Path(download_result)
+        await telegram.send_file_to_topic(
+            endpoints.destination_chat_id,
+            endpoints.destination_topic_id,
+            downloaded_file,
+            caption=caption,
+        )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -338,44 +434,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _clone_message_with_hidden_sender(
-    telegram: TelegramService,
-    endpoints: CloneEndpoints,
-    source_message_id: int,
-) -> bool:
-    source_message = await telegram.get_message(endpoints.source_chat_id, source_message_id)
-    if source_message is None or getattr(source_message, "empty", False):
-        raise RuntimeError(f"Source message {source_message_id} is missing")
-
-    classification = classify_message(source_message)
-
-    if classification.kind == MessageKind.TEXT:
-        text, entities, disable_preview = extract_text_payload(source_message)
-        await telegram.send_text_to_topic(
-            endpoints.destination_chat_id,
-            endpoints.destination_topic_id,
-            text=text,
-            entities=entities,
-            disable_web_page_preview=disable_preview,
-        )
-        return True
-
-    if classification.kind == MessageKind.DIRECT_MEDIA:
-        file_id = extract_reusable_file_id(source_message)
-        if not file_id:
-            raise RuntimeError("No reusable file_id found for media message")
-        caption, caption_entities = extract_caption_payload(source_message)
-        await telegram.send_cached_media_to_topic(
-            endpoints.destination_chat_id,
-            endpoints.destination_topic_id,
-            file_id=file_id,
-            caption=caption,
-            caption_entities=caption_entities,
-        )
-        return True
-
-    return False
-
 
 async def _clone_topic_messages(
     telegram: TelegramService,
@@ -388,6 +446,8 @@ async def _clone_topic_messages(
     dry_run: bool,
     continue_on_error: bool,
     hide_sender_name: bool,
+    status_callback: Optional[StatusCallback] = None,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> tuple[int, int]:
     if batch_size <= 0:
         raise RuntimeError("batch-size must be > 0")
@@ -410,47 +470,116 @@ async def _clone_topic_messages(
             source_ids = source_ids[:limit]
 
     if not source_ids:
+        await _save_clone_status(
+            status_callback,
+            "running",
+            payload,
+            current_index=0,
+            total_messages=0,
+            success=0,
+            failed=0,
+            current_message_id=None,
+        )
         return (0, 0)
 
     success = 0
     failed = 0
+    total_messages = len(source_ids)
+    await _save_clone_status(
+        status_callback,
+        "running",
+        payload,
+        current_index=0,
+        total_messages=total_messages,
+        success=0,
+        failed=0,
+        current_message_id=None,
+    )
 
     for index, source_message_id in enumerate(source_ids, start=1):
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError("Clone cancelled by user")
+
+        source_message = None
         try:
             if dry_run:
                 print(
-                    f"[DRY RUN] {index}/{len(source_ids)} copy "
+                    f"[DRY RUN] {index}/{total_messages} copy "
                     f"{endpoints.source_chat_id}:{source_message_id} -> "
                     f"{endpoints.destination_chat_id}:{endpoints.destination_topic_id}"
                 )
             else:
                 copied_with_hidden_sender = False
                 if hide_sender_name:
+                    source_message = await telegram.get_message(
+                        endpoints.source_chat_id,
+                        source_message_id,
+                    )
                     copied_with_hidden_sender = await _clone_message_with_hidden_sender(
                         telegram,
                         endpoints,
-                        source_message_id,
+                        source_message,
                     )
 
                 if not copied_with_hidden_sender:
-                    await telegram.write_call(
-                        "copy_message_to_topic",
-                        lambda message_id=source_message_id: telegram.app.copy_message(
+                    try:
+                        await telegram.copy_message_to_topic(
                             chat_id=endpoints.destination_chat_id,
                             from_chat_id=endpoints.source_chat_id,
-                            message_id=message_id,
-                            reply_to_message_id=endpoints.destination_topic_id,
-                        ),
-                    )
-                print(f"[{index}/{len(source_ids)}] cloned source message {source_message_id}")
+                            topic_id=endpoints.destination_topic_id,
+                            message_id=source_message_id,
+                        )
+                    except ChatForwardsRestricted:
+                        if source_message is None:
+                            source_message = await telegram.get_message(
+                                endpoints.source_chat_id,
+                                source_message_id,
+                            )
+                        await _download_and_upload_message(
+                            telegram,
+                            source_message,
+                            endpoints,
+                        )
+                print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
             success += 1
+            await _save_clone_status(
+                status_callback,
+                "running",
+                payload,
+                current_index=index,
+                total_messages=total_messages,
+                success=success,
+                failed=failed,
+                current_message_id=source_message_id,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             failed += 1
-            print(f"[{index}/{len(source_ids)}] failed for message {source_message_id}: {exc}")
+            logging.getLogger("topic_clone").exception(
+                "clone message failed",
+                extra={
+                    "event": "clone_message_failure",
+                    "message_id": source_message_id,
+                    "error": str(exc),
+                },
+            )
+            await _save_clone_status(
+                status_callback,
+                "running",
+                payload,
+                current_index=index,
+                total_messages=total_messages,
+                success=success,
+                failed=failed,
+                current_message_id=source_message_id,
+                error=str(exc),
+            )
+            print(f"[{index}/{total_messages}] failed for message {source_message_id}: {exc}")
             if not continue_on_error:
                 raise
 
-        has_more = index < len(source_ids)
+        has_more = index < total_messages
         if has_more and not dry_run and delay_sec > 0:
             await asyncio.sleep(delay_sec)
 
@@ -485,6 +614,8 @@ async def run_clone(
     dry_run: bool,
     continue_on_error: bool,
     hide_sender_name: bool,
+    status_callback: Optional[StatusCallback] = None,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> tuple[int, int]:
     try:
         settings, _ = load_settings(config_path)
@@ -513,6 +644,21 @@ async def run_clone(
             dry_run=dry_run,
             continue_on_error=continue_on_error,
             hide_sender_name=hide_sender_name,
+            payload={
+                "source_link": source_link,
+                "destination_link": destination_link,
+                "config_path": config_path,
+                "start_id": start_id,
+                "limit": limit,
+                "delay_sec": delay_sec,
+                "batch_size": batch_size,
+                "message_ids": message_ids,
+                "dry_run": dry_run,
+                "continue_on_error": continue_on_error,
+                "hide_sender_name": hide_sender_name,
+            },
+            status_callback=status_callback,
+            cancel_event=cancel_event,
         )
     finally:
         await telegram.stop()
@@ -550,18 +696,38 @@ async def _run_clone_bot(args: argparse.Namespace) -> int:
         in_memory=True,
     )
 
+    active_clone_task: asyncio.Task | None = None
+    active_cancel_event: asyncio.Event | None = None
+
     async def _authorized(message) -> bool:
         user = getattr(message, "from_user", None)
         user_id = getattr(user, "id", None)
         return isinstance(user_id, int) and user_id in admin_ids
 
     async def _run_spec(message, payload: dict[str, Any], label: str) -> None:
+        nonlocal active_clone_task, active_cancel_event
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
 
-        await store.save(f"clone:{label}", payload)
-        _write_json_file(_snapshot_path(f"clone_{label}"), payload)
+        active_cancel_event = asyncio.Event()
+        active_clone_task = asyncio.current_task()
+
+        async def _save_state(phase: str, extra: dict[str, Any] | None = None) -> None:
+            state = dict(payload)
+            state["phase"] = phase
+            state["updated_at"] = time.time()
+            state["payload"] = payload
+            if phase == "running":
+                state["started_at"] = state.get("started_at", state["updated_at"])
+            if extra:
+                state.update(extra)
+            try:
+                await store.save(f"clone:{label}", state)
+            except Exception:
+                _write_json_file(_snapshot_path(f"clone_{label}"), state)
+
+        await _save_state("queued")
         status = await message.reply_text("Clone started.")
         try:
             success, failed = await run_clone(
@@ -576,12 +742,25 @@ async def _run_clone_bot(args: argparse.Namespace) -> int:
                 dry_run=bool(payload["dry_run"]),
                 continue_on_error=bool(payload["continue_on_error"]),
                 hide_sender_name=bool(payload["hide_sender_name"]),
+                status_callback=lambda state: _save_state("running", state),
+                cancel_event=active_cancel_event,
             )
+        except asyncio.CancelledError:
+            await _save_state("cancelled", {"error": "Cancelled by user"})
+            await status.edit_text("Clone cancelled.")
+            raise
         except Exception as exc:
+            await _save_state("failed", {"error": str(exc)})
             await status.edit_text(f"Clone failed: {exc}")
             raise
         else:
+            await _save_state("completed", {"success": success, "failed": failed})
             await status.edit_text(f"Clone complete. Success: {success}, Failed: {failed}")
+        finally:
+            active_clone_task = None
+            active_cancel_event = None
+
+        return
 
     @bot.on_message(filters.private & filters.command("clone", prefixes="/"))
     async def clone_handler(client, message) -> None:
@@ -620,6 +799,31 @@ async def _run_clone_bot(args: argparse.Namespace) -> int:
             await message.reply_text("No saved clone state.")
             return
         await message.reply_text(json.dumps(payload, indent=2, sort_keys=True))
+
+    @bot.on_message(filters.private & filters.command("cancel", prefixes="/"))
+    async def cancel_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+        if active_cancel_event is None or active_cancel_event.is_set():
+            await message.reply_text("No active clone task to cancel.")
+            return
+        active_cancel_event.set()
+        if active_clone_task is not None and not active_clone_task.done():
+            active_clone_task.cancel()
+        await message.reply_text("Clone cancellation requested.")
+
+    @bot.on_message(filters.private & filters.command("restart", prefixes="/"))
+    async def restart_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+        await message.reply_text("Restarting bot now...")
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     await bot.start()
     print("Clone bot is running.")
