@@ -330,6 +330,17 @@ async def _download_and_upload_message(
             raise RuntimeError("Failed to download restricted media")
 
         downloaded_file = Path(download_result)
+        if downloaded_file.is_dir():
+            files = [p for p in downloaded_file.rglob("*") if p.is_file()]
+            if not files:
+                raise RuntimeError(
+                    f"Failed to find downloaded file inside {downloaded_file}"
+                )
+            downloaded_file = max(files, key=lambda p: p.stat().st_mtime)
+
+        if not downloaded_file.exists() or not downloaded_file.is_file():
+            raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}")
+
         await telegram.send_file_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,

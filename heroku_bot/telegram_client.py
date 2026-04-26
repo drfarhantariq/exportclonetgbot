@@ -190,7 +190,7 @@ class TelegramService:
                 chat_id=chat_id,
                 from_chat_id=from_chat_id,
                 message_id=message_id,
-                reply_to_message_id=topic_id,
+                message_thread_id=topic_id,
             ),
         )
 
@@ -200,7 +200,7 @@ class TelegramService:
         target_path: Path | str,
         progress=None,
     ) -> str:
-        return await self.write_call(
+        result = await self.write_call(
             "download_media",
             lambda: self.app.download_media(
                 message,
@@ -208,6 +208,20 @@ class TelegramService:
                 progress=progress,
             ),
         )
+        if not isinstance(result, str):
+            raise RuntimeError("Unexpected download result type")
+
+        downloaded_path = Path(result)
+        if downloaded_path.is_dir():
+            files = [p for p in downloaded_path.rglob("*") if p.is_file()]
+            if not files:
+                raise RuntimeError(
+                    f"Media download failed: no file found inside {downloaded_path}"
+                )
+            # Prefer the most recently modified file in case multiple files were created.
+            downloaded_path = max(files, key=lambda p: p.stat().st_mtime)
+
+        return str(downloaded_path)
 
     async def send_file_to_topic(
         self,
@@ -216,6 +230,9 @@ class TelegramService:
         file_path: Path,
         caption: str | None = None,
     ) -> Message:
+        if not file_path.exists() or not file_path.is_file():
+            raise RuntimeError(f"Invalid file path for upload: {file_path}")
+
         await self.ensure_peer_cached(chat_id)
         return await self.write_call(
             "send_file_to_topic",
@@ -223,7 +240,7 @@ class TelegramService:
                 chat_id=chat_id,
                 document=str(file_path),
                 caption=caption,
-                reply_to_message_id=topic_id,
+                message_thread_id=topic_id,
             ),
         )
 
@@ -460,7 +477,7 @@ class TelegramService:
                 chat_id=chat_id,
                 text=text,
                 entities=entities,
-                reply_to_message_id=topic_id,
+                message_thread_id=topic_id,
                 disable_web_page_preview=disable_web_page_preview,
             ),
         )
@@ -481,7 +498,7 @@ class TelegramService:
                 file_id=file_id,
                 caption=caption,
                 caption_entities=caption_entities,
-                reply_to_message_id=topic_id,
+                message_thread_id=topic_id,
             ),
         )
 
@@ -499,7 +516,7 @@ class TelegramService:
                 chat_id=chat_id,
                 document=str(document_path),
                 caption=caption,
-                reply_to_message_id=topic_id,
+                message_thread_id=topic_id,
             ),
         )
 
