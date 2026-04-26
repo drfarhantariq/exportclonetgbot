@@ -1,0 +1,7 @@
+Pyrogram==2.0.106
+PyYAML==6.0.2
+python-dotenv==1.0.1
+aiosqlite==0.20.0
+keyboard==0.13.5
+psutil==7.0.0
+pymongo==4.11.1

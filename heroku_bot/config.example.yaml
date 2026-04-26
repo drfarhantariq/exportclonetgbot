@@ -1,0 +1,4 @@
+# Minimal config for the Heroku bot bundle.
+# The combined bot only needs this file to exist.
+# Keep mappings empty unless you reuse the bundle with the rest of the app.
+mappings: []

@@ -1,0 +1,6 @@
+mappings:
+  - source_chat_id: -1003412645532
+    source_topic_id: 104378
+    destination_chat_id: -1003541699273
+    destination_topic_id: 13366
+    enabled: true
