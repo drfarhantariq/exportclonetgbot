@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from secrets import token_hex
-from time import time
+import time
 from typing import Any, Awaitable, Callable, Optional
 from urllib import error, request
 
