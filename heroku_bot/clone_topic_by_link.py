@@ -446,6 +446,7 @@ async def _clone_topic_messages(
     dry_run: bool,
     continue_on_error: bool,
     hide_sender_name: bool,
+    payload: dict[str, Any],
     status_callback: Optional[StatusCallback] = None,
     cancel_event: Optional[asyncio.Event] = None,
 ) -> tuple[int, int]:
