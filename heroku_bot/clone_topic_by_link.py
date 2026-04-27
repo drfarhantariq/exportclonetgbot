@@ -319,7 +319,26 @@ async def _download_and_upload_message(
     if source_message is None or getattr(source_message, "empty", False):
         raise RuntimeError("Source message is missing")
 
-    caption, _ = extract_caption_payload(source_message)
+    classification = classify_message(source_message)
+    caption, caption_entities = extract_caption_payload(source_message)
+
+    # Protected text-only messages cannot be downloaded; repost text directly.
+    if classification.kind == MessageKind.TEXT:
+        text, entities, disable_preview = extract_text_payload(source_message)
+        await telegram.send_text_to_topic(
+            endpoints.destination_chat_id,
+            endpoints.destination_topic_id,
+            text=text,
+            entities=entities,
+            disable_web_page_preview=disable_preview,
+        )
+        return
+
+    if not getattr(source_message, "media", None):
+        raise RuntimeError(
+            f"Restricted message type is unsupported for fallback upload: {classification.kind.value}"
+        )
+
     with tempfile.TemporaryDirectory() as temp_dir:
         download_path = Path(temp_dir)
         download_result = await telegram.download_media_to_path(
@@ -341,12 +360,35 @@ async def _download_and_upload_message(
         if not downloaded_file.exists() or not downloaded_file.is_file():
             raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}")
 
-        await telegram.send_file_to_topic(
+        await telegram.send_downloaded_media_to_topic(
+            chat_id=endpoints.destination_chat_id,
+            topic_id=endpoints.destination_topic_id,
+            source_message=source_message,
+            file_path=downloaded_file,
+            caption=caption,
+            caption_entities=caption_entities,
+        )
+
+
+async def _clone_restricted_message(
+    telegram: TelegramService,
+    endpoints: CloneEndpoints,
+    source_message: Any,
+) -> None:
+    classification = classify_message(source_message)
+
+    if classification.kind == MessageKind.TEXT:
+        text, entities, disable_preview = extract_text_payload(source_message)
+        await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
-            downloaded_file,
-            caption=caption,
+            text=text,
+            entities=entities,
+            disable_web_page_preview=disable_preview,
         )
+        return
+
+    await _download_and_upload_message(telegram, source_message, endpoints)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -547,10 +589,10 @@ async def _clone_topic_messages(
                                 endpoints.source_chat_id,
                                 source_message_id,
                             )
-                        await _download_and_upload_message(
+                        await _clone_restricted_message(
                             telegram,
-                            source_message,
                             endpoints,
+                            source_message,
                         )
                 print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
             success += 1

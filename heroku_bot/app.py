@@ -316,6 +316,30 @@ def _format_clone_status(state: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _format_clone_status_compact(state: dict[str, Any]) -> str:
+    phase = str(state.get("phase", "unknown")).lower()
+    current = int(state.get("current_index", 0) or 0)
+    total = int(state.get("total_messages", 0) or 0)
+    success = int(state.get("success", 0) or 0)
+    failed = int(state.get("failed", 0) or 0)
+    current_message_id = state.get("current_message_id")
+
+    if phase == "running":
+        return (
+            f"Live: {current}/{total} | Forwarded: {success} | Failed: {failed} "
+            f"| Current: {current_message_id or '-'}"
+        )
+    if phase == "queued":
+        return "Live: queued"
+    if phase == "completed":
+        return f"Live: completed | Forwarded: {success} | Failed: {failed}"
+    if phase == "cancelled":
+        return f"Live: cancelled at {current}/{total} | Forwarded: {success} | Failed: {failed}"
+    if phase == "failed":
+        return f"Live: failed at {current}/{total} | Forwarded: {success} | Failed: {failed}"
+    return f"Live: {phase} | Forwarded: {success} | Failed: {failed}"
+
+
 async def _save_clone_state(store: MongoStateStore, label: str, state: dict[str, Any]) -> None:
     try:
         await store.save(f"clone:{label}", state)
@@ -358,10 +382,76 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     ACTIVE_CLONE_CANCEL_EVENT = asyncio.Event()
     ACTIVE_CLONE_TASK = asyncio.current_task()
 
+    last_status_edit_at = 0.0
+    last_reported_success = -1
+    last_reported_index = -1
+    status_update_lock = asyncio.Lock()
+
+    def _format_status_text(state: dict[str, Any]) -> str:
+        phase = state.get("phase", "running")
+        if phase == "queued":
+            return "Clone queued. Waiting to start..."
+
+        total = state.get("total_messages", 0)
+        current = state.get("current_index", 0)
+        success = state.get("success", 0)
+        failed = state.get("failed", 0)
+        current_message_id = state.get("current_message_id")
+
+        if phase == "completed":
+            return (
+                f"Clone complete. Forwarded successfully: {success}, Failed: {failed}."
+            )
+        if phase == "cancelled":
+            return (
+                f"Clone cancelled. Progress: {current}/{total} "
+                f"(forwarded={success}, failed={failed})."
+            )
+        if phase == "failed":
+            return (
+                f"Clone failed after {current}/{total}. "
+                f"forwarded={success}, failed={failed}. "
+                f"Error: {state.get('error', 'unknown')}"
+            )
+        return (
+            f"Cloning messages: {current}/{total}\n"
+            f"Forwarded successfully: {success}\n"
+            f"Failed: {failed}\n"
+            f"Current source message: {current_message_id}"
+        )
+
     async def _save_state_inner(state: dict[str, Any]) -> None:
+        nonlocal last_status_edit_at, last_reported_success, last_reported_index
         wrapper = dict(state)
         wrapper["payload"] = payload
         await _save_clone_state(store, "last", wrapper)
+
+        now = time.time()
+        phase = str(wrapper.get("phase", "running"))
+        success = int(wrapper.get("success", 0) or 0)
+        current_index = int(wrapper.get("current_index", 0) or 0)
+
+        success_changed = success != last_reported_success
+        progress_changed = current_index != last_reported_index
+
+        should_edit = (
+            phase != "running"
+            or (success_changed and now - last_status_edit_at >= 1.5)
+            or (progress_changed and now - last_status_edit_at >= 2.0)
+            or now - last_status_edit_at >= 10
+        )
+        if not should_edit:
+            return
+
+        async with status_update_lock:
+            try:
+                await status.edit_text(_format_status_text(wrapper))
+            except Exception:
+                pass
+            else:
+                last_status_edit_at = now
+                last_reported_success = success
+                last_reported_index = current_index
 
     await _save_clone_state(store, "last", {"phase": "queued", "payload": payload})
     status = await message.reply_text("Clone started.")
@@ -477,6 +567,7 @@ async def run_bot() -> None:
         messages = []
         if clone_state:
             messages.append("<b>Clone Status</b>")
+            messages.append(_format_clone_status_compact(clone_state))
             messages.append(_format_clone_status(clone_state))
         else:
             messages.append("No saved clone state.")

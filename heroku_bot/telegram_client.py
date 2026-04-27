@@ -190,7 +190,7 @@ class TelegramService:
                 chat_id=chat_id,
                 from_chat_id=from_chat_id,
                 message_id=message_id,
-                message_thread_id=topic_id,
+                reply_to_message_id=topic_id,
             ),
         )
 
@@ -240,7 +240,108 @@ class TelegramService:
                 chat_id=chat_id,
                 document=str(file_path),
                 caption=caption,
-                message_thread_id=topic_id,
+                reply_to_message_id=topic_id,
+            ),
+        )
+
+    async def send_downloaded_media_to_topic(
+        self,
+        chat_id: int,
+        topic_id: int,
+        source_message: Message,
+        file_path: Path,
+        caption: str | None = None,
+        caption_entities=None,
+    ) -> Message:
+        if not file_path.exists() or not file_path.is_file():
+            raise RuntimeError(f"Invalid file path for upload: {file_path}")
+
+        await self.ensure_peer_cached(chat_id)
+
+        try:
+            if source_message.photo:
+                return await self.write_call(
+                    "send_downloaded_photo_to_topic",
+                    lambda: self.app.send_photo(
+                        chat_id=chat_id,
+                        photo=str(file_path),
+                        caption=caption,
+                        caption_entities=caption_entities,
+                        reply_to_message_id=topic_id,
+                    ),
+                )
+
+            if source_message.video:
+                return await self.write_call(
+                    "send_downloaded_video_to_topic",
+                    lambda: self.app.send_video(
+                        chat_id=chat_id,
+                        video=str(file_path),
+                        caption=caption,
+                        caption_entities=caption_entities,
+                        reply_to_message_id=topic_id,
+                    ),
+                )
+
+            if source_message.animation:
+                return await self.write_call(
+                    "send_downloaded_animation_to_topic",
+                    lambda: self.app.send_animation(
+                        chat_id=chat_id,
+                        animation=str(file_path),
+                        caption=caption,
+                        caption_entities=caption_entities,
+                        reply_to_message_id=topic_id,
+                    ),
+                )
+
+            if source_message.audio:
+                return await self.write_call(
+                    "send_downloaded_audio_to_topic",
+                    lambda: self.app.send_audio(
+                        chat_id=chat_id,
+                        audio=str(file_path),
+                        caption=caption,
+                        caption_entities=caption_entities,
+                        reply_to_message_id=topic_id,
+                    ),
+                )
+
+            if source_message.voice:
+                return await self.write_call(
+                    "send_downloaded_voice_to_topic",
+                    lambda: self.app.send_voice(
+                        chat_id=chat_id,
+                        voice=str(file_path),
+                        caption=caption,
+                        caption_entities=caption_entities,
+                        reply_to_message_id=topic_id,
+                    ),
+                )
+
+            if source_message.sticker:
+                return await self.write_call(
+                    "send_downloaded_sticker_to_topic",
+                    lambda: self.app.send_sticker(
+                        chat_id=chat_id,
+                        sticker=str(file_path),
+                        reply_to_message_id=topic_id,
+                    ),
+                )
+        except Exception:
+            self.logger.warning(
+                "typed media upload failed, falling back to document upload",
+                exc_info=True,
+            )
+
+        return await self.write_call(
+            "send_downloaded_document_to_topic",
+            lambda: self.app.send_document(
+                chat_id=chat_id,
+                document=str(file_path),
+                caption=caption,
+                caption_entities=caption_entities,
+                reply_to_message_id=topic_id,
             ),
         )
 
@@ -477,7 +578,7 @@ class TelegramService:
                 chat_id=chat_id,
                 text=text,
                 entities=entities,
-                message_thread_id=topic_id,
+                reply_to_message_id=topic_id,
                 disable_web_page_preview=disable_web_page_preview,
             ),
         )
@@ -498,7 +599,7 @@ class TelegramService:
                 file_id=file_id,
                 caption=caption,
                 caption_entities=caption_entities,
-                message_thread_id=topic_id,
+                reply_to_message_id=topic_id,
             ),
         )
 
@@ -516,7 +617,7 @@ class TelegramService:
                 chat_id=chat_id,
                 document=str(document_path),
                 caption=caption,
-                message_thread_id=topic_id,
+                reply_to_message_id=topic_id,
             ),
         )
 
