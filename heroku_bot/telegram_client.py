@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from time import monotonic
 from typing import Awaitable, Callable, TypeVar
@@ -609,7 +610,7 @@ class TelegramService:
         process = None
         try:
             process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
+                self._ffmpeg_binary(),
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -693,7 +694,7 @@ class TelegramService:
         process = None
         try:
             process = await asyncio.create_subprocess_exec(
-                "ffprobe",
+                self._ffprobe_binary(),
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -744,6 +745,27 @@ class TelegramService:
             break
 
         return duration, width, height
+
+    @staticmethod
+    def _ffmpeg_binary() -> str:
+        configured = os.getenv("FFMPEG_BINARY", "").strip()
+        if configured:
+            return configured
+        if binary := shutil.which("ffmpeg"):
+            return binary
+        try:
+            import imageio_ffmpeg
+
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return "ffmpeg"
+
+    @staticmethod
+    def _ffprobe_binary() -> str:
+        configured = os.getenv("FFPROBE_BINARY", "").strip()
+        if configured:
+            return configured
+        return shutil.which("ffprobe") or "ffprobe"
 
     async def get_chat(self, chat_id: int | str) -> Chat:
         await self.ensure_peer_cached(chat_id)

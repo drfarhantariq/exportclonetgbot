@@ -7,3 +7,4 @@ keyboard==0.13.5
 psutil==7.0.0
 pymongo==4.11.1
 Pillow==10.4.0
+imageio-ffmpeg==0.5.1

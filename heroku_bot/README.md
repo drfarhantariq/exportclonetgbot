@@ -145,6 +145,8 @@ Video uploads preserve duration and dimensions from the source message. If a sou
 heroku buildpacks:add --index 1 heroku-community/apt -a <your-app-name>
 ```
 
+There is also a `heroku_bot/Aptfile` for deployments where this folder is used as the Heroku app root. The `ffmpeg` apt package includes both `ffmpeg` and `ffprobe`.
+
 The bot also extracts a non-black JPEG thumbnail from the video itself for each video/animation upload, so Telegram does not use a black opening frame. It samples several points through the file and rejects near-black frames. Set `GENERATE_VIDEO_THUMBNAILS=false` to disable this.
 
 ## Heroku Setup (Recommended)
