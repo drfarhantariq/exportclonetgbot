@@ -252,6 +252,7 @@ class TelegramService:
         file_path: Path,
         caption: str | None = None,
         caption_entities=None,
+        progress=None,
     ) -> Message:
         if not file_path.exists() or not file_path.is_file():
             raise RuntimeError(f"Invalid file path for upload: {file_path}")
@@ -268,6 +269,7 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
+                        progress=progress,
                     ),
                 )
 
@@ -280,6 +282,7 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
+                        progress=progress,
                     ),
                 )
 
@@ -292,6 +295,7 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
+                        progress=progress,
                     ),
                 )
 
@@ -304,6 +308,7 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
+                        progress=progress,
                     ),
                 )
 
@@ -316,6 +321,7 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
+                        progress=progress,
                     ),
                 )
 
@@ -326,6 +332,7 @@ class TelegramService:
                         chat_id=chat_id,
                         sticker=str(file_path),
                         reply_to_message_id=topic_id,
+                        progress=progress,
                     ),
                 )
         except Exception:
@@ -342,6 +349,7 @@ class TelegramService:
                 caption=caption,
                 caption_entities=caption_entities,
                 reply_to_message_id=topic_id,
+                progress=progress,
             ),
         )
 

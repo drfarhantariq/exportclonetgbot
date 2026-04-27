@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+from dotenv import load_dotenv
+
 try:
     from pymongo import MongoClient
 except Exception:
     MongoClient = None
 
 BUNDLE_DIR = Path(__file__).resolve().parent
+load_dotenv(BUNDLE_DIR / ".env")
 os.environ.setdefault("HEROKU_RUNTIME_DIR", str(BUNDLE_DIR / "runtime"))
 os.environ.setdefault("ALLOW_EMPTY_MAPPINGS", "true")
 os.environ.setdefault("HEROKU_CONFIG_PATH", str(BUNDLE_DIR / "config.yaml"))
@@ -214,7 +217,7 @@ def _build_clone_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--start-id", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--delay-sec", type=float, default=2.0)
+    parser.add_argument("--delay-sec", type=float, default=0.35)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--message-ids", default="")
     parser.add_argument("--dry-run", action="store_true")
@@ -294,6 +297,21 @@ def _format_clone_status(state: dict[str, Any]) -> str:
         current_message_id = state.get("current_message_id")
         if current_message_id:
             parts.append(f"Current message: {current_message_id}")
+        transfer_stage = state.get("transfer_stage")
+        if transfer_stage:
+            parts.append(f"Transfer stage: {transfer_stage}")
+            parts.append(
+                "Download: "
+                f"{state.get('download_current', 0)}/{state.get('download_total', 0)} "
+                f"at {state.get('download_speed', '0B/s')} "
+                f"(eta {state.get('download_eta', '-')})"
+            )
+            parts.append(
+                "Upload: "
+                f"{state.get('upload_current', 0)}/{state.get('upload_total', 0)} "
+                f"at {state.get('upload_speed', '0B/s')} "
+                f"(eta {state.get('upload_eta', '-')})"
+            )
         if state.get("error"):
             parts.append(f"Last error: {state.get('error')}")
         if phase == "running":
@@ -325,9 +343,14 @@ def _format_clone_status_compact(state: dict[str, Any]) -> str:
     current_message_id = state.get("current_message_id")
 
     if phase == "running":
+        dl_speed = state.get("download_speed")
+        up_speed = state.get("upload_speed")
+        speed_text = ""
+        if dl_speed or up_speed:
+            speed_text = f" | DL: {dl_speed or '0B/s'} | UP: {up_speed or '0B/s'}"
         return (
             f"Live: {current}/{total} | Forwarded: {success} | Failed: {failed} "
-            f"| Current: {current_message_id or '-'}"
+            f"| Current: {current_message_id or '-'}{speed_text}"
         )
     if phase == "queued":
         return "Live: queued"
@@ -417,7 +440,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             f"Cloning messages: {current}/{total}\n"
             f"Forwarded successfully: {success}\n"
             f"Failed: {failed}\n"
-            f"Current source message: {current_message_id}"
+            f"Current source message: {current_message_id}\n"
+            f"Download speed: {state.get('download_speed', '0B/s')} (eta {state.get('download_eta', '-')})\n"
+            f"Upload speed: {state.get('upload_speed', '0B/s')} (eta {state.get('upload_eta', '-')})"
         )
 
     async def _save_state_inner(state: dict[str, Any]) -> None:

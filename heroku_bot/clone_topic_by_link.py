@@ -22,7 +22,6 @@ from config import ConfigError, load_settings
 from message_classifier import (
     classify_message,
     extract_caption_payload,
-    extract_reusable_file_id,
     extract_text_payload,
 )
 from models import MessageKind
@@ -46,6 +45,132 @@ class CloneEndpoints:
     source_start_message_id: int
     destination_chat_id: int
     destination_topic_id: int
+
+
+def _get_readable_file_size(size_in_bytes: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    size = float(size_in_bytes or 0)
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    return f"{size:.2f}{units[unit_index]}"
+
+
+def _get_readable_time(seconds: float) -> str:
+    total = int(max(seconds, 0))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return "".join(parts)
+
+
+@dataclass
+class TransferSnapshot:
+    stage: str
+    current: int
+    total: int
+    speed_bps: float
+    eta_seconds: float | None
+
+
+class WzmlTransferReporter:
+    def __init__(
+        self,
+        *,
+        source_message_id: int,
+        index: int,
+        total_messages: int,
+        success: int,
+        failed: int,
+        payload: dict[str, Any],
+        status_callback: Optional["StatusCallback"],
+    ) -> None:
+        self.source_message_id = source_message_id
+        self.index = index
+        self.total_messages = total_messages
+        self.success = success
+        self.failed = failed
+        self.payload = payload
+        self.status_callback = status_callback
+
+        self._download_started_at = time.time()
+        self._upload_started_at: float | None = None
+        self._download_snapshot = TransferSnapshot("download", 0, 0, 0.0, None)
+        self._upload_snapshot = TransferSnapshot("upload", 0, 0, 0.0, None)
+        self._last_emit_at = 0.0
+
+    def _snapshot(self, stage: str, current: int, total: int) -> TransferSnapshot:
+        now = time.time()
+        started_at = self._download_started_at if stage == "download" else (self._upload_started_at or now)
+        elapsed = max(now - started_at, 1e-3)
+        speed_bps = current / elapsed
+        eta_seconds: float | None
+        if speed_bps > 0 and total > 0 and current <= total:
+            eta_seconds = max((total - current) / speed_bps, 0.0)
+        else:
+            eta_seconds = None
+        return TransferSnapshot(stage=stage, current=current, total=total, speed_bps=speed_bps, eta_seconds=eta_seconds)
+
+    async def _emit(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_emit_at < 1.0:
+            return
+        self._last_emit_at = now
+
+        dl = self._download_snapshot
+        up = self._upload_snapshot
+        dl_eta = _get_readable_time(dl.eta_seconds) if dl.eta_seconds is not None else "-"
+        up_eta = _get_readable_time(up.eta_seconds) if up.eta_seconds is not None else "-"
+
+        print(
+            f"[{self.index}/{self.total_messages}] msg {self.source_message_id} "
+            f"DL {dl.current}/{dl.total} ({_get_readable_file_size(dl.speed_bps)}/s eta={dl_eta}) | "
+            f"UP {up.current}/{up.total} ({_get_readable_file_size(up.speed_bps)}/s eta={up_eta})"
+        )
+
+        await _save_clone_status(
+            self.status_callback,
+            "running",
+            self.payload,
+            current_index=self.index,
+            total_messages=self.total_messages,
+            success=self.success,
+            failed=self.failed,
+            current_message_id=self.source_message_id,
+            transfer_stage="upload" if up.current > 0 else "download",
+            download_current=dl.current,
+            download_total=dl.total,
+            download_speed_bps=dl.speed_bps,
+            download_speed=f"{_get_readable_file_size(dl.speed_bps)}/s",
+            download_eta=dl_eta,
+            upload_current=up.current,
+            upload_total=up.total,
+            upload_speed_bps=up.speed_bps,
+            upload_speed=f"{_get_readable_file_size(up.speed_bps)}/s",
+            upload_eta=up_eta,
+        )
+
+    async def on_download_progress(self, current: int, total: int, *args: Any) -> None:
+        self._download_snapshot = self._snapshot("download", int(current), int(total))
+        await self._emit()
+
+    async def on_upload_progress(self, current: int, total: int, *args: Any) -> None:
+        if self._upload_started_at is None:
+            self._upload_started_at = time.time()
+        self._upload_snapshot = self._snapshot("upload", int(current), int(total))
+        await self._emit()
+
+    async def complete(self) -> None:
+        await self._emit(force=True)
 
 
 def _parse_ids_csv(raw: str) -> list[int]:
@@ -271,6 +396,7 @@ async def _clone_message_with_hidden_sender(
     telegram: TelegramService,
     endpoints: CloneEndpoints,
     source_message: Any,
+    reporter: WzmlTransferReporter | None = None,
 ) -> bool:
     if source_message is None or getattr(source_message, "empty", False):
         raise RuntimeError("Source message is missing")
@@ -288,25 +414,13 @@ async def _clone_message_with_hidden_sender(
         return True
 
     if classification.kind == MessageKind.DIRECT_MEDIA:
-        file_id = extract_reusable_file_id(source_message)
-        caption, caption_entities = extract_caption_payload(source_message)
-        if file_id:
-            try:
-                await telegram.send_cached_media_to_topic(
-                    endpoints.destination_chat_id,
-                    endpoints.destination_topic_id,
-                    file_id=file_id,
-                    caption=caption,
-                    caption_entities=caption_entities,
-                )
-                return True
-            except ChatForwardsRestricted:
-                pass
-            except Exception:
-                logging.getLogger("topic_clone").warning(
-                    "send_cached_media_to_topic failed, falling back to download",
-                    exc_info=True,
-                )
+        await _download_and_upload_message(
+            telegram,
+            source_message,
+            endpoints,
+            reporter=reporter,
+        )
+        return True
 
     return False
 
@@ -315,6 +429,7 @@ async def _download_and_upload_message(
     telegram: TelegramService,
     source_message: Any,
     endpoints: CloneEndpoints,
+    reporter: WzmlTransferReporter | None = None,
 ) -> None:
     if source_message is None or getattr(source_message, "empty", False):
         raise RuntimeError("Source message is missing")
@@ -341,21 +456,54 @@ async def _download_and_upload_message(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         download_path = Path(temp_dir)
+        media = (
+            getattr(source_message, source_message.media.value)
+            if getattr(source_message, "media", None)
+            else None
+        )
+        media_file_name = getattr(media, "file_name", "") if media is not None else ""
+        if media_file_name:
+            target_file = download_path / Path(media_file_name).name
+        else:
+            fallback_ext = ".bin"
+            if getattr(source_message, "photo", None):
+                fallback_ext = ".jpg"
+            elif getattr(source_message, "video", None):
+                fallback_ext = ".mp4"
+            elif getattr(source_message, "audio", None):
+                fallback_ext = ".mp3"
+            elif getattr(source_message, "voice", None):
+                fallback_ext = ".ogg"
+            target_file = download_path / f"{source_message.id}{fallback_ext}"
         download_result = await telegram.download_media_to_path(
             source_message,
-            download_path,
+            target_file,
+            progress=reporter.on_download_progress if reporter else None,
         )
         if not download_result:
             raise RuntimeError("Failed to download restricted media")
 
         downloaded_file = Path(download_result)
         if downloaded_file.is_dir():
-            files = [p for p in downloaded_file.rglob("*") if p.is_file()]
+            files = [p for p in downloaded_file.rglob("*") if p.is_file() and p.suffix.lower() != ".temp"]
+            if not files:
+                files = [p for p in downloaded_file.rglob("*") if p.is_file()]
             if not files:
                 raise RuntimeError(
                     f"Failed to find downloaded file inside {downloaded_file}"
                 )
             downloaded_file = max(files, key=lambda p: p.stat().st_mtime)
+
+        if downloaded_file.suffix.lower() == ".temp":
+            without_temp = downloaded_file.with_suffix("")
+            if without_temp.exists():
+                downloaded_file = without_temp
+            else:
+                try:
+                    downloaded_file.rename(without_temp)
+                    downloaded_file = without_temp
+                except OSError:
+                    pass
 
         if not downloaded_file.exists() or not downloaded_file.is_file():
             raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}")
@@ -367,13 +515,17 @@ async def _download_and_upload_message(
             file_path=downloaded_file,
             caption=caption,
             caption_entities=caption_entities,
+            progress=reporter.on_upload_progress if reporter else None,
         )
+        if reporter is not None:
+            await reporter.complete()
 
 
 async def _clone_restricted_message(
     telegram: TelegramService,
     endpoints: CloneEndpoints,
     source_message: Any,
+    reporter: WzmlTransferReporter | None = None,
 ) -> None:
     classification = classify_message(source_message)
 
@@ -388,7 +540,7 @@ async def _clone_restricted_message(
         )
         return
 
-    await _download_and_upload_message(telegram, source_message, endpoints)
+    await _download_and_upload_message(telegram, source_message, endpoints, reporter=reporter)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -431,8 +583,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delay-sec",
         type=float,
-        default=2.0,
-        help="Delay between cloned messages in seconds (default: 2.0)",
+        default=0.35,
+        help="Delay between cloned messages in seconds (default: 0.35)",
     )
     parser.add_argument(
         "--batch-size",
@@ -569,10 +721,20 @@ async def _clone_topic_messages(
                         endpoints.source_chat_id,
                         source_message_id,
                     )
+                    reporter = WzmlTransferReporter(
+                        source_message_id=source_message_id,
+                        index=index,
+                        total_messages=total_messages,
+                        success=success,
+                        failed=failed,
+                        payload=payload,
+                        status_callback=status_callback,
+                    )
                     copied_with_hidden_sender = await _clone_message_with_hidden_sender(
                         telegram,
                         endpoints,
                         source_message,
+                        reporter=reporter,
                     )
 
                 if not copied_with_hidden_sender:
@@ -589,10 +751,20 @@ async def _clone_topic_messages(
                                 endpoints.source_chat_id,
                                 source_message_id,
                             )
+                        reporter = WzmlTransferReporter(
+                            source_message_id=source_message_id,
+                            index=index,
+                            total_messages=total_messages,
+                            success=success,
+                            failed=failed,
+                            payload=payload,
+                            status_callback=status_callback,
+                        )
                         await _clone_restricted_message(
                             telegram,
                             endpoints,
                             source_message,
+                            reporter=reporter,
                         )
                 print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
             success += 1

@@ -27,6 +27,68 @@ Runtime output folder:
 - `runtime/exports` for generated txt exports
 - `runtime/state` for local JSON snapshots
 
+## Local Development (Run on Your PC)
+
+You can run this exact Heroku worker locally for real-time testing.
+
+1. Create and activate a virtual environment:
+
+```bash
+cd heroku_bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+2. Create local env file:
+
+```bash
+cp .env.example .env
+```
+
+3. Edit `.env` and fill the required values:
+
+- `TG_API_ID`
+- `TG_API_HASH`
+- `TG_SESSION_STRING`
+- `HEROKU_BOT_TOKEN`
+- `BOT_ADMIN_USER_IDS`
+
+For state persistence during local testing, choose one option:
+
+- Option A: set `MONGODB_URI` (recommended for local dev)
+- Option B: set all Data API vars: `MONGODB_DATA_API_URL`, `MONGODB_DATA_API_KEY`, `MONGODB_DATA_SOURCE`, `MONGODB_DATABASE`, `MONGODB_COLLECTION`
+
+4. Run the bot:
+
+```bash
+python app.py
+```
+
+You should see: `Heroku topic bot is running.`
+
+5. Test in Telegram from an admin account:
+
+- `/start`
+- `/status`
+- `/export ...`
+- `/clone ...`
+
+### Fast Edit-Test Loop
+
+Use one terminal to run the bot and another terminal to edit code.
+After each change, stop and restart the process.
+
+If you want auto-restart on file changes:
+
+```bash
+pip install watchfiles
+watchfiles --filter python "python app.py" .
+```
+
+This gives you a local workflow very close to Heroku worker behavior.
+
 ## Bot Commands
 
 - `/start`
