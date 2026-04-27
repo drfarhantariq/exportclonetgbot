@@ -106,13 +106,28 @@ class WzmlTransferReporter:
         self._upload_started_at: float | None = None
         self._download_snapshot = TransferSnapshot("download", 0, 0, 0.0, None)
         self._upload_snapshot = TransferSnapshot("upload", 0, 0, 0.0, None)
+        self._last_progress: dict[str, tuple[int, float, float]] = {}
         self._last_emit_at = 0.0
 
     def _snapshot(self, stage: str, current: int, total: int) -> TransferSnapshot:
         now = time.time()
         started_at = self._download_started_at if stage == "download" else (self._upload_started_at or now)
-        elapsed = max(now - started_at, 1e-3)
-        speed_bps = current / elapsed
+        if stage not in self._last_progress:
+            self._last_progress[stage] = (current, now, 0.0)
+            return TransferSnapshot(stage=stage, current=current, total=total, speed_bps=0.0, eta_seconds=None)
+
+        previous_current, previous_at, previous_speed = self._last_progress[stage]
+        delta_bytes = max(current - previous_current, 0)
+        delta_time = max(now - previous_at, 1e-3)
+        instant_speed = delta_bytes / delta_time if delta_bytes else previous_speed
+        if previous_speed > 0 and instant_speed > 0:
+            speed_bps = previous_speed * 0.65 + instant_speed * 0.35
+        elif instant_speed > 0:
+            speed_bps = instant_speed
+        else:
+            elapsed = max(now - started_at, 1e-3)
+            speed_bps = current / elapsed
+        self._last_progress[stage] = (current, now, speed_bps)
         eta_seconds: float | None
         if speed_bps > 0 and total > 0 and current <= total:
             eta_seconds = max((total - current) / speed_bps, 0.0)
@@ -828,6 +843,39 @@ def _build_clone_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _chat_display_name(chat) -> str:
+    for attr in ("title", "username", "first_name"):
+        value = getattr(chat, attr, None)
+        if value:
+            return str(value)
+    return str(getattr(chat, "id", "unknown"))
+
+
+async def _build_endpoint_labels(
+    telegram: TelegramService,
+    endpoints: CloneEndpoints,
+) -> dict[str, Any]:
+    source_chat, destination_chat = await asyncio.gather(
+        telegram.get_chat(endpoints.source_chat_id),
+        telegram.get_chat(endpoints.destination_chat_id),
+    )
+    source_topic_title, destination_topic_title = await asyncio.gather(
+        telegram.get_forum_topic_title(endpoints.source_chat_id, endpoints.source_topic_id),
+        telegram.get_forum_topic_title(endpoints.destination_chat_id, endpoints.destination_topic_id),
+    )
+
+    return {
+        "source_chat_id": endpoints.source_chat_id,
+        "source_chat_title": _chat_display_name(source_chat),
+        "source_topic_id": endpoints.source_topic_id,
+        "source_topic_title": source_topic_title or f"Topic {endpoints.source_topic_id}",
+        "destination_chat_id": endpoints.destination_chat_id,
+        "destination_chat_title": _chat_display_name(destination_chat),
+        "destination_topic_id": endpoints.destination_topic_id,
+        "destination_topic_title": destination_topic_title or f"Topic {endpoints.destination_topic_id}",
+    }
+
+
 async def run_clone(
     source_link: str,
     destination_link: str,
@@ -859,6 +907,7 @@ async def run_clone(
         # Validate source and destination topics before the clone loop.
         await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
         await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
+        endpoint_labels = await _build_endpoint_labels(telegram, endpoints)
 
         return await _clone_topic_messages(
             telegram,
@@ -873,6 +922,7 @@ async def run_clone(
             payload={
                 "source_link": source_link,
                 "destination_link": destination_link,
+                **endpoint_labels,
                 "config_path": config_path,
                 "start_id": start_id,
                 "limit": limit,

@@ -284,8 +284,10 @@ def _format_clone_status(state: dict[str, Any]) -> str:
     payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
     source = payload.get("source_link", "n/a")
     dest = payload.get("destination_link", "n/a")
-    parts.append(f"Source: {source}")
-    parts.append(f"Destination: {dest}")
+    source_label = _format_clone_endpoint(payload, "source")
+    destination_label = _format_clone_endpoint(payload, "destination")
+    parts.append(f"Source: {source_label or source}")
+    parts.append(f"Leech: {destination_label or dest}")
 
     if phase in {"running", "queued"}:
         parts.append(
@@ -363,6 +365,21 @@ def _format_clone_status_compact(state: dict[str, Any]) -> str:
     return f"Live: {phase} | Forwarded: {success} | Failed: {failed}"
 
 
+def _format_clone_endpoint(payload: dict[str, Any], prefix: str) -> str:
+    chat_title = str(payload.get(f"{prefix}_chat_title") or "").strip()
+    topic_title = str(payload.get(f"{prefix}_topic_title") or "").strip()
+    chat_id = payload.get(f"{prefix}_chat_id")
+    topic_id = payload.get(f"{prefix}_topic_id")
+
+    if not chat_title and chat_id:
+        chat_title = str(chat_id)
+    if not topic_title and topic_id:
+        topic_title = f"Topic {topic_id}"
+    if chat_title and topic_title:
+        return f"{chat_title} / {topic_title}"
+    return chat_title or topic_title
+
+
 async def _save_clone_state(store: MongoStateStore, label: str, state: dict[str, Any]) -> None:
     try:
         await store.save(f"clone:{label}", state)
@@ -408,12 +425,22 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     last_status_edit_at = 0.0
     last_reported_success = -1
     last_reported_index = -1
+    latest_state_payload = dict(payload)
     status_update_lock = asyncio.Lock()
 
     def _format_status_text(state: dict[str, Any]) -> str:
         phase = state.get("phase", "running")
+        payload_info = state.get("payload") if isinstance(state.get("payload"), dict) else payload
+        source_label = _format_clone_endpoint(payload_info, "source")
+        destination_label = _format_clone_endpoint(payload_info, "destination")
+        route_lines = ""
+        if source_label or destination_label:
+            route_lines = (
+                f"Source: {source_label or payload_info.get('source_link', 'n/a')}\n"
+                f"Leech: {destination_label or payload_info.get('destination_link', 'n/a')}\n\n"
+            )
         if phase == "queued":
-            return "Clone queued. Waiting to start..."
+            return f"{route_lines}Clone queued. Waiting to start..."
 
         total = state.get("total_messages", 0)
         current = state.get("current_index", 0)
@@ -423,20 +450,21 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
 
         if phase == "completed":
             return (
-                f"Clone complete. Forwarded successfully: {success}, Failed: {failed}."
+                f"{route_lines}Clone complete. Forwarded successfully: {success}, Failed: {failed}."
             )
         if phase == "cancelled":
             return (
-                f"Clone cancelled. Progress: {current}/{total} "
+                f"{route_lines}Clone cancelled. Progress: {current}/{total} "
                 f"(forwarded={success}, failed={failed})."
             )
         if phase == "failed":
             return (
-                f"Clone failed after {current}/{total}. "
+                f"{route_lines}Clone failed after {current}/{total}. "
                 f"forwarded={success}, failed={failed}. "
                 f"Error: {state.get('error', 'unknown')}"
             )
         return (
+            f"{route_lines}"
             f"Cloning messages: {current}/{total}\n"
             f"Forwarded successfully: {success}\n"
             f"Failed: {failed}\n"
@@ -446,9 +474,26 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         )
 
     async def _save_state_inner(state: dict[str, Any]) -> None:
-        nonlocal last_status_edit_at, last_reported_success, last_reported_index
+        nonlocal last_status_edit_at, last_reported_success, last_reported_index, latest_state_payload
         wrapper = dict(state)
-        wrapper["payload"] = payload
+        if isinstance(state.get("payload"), dict):
+            wrapper["payload"] = state["payload"]
+        else:
+            enriched_payload = dict(payload)
+            for key in (
+                "source_chat_id",
+                "source_chat_title",
+                "source_topic_id",
+                "source_topic_title",
+                "destination_chat_id",
+                "destination_chat_title",
+                "destination_topic_id",
+                "destination_topic_title",
+            ):
+                if key in state:
+                    enriched_payload[key] = state[key]
+            wrapper["payload"] = enriched_payload
+        latest_state_payload = dict(wrapper["payload"])
         await _save_clone_state(store, "last", wrapper)
 
         now = time.time()
@@ -519,12 +564,12 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     else:
         result = {
             "phase": "completed",
-            "payload": payload,
+            "payload": latest_state_payload,
             "success": success,
             "failed": failed,
         }
         await _save_clone_state(store, "last", result)
-        await status.edit_text(f"Clone complete. Success: {success}, Failed: {failed}")
+        await status.edit_text(_format_status_text(result))
     finally:
         ACTIVE_CLONE_TASK = None
         ACTIVE_CLONE_CANCEL_EVENT = None

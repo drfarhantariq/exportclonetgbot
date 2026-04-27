@@ -60,6 +60,12 @@ For state persistence during local testing, choose one option:
 - Option A: set `MONGODB_URI` (recommended for local dev)
 - Option B: set all Data API vars: `MONGODB_DATA_API_URL`, `MONGODB_DATA_API_KEY`, `MONGODB_DATA_SOURCE`, `MONGODB_DATABASE`, `MONGODB_COLLECTION`
 
+To speed up Telegram downloads like WZML, also set:
+
+- `HELPER_TOKENS` with one or more helper bot tokens separated by spaces or commas
+- `HYPER_DUMP_CHAT` with a private/channel dump chat id where the user session can post and every helper bot can read
+- `HYPER_THREADS` to tune the number of parallel chunks
+
 4. Run the bot:
 
 ```bash
@@ -120,6 +126,26 @@ Shortcuts are supported:
 Optional:
 
 - `HEROKU_RUNTIME_DIR` (defaults to `heroku_bot/runtime`)
+- `HELPER_TOKENS` for WZML-style helper bot chunk downloads
+- `HYPER_DUMP_CHAT` or `LEECH_DUMP_CHAT` for the helper-bot dump chat
+- `HYPER_THREADS` to override automatic chunk parallelism
+
+## WZML-Style Fast Telegram Transfers
+
+For the helper-client downloader to work reliably, create a dump chat and add:
+
+- the `TG_SESSION_STRING` user account, with permission to send messages
+- every helper bot from `HELPER_TOKENS`, with permission to read messages
+
+Set the dump chat id as `HYPER_DUMP_CHAT`. Without a dump chat, helper bots can only download from source chats they can already access. If the helper path fails, the bot automatically falls back to the main Pyrogram download so clones continue instead of stopping.
+
+Video uploads preserve duration and dimensions from the source message. If a source message does not expose those values, the bot can probe the downloaded file with `ffprobe`; on Heroku, add the apt buildpack so the root `Aptfile` installs `ffmpeg`:
+
+```bash
+heroku buildpacks:add --index 1 heroku-community/apt -a <your-app-name>
+```
+
+The bot also extracts a non-black JPEG thumbnail from the video itself for each video/animation upload, so Telegram does not use a black opening frame. It samples several points through the file and rejects near-black frames. Set `GENERATE_VIDEO_THUMBNAILS=false` to disable this.
 
 ## Heroku Setup (Recommended)
 

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import logging
+import os
+import re
 from pathlib import Path
+from time import monotonic
 from typing import Awaitable, Callable, TypeVar
 
 from pyrogram import Client, filters, raw
@@ -11,6 +16,7 @@ from pyrogram.handlers import MessageHandler
 from pyrogram.types import Chat, Message, User
 
 from config import AppSettings, MappingConfig
+from hyper_download import HyperTGDownload
 
 
 T = TypeVar("T")
@@ -26,6 +32,18 @@ class TelegramService:
     ) -> None:
         self.settings = settings
         self.logger = logger
+        self.helper_clients: dict[int, Client] = {}
+        self.helper_loads: dict[int, int] = {}
+        self.hyper_threads = int(os.getenv("HYPER_THREADS", "0") or 0)
+        self.hyper_dump_chat = self._parse_chat_id(
+            os.getenv("HYPER_DUMP_CHAT", "").strip()
+            or os.getenv("LEECH_DUMP_CHAT", "").strip()
+        )
+        self.helper_tokens = [
+            token
+            for token in re.split(r"[\s,]+", os.getenv("HELPER_TOKENS", "").strip())
+            if token
+        ]
         self.app = Client(
             name="telegram-topic-cloner",
             api_id=settings.api_id,
@@ -33,10 +51,13 @@ class TelegramService:
             session_string=settings.session_string,
             in_memory=True,
             no_updates=not receive_updates,
+            sleep_threshold=60,
+            **self._transmission_options(),
         )
 
     async def start(self) -> User:
         await self.app.start()
+        await self._start_helper_clients()
         return await self.read_call("get_me", self.app.get_me)
 
     async def stop(self) -> None:
@@ -44,6 +65,73 @@ class TelegramService:
             await self.app.stop()
         except Exception:
             self.logger.exception("shutdown error", extra={"event": "shutdown_error"})
+        for client in self.helper_clients.values():
+            try:
+                await client.stop()
+            except Exception:
+                self.logger.exception("helper shutdown error", extra={"event": "shutdown_error"})
+        self.helper_clients.clear()
+        self.helper_loads.clear()
+
+    async def _start_helper_clients(self) -> None:
+        if self.helper_clients or not self.helper_tokens:
+            return
+
+        await asyncio.gather(
+            *(
+                self._start_helper_client(index, token)
+                for index, token in enumerate(self.helper_tokens, start=1)
+            )
+        )
+
+        if self.helper_clients:
+            self.logger.info(
+                "helper bots started",
+                extra={
+                    "event": "helper_bots_started",
+                    "helper_count": len(self.helper_clients),
+                    "hyper_threads": self.hyper_threads,
+                    "hyper_dump_chat": self.hyper_dump_chat,
+                },
+            )
+
+    async def _start_helper_client(self, index: int, token: str) -> None:
+        client = Client(
+            name=f"telegram-topic-helper-{index}",
+            api_id=self.settings.api_id,
+            api_hash=self.settings.api_hash,
+            bot_token=token,
+            in_memory=True,
+            no_updates=True,
+            sleep_threshold=60,
+            **self._transmission_options(),
+        )
+        try:
+            await client.start()
+        except Exception:
+            self.logger.exception(
+                "failed to start helper bot",
+                extra={"event": "helper_bot_start_failed", "helper_index": index},
+            )
+            return
+
+        self.helper_clients[index] = client
+        self.helper_loads[index] = 0
+
+    @staticmethod
+    def _transmission_options() -> dict[str, int]:
+        if "max_concurrent_transmissions" in inspect.signature(Client.__init__).parameters:
+            return {"max_concurrent_transmissions": 100}
+        return {}
+
+    @staticmethod
+    def _parse_chat_id(value: str) -> int | str | None:
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return value
 
     async def read_call(self, operation: str, func: Callable[[], Awaitable[T]]) -> T:
         return await self._call(operation, func, apply_action_delay=False)
@@ -200,17 +288,53 @@ class TelegramService:
         target_path: Path | str,
         progress=None,
     ) -> str:
+        progress_handler = self._wrap_progress_callback(progress)
+        if self.helper_clients:
+            hyper = HyperTGDownload(
+                self.app,
+                self.helper_clients,
+                self.helper_loads,
+                hyper_threads=self.hyper_threads,
+                logger=self.logger,
+            )
+            try:
+                result = await hyper.download_media(
+                    message,
+                    file_name=str(target_path),
+                    progress=progress,
+                    dump_chat=self.hyper_dump_chat,
+                )
+            except Exception:
+                self.logger.warning(
+                    "hyper download failed, falling back to main client",
+                    exc_info=True,
+                    extra={"event": "hyper_download_fallback"},
+                )
+            else:
+                if isinstance(result, str):
+                    return self._resolve_downloaded_path(result)
+                self.logger.warning(
+                    "hyper download returned no file, falling back to main client",
+                    extra={"event": "hyper_download_empty"},
+                )
+            finally:
+                await hyper.aclose()
+
         result = await self.write_call(
             "download_media",
             lambda: self.app.download_media(
                 message,
                 file_name=str(target_path),
-                progress=progress,
+                progress=progress_handler,
             ),
         )
         if not isinstance(result, str):
             raise RuntimeError("Unexpected download result type")
 
+        return self._resolve_downloaded_path(result)
+
+    @staticmethod
+    def _resolve_downloaded_path(result: str) -> str:
         downloaded_path = Path(result)
         if downloaded_path.is_dir():
             files = [p for p in downloaded_path.rglob("*") if p.is_file()]
@@ -222,6 +346,59 @@ class TelegramService:
             downloaded_path = max(files, key=lambda p: p.stat().st_mtime)
 
         return str(downloaded_path)
+
+    def _wrap_progress_callback(self, progress):
+        if progress is None:
+            return None
+
+        loop = self.app.loop
+        logger = self.logger
+        last_report_at = 0.0
+
+        def _log_progress_error(future) -> None:
+            try:
+                future.result()
+            except Exception:
+                logger.debug("progress callback failed", exc_info=True)
+
+        def _handler(current, total, *args):
+            nonlocal last_report_at
+            now = monotonic()
+            if current < total and now - last_report_at < 0.75:
+                return
+            last_report_at = now
+
+            try:
+                result = progress(current, total, *args)
+            except Exception:
+                logger.debug("progress callback failed", exc_info=True)
+                return
+
+            if not inspect.isawaitable(result):
+                return
+
+            if loop.is_closed():
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                return
+
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                future = asyncio.run_coroutine_threadsafe(result, loop)
+                future.add_done_callback(_log_progress_error)
+                return
+
+            if running_loop is loop:
+                task = loop.create_task(result)
+                task.add_done_callback(_log_progress_error)
+                return
+
+            future = asyncio.run_coroutine_threadsafe(result, loop)
+            future.add_done_callback(_log_progress_error)
+
+        return _handler
 
     async def send_file_to_topic(
         self,
@@ -269,11 +446,15 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
-                        progress=progress,
+                        progress=self._wrap_progress_callback(progress),
                     ),
                 )
 
             if source_message.video:
+                duration, width, height = await self._video_upload_metadata(file_path, source_message.video)
+                thumb = await self._generate_video_thumbnail(file_path, duration)
+                if thumb:
+                    width, height = await asyncio.to_thread(self._image_size, thumb, width, height)
                 return await self.write_call(
                     "send_downloaded_video_to_topic",
                     lambda: self.app.send_video(
@@ -282,11 +463,21 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
-                        progress=progress,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        thumb=str(thumb) if thumb else None,
+                        file_name=file_path.name,
+                        supports_streaming=True,
+                        progress=self._wrap_progress_callback(progress),
                     ),
                 )
 
             if source_message.animation:
+                duration, width, height = await self._video_upload_metadata(file_path, source_message.animation)
+                thumb = await self._generate_video_thumbnail(file_path, duration)
+                if thumb:
+                    width, height = await asyncio.to_thread(self._image_size, thumb, width, height)
                 return await self.write_call(
                     "send_downloaded_animation_to_topic",
                     lambda: self.app.send_animation(
@@ -295,11 +486,17 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
-                        progress=progress,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        thumb=str(thumb) if thumb else None,
+                        file_name=file_path.name,
+                        progress=self._wrap_progress_callback(progress),
                     ),
                 )
 
             if source_message.audio:
+                duration = int(getattr(source_message.audio, "duration", 0) or 0)
                 return await self.write_call(
                     "send_downloaded_audio_to_topic",
                     lambda: self.app.send_audio(
@@ -308,11 +505,16 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
-                        progress=progress,
+                        duration=duration,
+                        performer=getattr(source_message.audio, "performer", None),
+                        title=getattr(source_message.audio, "title", None),
+                        file_name=file_path.name,
+                        progress=self._wrap_progress_callback(progress),
                     ),
                 )
 
             if source_message.voice:
+                duration = int(getattr(source_message.voice, "duration", 0) or 0)
                 return await self.write_call(
                     "send_downloaded_voice_to_topic",
                     lambda: self.app.send_voice(
@@ -321,7 +523,8 @@ class TelegramService:
                         caption=caption,
                         caption_entities=caption_entities,
                         reply_to_message_id=topic_id,
-                        progress=progress,
+                        duration=duration,
+                        progress=self._wrap_progress_callback(progress),
                     ),
                 )
 
@@ -332,7 +535,7 @@ class TelegramService:
                         chat_id=chat_id,
                         sticker=str(file_path),
                         reply_to_message_id=topic_id,
-                        progress=progress,
+                        progress=self._wrap_progress_callback(progress),
                     ),
                 )
         except Exception:
@@ -349,13 +552,234 @@ class TelegramService:
                 caption=caption,
                 caption_entities=caption_entities,
                 reply_to_message_id=topic_id,
-                progress=progress,
+                file_name=file_path.name,
+                progress=self._wrap_progress_callback(progress),
             ),
         )
+
+    async def _video_upload_metadata(self, file_path: Path, source_media) -> tuple[int, int, int]:
+        source_duration = int(getattr(source_media, "duration", 0) or 0)
+        source_width = int(getattr(source_media, "width", 0) or 0)
+        source_height = int(getattr(source_media, "height", 0) or 0)
+        probed_duration, probed_width, probed_height = await self._probe_video_metadata(file_path)
+        return (
+            probed_duration or source_duration,
+            probed_width or source_width,
+            probed_height or source_height,
+        )
+
+    async def _generate_video_thumbnail(self, file_path: Path, duration: int) -> Path | None:
+        if os.getenv("GENERATE_VIDEO_THUMBNAILS", "true").strip().lower() in {"0", "false", "no", "off"}:
+            return None
+
+        thumb_path = file_path.with_name(f"{file_path.stem}.tg-thumb.jpg")
+        timestamps = self._thumbnail_timestamps(duration)
+
+        for timestamp in timestamps:
+            if thumb_path.exists():
+                thumb_path.unlink(missing_ok=True)
+            if await self._extract_video_thumbnail(file_path, thumb_path, timestamp):
+                self.logger.info(
+                    "generated video frame thumbnail",
+                    extra={"event": "video_thumbnail_generated", "path": str(thumb_path), "timestamp": timestamp},
+                )
+                return thumb_path
+
+        self.logger.warning(
+            "could not generate a non-black video frame thumbnail; upload will use Telegram default",
+            extra={"event": "video_thumbnail_generation_failed", "file": str(file_path)},
+        )
+        return None
+
+    @staticmethod
+    def _thumbnail_timestamps(duration: int) -> list[float]:
+        if duration <= 0:
+            duration = 3
+        midpoint = max(duration // 2, 1)
+        if duration > 12:
+            return [
+                float(midpoint),
+                max(duration * 0.35, 1.0),
+                max(duration * 0.65, 1.0),
+                max(duration * 0.8, 1.0),
+            ]
+        return [float(midpoint), max(duration * 0.75, 1.0), 1.0]
+
+    async def _extract_video_thumbnail(self, file_path: Path, thumb_path: Path, timestamp: float) -> bool:
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{timestamp:.2f}",
+                "-i",
+                str(file_path),
+                "-vf",
+                "thumbnail",
+                "-q:v",
+                "1",
+                "-frames:v",
+                "1",
+                "-f",
+                "mjpeg",
+                "-y",
+                str(thumb_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+        except (FileNotFoundError, TimeoutError, asyncio.TimeoutError):
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            return False
+        except Exception:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            self.logger.debug("video thumbnail generation failed", exc_info=True)
+            return False
+
+        if process.returncode != 0:
+            if stderr:
+                self.logger.debug("ffmpeg thumbnail failed: %s", stderr.decode(errors="ignore").strip())
+            return False
+
+        try:
+            if not thumb_path.exists() or thumb_path.stat().st_size <= 0:
+                return False
+            return await asyncio.to_thread(self._is_usable_video_frame_thumb, thumb_path)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _is_usable_video_frame_thumb(thumb_path: Path) -> bool:
+        try:
+            from PIL import Image, ImageStat
+        except ImportError:
+            return True
+
+        try:
+            with Image.open(thumb_path) as image:
+                grayscale = image.convert("L")
+                stat = ImageStat.Stat(grayscale)
+                mean = float(stat.mean[0])
+                extrema = grayscale.getextrema()
+                contrast = float(extrema[1] - extrema[0]) if extrema else 0.0
+        except OSError:
+            return False
+
+        return mean >= 8.0 and contrast >= 5.0 and thumb_path.stat().st_size <= 200 * 1024
+
+    @staticmethod
+    def _image_size(image_path: Path, fallback_width: int, fallback_height: int) -> tuple[int, int]:
+        try:
+            from PIL import Image
+        except ImportError:
+            return fallback_width, fallback_height
+
+        try:
+            with Image.open(image_path) as image:
+                width, height = image.size
+        except OSError:
+            return fallback_width, fallback_height
+
+        return int(width or fallback_width), int(height or fallback_height)
+
+    async def _probe_video_metadata(self, file_path: Path) -> tuple[int, int, int]:
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(file_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+        except (FileNotFoundError, TimeoutError, asyncio.TimeoutError):
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            return 0, 0, 0
+        except Exception:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            self.logger.debug("video metadata probe failed", exc_info=True)
+            return 0, 0, 0
+
+        if process.returncode != 0 or not stdout:
+            if stderr:
+                self.logger.debug("ffprobe failed: %s", stderr.decode(errors="ignore").strip())
+            return 0, 0, 0
+
+        try:
+            payload = json.loads(stdout.decode("utf-8", errors="ignore"))
+        except json.JSONDecodeError:
+            return 0, 0, 0
+
+        duration = 0
+        try:
+            duration = round(float(payload.get("format", {}).get("duration") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+
+        width = 0
+        height = 0
+        for stream in payload.get("streams", []):
+            if stream.get("codec_type") != "video":
+                continue
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            break
+
+        return duration, width, height
 
     async def get_chat(self, chat_id: int | str) -> Chat:
         await self.ensure_peer_cached(chat_id)
         return await self.read_call("get_chat", lambda: self.app.get_chat(chat_id))
+
+    async def get_forum_topic_title(self, chat_id: int, topic_id: int) -> str | None:
+        try:
+            peer = await self.resolve_input_peer(chat_id)
+            channel_id = getattr(peer, "channel_id", None)
+            access_hash = getattr(peer, "access_hash", None)
+            if channel_id is None or access_hash is None:
+                return None
+
+            result = await self.read_call(
+                "get_forum_topic_title",
+                lambda: self.app.invoke(
+                    raw.functions.channels.GetForumTopicsByID(
+                        channel=raw.types.InputChannel(
+                            channel_id=channel_id,
+                            access_hash=access_hash,
+                        ),
+                        topics=[topic_id],
+                    )
+                ),
+            )
+            for topic in getattr(result, "topics", []) or []:
+                if getattr(topic, "top_message", None) == topic_id:
+                    title = getattr(topic, "title", None)
+                    return str(title) if title else None
+        except Exception:
+            self.logger.debug(
+                "forum topic title lookup failed",
+                exc_info=True,
+                extra={"event": "forum_topic_title_lookup_failed", "chat_id": chat_id, "topic_id": topic_id},
+            )
+        return None
 
     async def get_bot_user(self) -> User:
         return await self.read_call("get_bot_user", lambda: self.app.get_users(self.settings.leech_bot_username))
