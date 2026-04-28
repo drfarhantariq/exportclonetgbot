@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from asyncio import CancelledError, Event, TimeoutError as AsyncTimeoutError, create_task, gather, sleep, wait_for
 from contextlib import suppress
 from datetime import datetime
@@ -41,6 +42,7 @@ class HyperTGDownload:
         self.download_dir = "downloads/"
         self.directory = None
         self.num_parts = hyper_threads or max(8, len(self.clients))
+        self.max_flood_wait = int(os.getenv("HYPER_MAX_FLOOD_WAIT", "120") or 120)
         self.cache_file_ref: dict[int, Any] = {}
         self.cache_last_access: dict[int, float] = {}
         self.cache_max_size = 100
@@ -174,6 +176,11 @@ class HyperTGDownload:
                 self.session_pool[session_key] = media_session
                 return media_session
 
+            except FloodWait as exc:
+                if exc.value > self.max_flood_wait:
+                    raise
+                retries += 1
+                await sleep(exc.value + 1)
             except Exception:
                 retries += 1
                 await sleep(1)
@@ -277,6 +284,8 @@ class HyperTGDownload:
 
                         except (FloodWait, AsyncTimeoutError, ConnectionError) as exc:
                             if isinstance(exc, FloodWait):
+                                if exc.value > self.max_flood_wait:
+                                    raise
                                 await sleep(exc.value + 1)
                             else:
                                 await sleep(1)
@@ -286,7 +295,7 @@ class HyperTGDownload:
                         raise ValueError(f"Incomplete download: got {current_part-1} of {part_count} parts")
                     break
 
-                except (AsyncTimeoutError, ConnectionError, AttributeError):
+                except (FloodWait, AsyncTimeoutError, ConnectionError, AttributeError):
                     current_retry += 1
                     if current_retry >= max_retries:
                         raise
@@ -366,6 +375,13 @@ class HyperTGDownload:
 
             file_path = ospath.splitext(temp_file_path)[0]
             shutil.move(temp_file_path, file_path)
+            actual_size = Path(file_path).stat().st_size
+            if actual_size <= 0:
+                Path(file_path).unlink(missing_ok=True)
+                raise ValueError("Hyper download produced an empty file")
+            if actual_size != self.file_size:
+                Path(file_path).unlink(missing_ok=True)
+                raise ValueError(f"Hyper download size mismatch: got {actual_size}, expected {self.file_size}")
             return file_path
         except FloodWait:
             raise

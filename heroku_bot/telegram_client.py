@@ -346,6 +346,14 @@ class TelegramService:
             # Prefer the most recently modified file in case multiple files were created.
             downloaded_path = max(files, key=lambda p: p.stat().st_mtime)
 
+        try:
+            size = downloaded_path.stat().st_size
+        except OSError as exc:
+            raise RuntimeError(f"Media download failed: cannot stat {downloaded_path}") from exc
+        if size <= 0:
+            downloaded_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Media download failed: downloaded file is empty ({downloaded_path})")
+
         return str(downloaded_path)
 
     def _wrap_progress_callback(self, progress):

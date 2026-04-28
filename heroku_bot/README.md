@@ -104,6 +104,7 @@ This gives you a local workflow very close to Heroku worker behavior.
 - `/export last`
 - `/clone --source-link <link> --destination-link <link> [options]`
 - `/clone last`
+- `/log`
 
 Shortcuts are supported:
 
@@ -129,6 +130,8 @@ Optional:
 - `HELPER_TOKENS` for WZML-style helper bot chunk downloads
 - `HYPER_DUMP_CHAT` or `LEECH_DUMP_CHAT` for the helper-bot dump chat
 - `HYPER_THREADS` to override automatic chunk parallelism
+- `HYPER_MAX_FLOOD_WAIT` to stop helper-client downloads and fall back when Telegram asks for a long wait
+- `LOG_FILE_PATH` for the file sent by `/log`
 
 ## WZML-Style Fast Telegram Transfers
 

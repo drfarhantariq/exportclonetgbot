@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import shlex
 import sys
@@ -26,7 +27,7 @@ os.environ.setdefault("HEROKU_CONFIG_PATH", str(BUNDLE_DIR / "config.yaml"))
 os.environ.setdefault("LEECH_BOT_USERNAME", "@placeholder_bot")
 os.environ.setdefault("LEECH_BOT_ID", "0")
 
-from pyrogram import Client, filters
+from pyrogram import Client, enums, filters
 
 from clone_topic_by_link import run_clone
 from export_topic_list import run_export
@@ -42,11 +43,31 @@ MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 RUNTIME_DIR = Path(os.environ["HEROKU_RUNTIME_DIR"]).expanduser().resolve()
 STATE_DIR = RUNTIME_DIR / "state"
 EXPORTS_DIR = RUNTIME_DIR / "exports"
+LOG_DIR = RUNTIME_DIR / "logs"
+LOG_FILE = Path(os.getenv("LOG_FILE_PATH", str(LOG_DIR / "app.log"))).expanduser()
 
 
 def _ensure_runtime_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _setup_logging() -> None:
+    _ensure_runtime_dirs()
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+    if not any(isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == LOG_FILE for handler in root.handlers):
+        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+    if not any(isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler) for handler in root.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -237,6 +258,7 @@ def _bundle_help_text() -> str:
         "[--continue-on-error] [--hide-sender-name]\n"
         "/clone last or /clone resume\n"
         "/status\n"
+        "/log\n"
         "/cancel\n"
         "/restart"
     )
@@ -576,7 +598,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
 
 
 async def run_bot() -> None:
-    _ensure_runtime_dirs()
+    _setup_logging()
 
     bot_token = os.getenv("HEROKU_BOT_TOKEN", "").strip()
     if not bot_token:
@@ -644,7 +666,22 @@ async def run_bot() -> None:
         if export_state:
             messages.append("\n<b>Export Status</b>")
             messages.append(_format_status_payload(export_state))
-        await message.reply_text("\n\n".join(messages), parse_mode="html")
+        await message.reply_text("\n\n".join(messages), parse_mode=enums.ParseMode.HTML)
+
+    @bot.on_message(filters.private & filters.command("log", prefixes="/"))
+    async def log_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+
+        if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= 0:
+            await message.reply_text("No log file is available yet.")
+            return
+
+        await message.reply_document(
+            document=str(LOG_FILE),
+            caption="Current bot log",
+        )
 
     @bot.on_message(filters.private & filters.command("cancel", prefixes="/"))
     async def cancel_handler(client, message) -> None:

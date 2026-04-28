@@ -522,6 +522,9 @@ async def _download_and_upload_message(
 
         if not downloaded_file.exists() or not downloaded_file.is_file():
             raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}")
+        if downloaded_file.stat().st_size <= 0:
+            downloaded_file.unlink(missing_ok=True)
+            raise RuntimeError(f"Downloaded media file is empty: {downloaded_file}")
 
         await telegram.send_downloaded_media_to_topic(
             chat_id=endpoints.destination_chat_id,
