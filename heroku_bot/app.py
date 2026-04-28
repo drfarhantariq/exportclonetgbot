@@ -57,6 +57,11 @@ def _setup_logging() -> None:
     _ensure_runtime_dirs()
     root = logging.getLogger()
     root.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+    pyrogram_level = getattr(
+        logging,
+        os.getenv("PYROGRAM_LOG_LEVEL", "WARNING").upper(),
+        logging.WARNING,
+    )
     formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
     if not any(isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == LOG_FILE for handler in root.handlers):
@@ -68,6 +73,17 @@ def _setup_logging() -> None:
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
         root.addHandler(stream_handler)
+
+    for logger_name in (
+        "pyrogram",
+        "pyrogram.client",
+        "pyrogram.connection",
+        "pyrogram.dispatcher",
+        "pyrogram.session",
+        "pyrogram.session.auth",
+        "pyrogram.session.session",
+    ):
+        logging.getLogger(logger_name).setLevel(pyrogram_level)
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -249,18 +265,27 @@ def _build_clone_parser() -> argparse.ArgumentParser:
 
 def _bundle_help_text() -> str:
     return (
-        "Commands:\n"
-        "/export --topic-link <link> [--config <path>] [--out <file>] [--batch-size N] "
-        "[--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards]\n"
-        "/export last or /export resume\n"
+        "Available commands:\n\n"
+        "/start - Show the command guide\n"
+        "/help - Show all available commands and examples\n"
+        "/status - Show the latest clone/export status\n"
+        "/settings - View bot runtime settings\n"
+        "/settings set <key> <value> - Change a runtime setting\n"
+        "/settings reset <key>|all - Reset one or all settings\n"
+        "/log - Upload the current bot log file\n"
+        "/cancel - Cancel the active clone job\n"
+        "/restart - Restart the bot process\n\n"
+        "Clone:\n"
         "/clone --source-link <link> --destination-link <link> [--config <path>] [--start-id N] "
         "[--limit N] [--delay-sec S] [--batch-size N] [--message-ids 1,2,3] [--dry-run] "
         "[--continue-on-error] [--hide-sender-name]\n"
-        "/clone last or /clone resume\n"
-        "/status\n"
-        "/log\n"
-        "/cancel\n"
-        "/restart"
+        "/clone <source_link> <destination_link>\n"
+        "/clone last or /clone resume\n\n"
+        "Export:\n"
+        "/export --topic-link <link> [--config <path>] [--out <file>] [--batch-size N] "
+        "[--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards]\n"
+        "/export <topic_link>\n"
+        "/export last or /export resume"
     )
 
 
@@ -290,6 +315,123 @@ def _normalize_clone_command(command_text: str) -> str:
 
 ACTIVE_CLONE_TASK: asyncio.Task | None = None
 ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
+
+BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
+    "clone_status_update_interval_sec": 2.0,
+    "clone_status_success_update_interval_sec": 1.5,
+    "clone_status_keepalive_interval_sec": 10.0,
+    "clone_default_delay_sec": 0.35,
+    "clone_default_batch_size": 50,
+    "clone_continue_on_error_default": False,
+    "clone_hide_sender_name_default": False,
+    "export_default_batch_size": 20,
+    "export_default_batch_delay_sec": 2.0,
+}
+
+BOT_SETTINGS_HELP = (
+    "Settings commands:\n"
+    "/settings\n"
+    "/settings show\n"
+    "/settings set <key> <value>\n"
+    "/settings reset <key>\n"
+    "/settings reset all\n\n"
+    "Useful keys:\n"
+    "- clone_status_update_interval_sec\n"
+    "- clone_status_success_update_interval_sec\n"
+    "- clone_status_keepalive_interval_sec\n"
+    "- clone_default_delay_sec\n"
+    "- clone_default_batch_size\n"
+    "- clone_continue_on_error_default\n"
+    "- clone_hide_sender_name_default\n"
+    "- export_default_batch_size\n"
+    "- export_default_batch_delay_sec"
+)
+
+
+def _coerce_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("expected true/false")
+
+
+def _normalize_setting_value(key: str, value: Any) -> Any:
+    if key not in BOT_SETTINGS_DEFAULTS:
+        raise ValueError(f"Unknown setting: {key}")
+
+    if key in {
+        "clone_status_update_interval_sec",
+        "clone_status_success_update_interval_sec",
+        "clone_status_keepalive_interval_sec",
+        "clone_default_delay_sec",
+        "export_default_batch_delay_sec",
+    }:
+        number = float(value)
+        if number < 0:
+            raise ValueError(f"{key} must be >= 0")
+        return number
+
+    if key in {
+        "clone_default_batch_size",
+        "export_default_batch_size",
+    }:
+        number = int(value)
+        if number <= 0:
+            raise ValueError(f"{key} must be > 0")
+        return number
+
+    if key in {
+        "clone_continue_on_error_default",
+        "clone_hide_sender_name_default",
+    }:
+        if isinstance(value, bool):
+            return value
+        return _coerce_bool(str(value))
+
+    return value
+
+
+async def _load_bot_settings(store: MongoStateStore) -> dict[str, Any]:
+    try:
+        stored = await store.load("bot:settings")
+    except Exception:
+        stored = _read_json_file(_snapshot_path("bot_settings"))
+
+    merged = dict(BOT_SETTINGS_DEFAULTS)
+    if isinstance(stored, dict):
+        for key, default_value in BOT_SETTINGS_DEFAULTS.items():
+            if key not in stored:
+                continue
+            try:
+                merged[key] = _normalize_setting_value(key, stored[key])
+            except Exception:
+                merged[key] = default_value
+    return merged
+
+
+async def _save_bot_settings(store: MongoStateStore, settings: dict[str, Any]) -> None:
+    normalized = {
+        key: _normalize_setting_value(key, settings.get(key, default))
+        for key, default in BOT_SETTINGS_DEFAULTS.items()
+    }
+    try:
+        await store.save("bot:settings", normalized)
+    except Exception:
+        _write_json_file(_snapshot_path("bot_settings"), normalized)
+
+
+def _format_bot_settings(settings: dict[str, Any]) -> str:
+    lines = ["<b>Bot Settings</b>"]
+    for key in sorted(BOT_SETTINGS_DEFAULTS):
+        current = settings.get(key, BOT_SETTINGS_DEFAULTS[key])
+        default = BOT_SETTINGS_DEFAULTS[key]
+        lines.append(f"<code>{key}</code> = <code>{current}</code> (default: <code>{default}</code>)")
+    lines.append("")
+    lines.append("Use <code>/settings set &lt;key&gt; &lt;value&gt;</code>")
+    lines.append("Use <code>/settings reset &lt;key&gt;</code> or <code>/settings reset all</code>")
+    return "\n".join(lines)
 
 
 def _format_status_payload(payload: dict[str, Any] | None) -> str:
@@ -345,6 +487,8 @@ def _format_clone_status(state: dict[str, Any]) -> str:
             parts.append(
                 f"Success: {state.get('success', 0)} | Failed: {state.get('failed', 0)}"
             )
+        if state.get("last_successful_message_link"):
+            parts.append(f"Last successful transfer: {state.get('last_successful_message_link')}")
         if state.get("error"):
             parts.append(f"Error: {state.get('error')}")
 
@@ -383,6 +527,12 @@ def _format_clone_status_compact(state: dict[str, Any]) -> str:
     if phase == "cancelled":
         return f"Live: cancelled at {current}/{total} | Forwarded: {success} | Failed: {failed}"
     if phase == "failed":
+        link = str(state.get("last_successful_message_link") or "").strip()
+        if link:
+            return (
+                f"Live: failed at {current}/{total} | Forwarded: {success} | Failed: {failed} "
+                f"| Last OK: {link}"
+            )
         return f"Live: failed at {current}/{total} | Forwarded: {success} | Failed: {failed}"
     return f"Live: {phase} | Forwarded: {success} | Failed: {failed}"
 
@@ -443,11 +593,13 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
 
     ACTIVE_CLONE_CANCEL_EVENT = asyncio.Event()
     ACTIVE_CLONE_TASK = asyncio.current_task()
+    bot_settings = await _load_bot_settings(store)
 
     last_status_edit_at = 0.0
     last_reported_success = -1
     last_reported_index = -1
     latest_state_payload = dict(payload)
+    latest_runtime_state: dict[str, Any] = {"phase": "queued", "payload": dict(payload)}
     status_update_lock = asyncio.Lock()
 
     def _format_status_text(state: dict[str, Any]) -> str:
@@ -480,10 +632,15 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
                 f"(forwarded={success}, failed={failed})."
             )
         if phase == "failed":
+            last_successful_link = str(state.get("last_successful_message_link") or "").strip()
+            last_successful_line = (
+                f"\nLast successful transfer: {last_successful_link}" if last_successful_link else ""
+            )
             return (
                 f"{route_lines}Clone failed after {current}/{total}. "
                 f"forwarded={success}, failed={failed}. "
                 f"Error: {state.get('error', 'unknown')}"
+                f"{last_successful_line}"
             )
         return (
             f"{route_lines}"
@@ -496,7 +653,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         )
 
     async def _save_state_inner(state: dict[str, Any]) -> None:
-        nonlocal last_status_edit_at, last_reported_success, last_reported_index, latest_state_payload
+        nonlocal last_status_edit_at, last_reported_success, last_reported_index, latest_state_payload, latest_runtime_state
         wrapper = dict(state)
         if isinstance(state.get("payload"), dict):
             wrapper["payload"] = state["payload"]
@@ -516,6 +673,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
                     enriched_payload[key] = state[key]
             wrapper["payload"] = enriched_payload
         latest_state_payload = dict(wrapper["payload"])
+        latest_runtime_state = dict(wrapper)
         await _save_clone_state(store, "last", wrapper)
 
         now = time.time()
@@ -525,12 +683,15 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
 
         success_changed = success != last_reported_success
         progress_changed = current_index != last_reported_index
+        success_interval = float(bot_settings["clone_status_success_update_interval_sec"])
+        progress_interval = float(bot_settings["clone_status_update_interval_sec"])
+        keepalive_interval = float(bot_settings["clone_status_keepalive_interval_sec"])
 
         should_edit = (
             phase != "running"
-            or (success_changed and now - last_status_edit_at >= 1.5)
-            or (progress_changed and now - last_status_edit_at >= 2.0)
-            or now - last_status_edit_at >= 10
+            or (success_changed and now - last_status_edit_at >= success_interval)
+            or (progress_changed and now - last_status_edit_at >= progress_interval)
+            or now - last_status_edit_at >= keepalive_interval
         )
         if not should_edit:
             return
@@ -564,24 +725,44 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             cancel_event=ACTIVE_CLONE_CANCEL_EVENT,
         )
     except asyncio.CancelledError:
+        cancelled_state = {
+            "phase": "cancelled",
+            "payload": latest_state_payload,
+            "error": "Cancelled by user",
+        }
+        if latest_runtime_state.get("last_successful_message_link"):
+            cancelled_state["last_successful_message_link"] = latest_runtime_state["last_successful_message_link"]
         await _save_clone_state(
             store,
             "last",
-            {
-                "phase": "cancelled",
-                "payload": payload,
-                "error": "Cancelled by user",
-            },
+            cancelled_state,
         )
         await status.edit_text("Clone cancelled.")
         raise
     except Exception as exc:
+        failed_state = {
+            "phase": "failed",
+            "payload": latest_state_payload,
+            "error": str(exc),
+            "current_index": latest_runtime_state.get("current_index", 0),
+            "total_messages": latest_runtime_state.get("total_messages", 0),
+            "success": latest_runtime_state.get("success", 0),
+            "failed": latest_runtime_state.get("failed", 0),
+            "current_message_id": latest_runtime_state.get("current_message_id"),
+        }
+        for key in (
+            "last_successful_source_message_id",
+            "last_successful_destination_message_id",
+            "last_successful_message_link",
+        ):
+            if latest_runtime_state.get(key):
+                failed_state[key] = latest_runtime_state[key]
         await _save_clone_state(
             store,
             "last",
-            {"phase": "failed", "payload": payload, "error": str(exc)},
+            failed_state,
         )
-        await status.edit_text(f"Clone failed: {exc}")
+        await status.edit_text(_format_status_text(failed_state))
         raise
     else:
         result = {
@@ -668,6 +849,68 @@ async def run_bot() -> None:
             messages.append(_format_status_payload(export_state))
         await message.reply_text("\n\n".join(messages), parse_mode=enums.ParseMode.HTML)
 
+    @bot.on_message(filters.private & filters.command("settings", prefixes="/"))
+    async def settings_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+
+        raw_text = message.text or ""
+        parts = raw_text.split(maxsplit=1)
+        command_text = parts[1].strip() if len(parts) > 1 else ""
+        tokens = shlex.split(command_text) if command_text else []
+
+        current_settings = await _load_bot_settings(store)
+
+        if not tokens or tokens[0].lower() in {"show", "list"}:
+            await message.reply_text(
+                _format_bot_settings(current_settings),
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+
+        action = tokens[0].lower()
+
+        if action == "set":
+            if len(tokens) < 3:
+                await message.reply_text(BOT_SETTINGS_HELP)
+                return
+            key = tokens[1].strip()
+            raw_value = " ".join(tokens[2:]).strip()
+            try:
+                current_settings[key] = _normalize_setting_value(key, raw_value)
+                await _save_bot_settings(store, current_settings)
+            except Exception as exc:
+                await message.reply_text(f"Could not save setting: {exc}")
+                return
+            await message.reply_text(
+                f"Saved <code>{key}</code> = <code>{current_settings[key]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+
+        if action == "reset":
+            if len(tokens) < 2:
+                await message.reply_text(BOT_SETTINGS_HELP)
+                return
+            key = tokens[1].strip()
+            if key.lower() == "all":
+                await _save_bot_settings(store, dict(BOT_SETTINGS_DEFAULTS))
+                await message.reply_text("All settings were reset to defaults.")
+                return
+            if key not in BOT_SETTINGS_DEFAULTS:
+                await message.reply_text(f"Unknown setting: {key}")
+                return
+            current_settings[key] = BOT_SETTINGS_DEFAULTS[key]
+            await _save_bot_settings(store, current_settings)
+            await message.reply_text(
+                f"Reset <code>{key}</code> to <code>{BOT_SETTINGS_DEFAULTS[key]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+
+        await message.reply_text(BOT_SETTINGS_HELP)
+
     @bot.on_message(filters.private & filters.command("log", prefixes="/"))
     async def log_handler(client, message) -> None:
         if not await _authorized(message):
@@ -717,6 +960,7 @@ async def run_bot() -> None:
         raw_text = message.text or ""
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
+        bot_settings = await _load_bot_settings(store)
 
         if command_text.lower() in {"last", "resume"}:
             stored = await store.load("export:last")
@@ -738,8 +982,12 @@ async def run_bot() -> None:
                 "topic_link": parsed.topic_link,
                 "config_path": parsed.config,
                 "out_path": parsed.out,
-                "batch_size": parsed.batch_size,
-                "batch_delay_sec": parsed.batch_delay_sec,
+                "batch_size": parsed.batch_size
+                if "--batch-size" in normalized
+                else int(bot_settings["export_default_batch_size"]),
+                "batch_delay_sec": parsed.batch_delay_sec
+                if "--batch-delay-sec" in normalized
+                else float(bot_settings["export_default_batch_delay_sec"]),
                 "upload_topic_link": parsed.upload_topic_link,
                 "caption_file_names": parsed.caption_file_names,
                 "onwards": parsed.onwards,
@@ -756,6 +1004,7 @@ async def run_bot() -> None:
         raw_text = message.text or ""
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
+        bot_settings = await _load_bot_settings(store)
 
         if command_text.lower() in {"last", "resume"}:
             stored = await store.load("clone:last")
@@ -779,12 +1028,20 @@ async def run_bot() -> None:
                 "config_path": parsed.config,
                 "start_id": parsed.start_id,
                 "limit": parsed.limit,
-                "delay_sec": parsed.delay_sec,
-                "batch_size": parsed.batch_size,
+                "delay_sec": parsed.delay_sec
+                if "--delay-sec" in normalized
+                else float(bot_settings["clone_default_delay_sec"]),
+                "batch_size": parsed.batch_size
+                if "--batch-size" in normalized
+                else int(bot_settings["clone_default_batch_size"]),
                 "message_ids": parsed.message_ids,
                 "dry_run": parsed.dry_run,
-                "continue_on_error": parsed.continue_on_error,
-                "hide_sender_name": parsed.hide_sender_name,
+                "continue_on_error": parsed.continue_on_error
+                if "--continue-on-error" in normalized
+                else bool(bot_settings["clone_continue_on_error_default"]),
+                "hide_sender_name": parsed.hide_sender_name
+                if "--hide-sender-name" in normalized
+                else bool(bot_settings["clone_hide_sender_name_default"]),
             }
 
         await _run_clone_job(message, payload, store)

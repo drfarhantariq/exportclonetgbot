@@ -26,7 +26,7 @@ from message_classifier import (
 )
 from models import MessageKind
 from telegram_client import TelegramService
-from topic_utils import parse_private_topic_link
+from topic_utils import build_private_topic_link, parse_private_topic_link
 
 
 HEROKU_RUNTIME_DIR = Path(os.getenv("HEROKU_RUNTIME_DIR", "heroku_runtime")).expanduser().resolve()
@@ -412,32 +412,25 @@ async def _clone_message_with_hidden_sender(
     endpoints: CloneEndpoints,
     source_message: Any,
     reporter: WzmlTransferReporter | None = None,
-) -> bool:
+) -> Any | None:
     if source_message is None or getattr(source_message, "empty", False):
         raise RuntimeError("Source message is missing")
 
     classification = classify_message(source_message)
     if classification.kind == MessageKind.TEXT:
         text, entities, disable_preview = extract_text_payload(source_message)
-        await telegram.send_text_to_topic(
+        return await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
             text=text,
             entities=entities,
             disable_web_page_preview=disable_preview,
         )
-        return True
 
-    if classification.kind == MessageKind.DIRECT_MEDIA:
-        await _download_and_upload_message(
-            telegram,
-            source_message,
-            endpoints,
-            reporter=reporter,
-        )
-        return True
-
-    return False
+    # For media/documents, prefer Telegram's native copy path first. Only fall
+    # back to download+upload later when copy_message raises
+    # CHAT_FORWARDS_RESTRICTED.
+    return None
 
 
 async def _download_and_upload_message(
@@ -445,7 +438,7 @@ async def _download_and_upload_message(
     source_message: Any,
     endpoints: CloneEndpoints,
     reporter: WzmlTransferReporter | None = None,
-) -> None:
+) -> Any:
     if source_message is None or getattr(source_message, "empty", False):
         raise RuntimeError("Source message is missing")
 
@@ -455,14 +448,13 @@ async def _download_and_upload_message(
     # Protected text-only messages cannot be downloaded; repost text directly.
     if classification.kind == MessageKind.TEXT:
         text, entities, disable_preview = extract_text_payload(source_message)
-        await telegram.send_text_to_topic(
+        return await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
             text=text,
             entities=entities,
             disable_web_page_preview=disable_preview,
         )
-        return
 
     if not getattr(source_message, "media", None):
         raise RuntimeError(
@@ -526,7 +518,7 @@ async def _download_and_upload_message(
             downloaded_file.unlink(missing_ok=True)
             raise RuntimeError(f"Downloaded media file is empty: {downloaded_file}")
 
-        await telegram.send_downloaded_media_to_topic(
+        sent_message = await telegram.send_downloaded_media_to_topic(
             chat_id=endpoints.destination_chat_id,
             topic_id=endpoints.destination_topic_id,
             source_message=source_message,
@@ -537,6 +529,7 @@ async def _download_and_upload_message(
         )
         if reporter is not None:
             await reporter.complete()
+        return sent_message
 
 
 async def _clone_restricted_message(
@@ -544,21 +537,30 @@ async def _clone_restricted_message(
     endpoints: CloneEndpoints,
     source_message: Any,
     reporter: WzmlTransferReporter | None = None,
-) -> None:
+) -> Any:
     classification = classify_message(source_message)
 
     if classification.kind == MessageKind.TEXT:
         text, entities, disable_preview = extract_text_payload(source_message)
-        await telegram.send_text_to_topic(
+        return await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
             text=text,
             entities=entities,
             disable_web_page_preview=disable_preview,
         )
-        return
 
-    await _download_and_upload_message(telegram, source_message, endpoints, reporter=reporter)
+    return await _download_and_upload_message(telegram, source_message, endpoints, reporter=reporter)
+
+
+def _build_destination_message_link(endpoints: CloneEndpoints, destination_message_id: int | None) -> str | None:
+    if not destination_message_id:
+        return None
+    return build_private_topic_link(
+        endpoints.destination_chat_id,
+        endpoints.destination_topic_id,
+        destination_message_id,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -725,6 +727,7 @@ async def _clone_topic_messages(
             raise asyncio.CancelledError("Clone cancelled by user")
 
         source_message = None
+        destination_message = None
         try:
             if dry_run:
                 print(
@@ -733,7 +736,7 @@ async def _clone_topic_messages(
                     f"{endpoints.destination_chat_id}:{endpoints.destination_topic_id}"
                 )
             else:
-                copied_with_hidden_sender = False
+                copied_with_hidden_sender = None
                 if hide_sender_name:
                     source_message = await telegram.get_message(
                         endpoints.source_chat_id,
@@ -755,9 +758,11 @@ async def _clone_topic_messages(
                         reporter=reporter,
                     )
 
-                if not copied_with_hidden_sender:
+                if copied_with_hidden_sender is not None:
+                    destination_message = copied_with_hidden_sender
+                else:
                     try:
-                        await telegram.copy_message_to_topic(
+                        destination_message = await telegram.copy_message_to_topic(
                             chat_id=endpoints.destination_chat_id,
                             from_chat_id=endpoints.source_chat_id,
                             topic_id=endpoints.destination_topic_id,
@@ -778,7 +783,7 @@ async def _clone_topic_messages(
                             payload=payload,
                             status_callback=status_callback,
                         )
-                        await _clone_restricted_message(
+                        destination_message = await _clone_restricted_message(
                             telegram,
                             endpoints,
                             source_message,
@@ -786,6 +791,11 @@ async def _clone_topic_messages(
                         )
                 print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
             success += 1
+            destination_message_id = getattr(destination_message, "id", None)
+            last_successful_message_link = _build_destination_message_link(
+                endpoints,
+                int(destination_message_id) if isinstance(destination_message_id, int) else None,
+            )
             await _save_clone_status(
                 status_callback,
                 "running",
@@ -795,6 +805,9 @@ async def _clone_topic_messages(
                 success=success,
                 failed=failed,
                 current_message_id=source_message_id,
+                last_successful_source_message_id=source_message_id,
+                last_successful_destination_message_id=destination_message_id,
+                last_successful_message_link=last_successful_message_link,
             )
         except asyncio.CancelledError:
             raise
