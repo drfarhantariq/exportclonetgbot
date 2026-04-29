@@ -351,7 +351,21 @@ ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
 ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
 SETTINGS_PAGE_SIZE = 10
 
+ENV_SETTING_KEYS = {
+    "tg_api_id": "TG_API_ID",
+    "tg_api_hash": "TG_API_HASH",
+    "mongodb_database": "MONGODB_DATABASE",
+    "owner_id": "BOT_ADMIN_USER_IDS",
+    "tg_session_string": "TG_SESSION_STRING",
+}
+SECRET_SETTING_KEYS = {"tg_api_hash", "tg_session_string"}
+
 BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
+    "tg_api_id": os.getenv("TG_API_ID", "").strip(),
+    "tg_api_hash": os.getenv("TG_API_HASH", "").strip(),
+    "mongodb_database": os.getenv("MONGODB_DATABASE", "topic_ops").strip(),
+    "owner_id": os.getenv("BOT_ADMIN_USER_IDS", "").strip(),
+    "tg_session_string": os.getenv("TG_SESSION_STRING", "").strip(),
     "clone_status_update_interval_sec": 2.0,
     "clone_status_success_update_interval_sec": 1.5,
     "clone_status_keepalive_interval_sec": 10.0,
@@ -381,7 +395,12 @@ BOT_SETTINGS_HELP = (
     "- clone_continue_on_error_default\n"
     "- clone_hide_sender_name_default\n"
     "- export_default_batch_size\n"
-    "- export_default_batch_delay_sec"
+    "- export_default_batch_delay_sec\n"
+    "- tg_api_id\n"
+    "- tg_api_hash\n"
+    "- mongodb_database\n"
+    "- owner_id\n"
+    "- tg_session_string"
 )
 
 
@@ -428,7 +447,48 @@ def _normalize_setting_value(key: str, value: Any) -> Any:
             return value
         return _coerce_bool(str(value))
 
+    if key == "tg_api_id":
+        raw = str(value).strip()
+        if raw:
+            number = int(raw)
+            if number <= 0:
+                raise ValueError("tg_api_id must be > 0")
+        return raw
+
+    if key == "owner_id":
+        raw = str(value).strip()
+        if raw:
+            _parse_admin_ids(raw)
+        return raw
+
+    if key in {"tg_api_hash", "mongodb_database", "tg_session_string"}:
+        return str(value).strip()
+
     return value
+
+
+def _masked_setting_value(key: str, value: Any) -> str:
+    text = str(value or "")
+    if key not in SECRET_SETTING_KEYS:
+        return text
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "********"
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def _apply_env_settings(settings: dict[str, Any]) -> None:
+    for key, env_name in ENV_SETTING_KEYS.items():
+        value = str(settings.get(key, "") or "").strip()
+        if value:
+            os.environ[env_name] = value
+
+
+def _apply_bootstrap_settings() -> None:
+    stored = _read_json_file(_snapshot_path("bot_settings"))
+    if isinstance(stored, dict):
+        _apply_env_settings(stored)
 
 
 async def _load_bot_settings(store: MongoStateStore) -> dict[str, Any]:
@@ -446,6 +506,7 @@ async def _load_bot_settings(store: MongoStateStore) -> dict[str, Any]:
                 merged[key] = _normalize_setting_value(key, stored[key])
             except Exception:
                 merged[key] = default_value
+    _apply_env_settings(merged)
     return merged
 
 
@@ -454,10 +515,12 @@ async def _save_bot_settings(store: MongoStateStore, settings: dict[str, Any]) -
         key: _normalize_setting_value(key, settings.get(key, default))
         for key, default in BOT_SETTINGS_DEFAULTS.items()
     }
+    _write_json_file(_snapshot_path("bot_settings"), normalized)
     try:
         await store.save("bot:settings", normalized)
     except Exception:
-        _write_json_file(_snapshot_path("bot_settings"), normalized)
+        pass
+    _apply_env_settings(normalized)
 
 
 def _format_bot_settings(settings: dict[str, Any]) -> str:
@@ -465,7 +528,10 @@ def _format_bot_settings(settings: dict[str, Any]) -> str:
     for key in sorted(BOT_SETTINGS_DEFAULTS):
         current = settings.get(key, BOT_SETTINGS_DEFAULTS[key])
         default = BOT_SETTINGS_DEFAULTS[key]
-        lines.append(f"<code>{key}</code> = <code>{current}</code> (default: <code>{default}</code>)")
+        lines.append(
+            f"<code>{key}</code> = <code>{_html(_masked_setting_value(key, current))}</code> "
+            f"(default: <code>{_html(_masked_setting_value(key, default))}</code>)"
+        )
     lines.append("")
     lines.append("Use <code>/settings set &lt;key&gt; &lt;value&gt;</code>")
     lines.append("Use <code>/settings reset &lt;key&gt;</code> or <code>/settings reset all</code>")
@@ -539,8 +605,8 @@ def _format_setting_detail(settings: dict[str, Any], key: str, page: int, state:
         f"Config Variable | Page: {page} | State: {state}",
         "",
         f"<b>{_html(key)}</b>",
-        f"┠ <b>Current</b> → <code>{_html(current)}</code>",
-        f"┠ <b>Default</b> → <code>{_html(default)}</code>",
+        f"┠ <b>Current</b> → <code>{_html(_masked_setting_value(key, current))}</code>",
+        f"┠ <b>Default</b> → <code>{_html(_masked_setting_value(key, default))}</code>",
     ]
     if state == "edit":
         lines.extend(
@@ -732,6 +798,8 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
 
     source_label = _format_clone_endpoint(payload, "source") or payload.get("source_link", "n/a")
     destination_label = _format_clone_endpoint(payload, "destination") or payload.get("destination_link", "n/a")
+    message_type = str(state.get("current_message_type") or "").strip()
+    file_name = str(state.get("current_file_name") or "").strip()
 
     lines = [
         f"<b>1.</b> <b><i>{_html(_status_task_title(state))}</i></b>",
@@ -743,9 +811,13 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
         f"┠ <b>Speed</b> → <i>{_html(snapshot['speed'])}</i>",
         f"┠ <b>Time</b> → <i>{_html(eta_text)} of {_html(_readable_time(total_time))} ( {_html(_readable_time(elapsed))} )</i>",
         "┠ <b>Engine</b> → <i>Pyrogram</i>",
-        f"┠ <b>In Mode</b> → <i>{_html(source_label)}</i>",
-        f"┠ <b>Out Mode</b> → <i>{_html(destination_label)}</i>",
+        f"┠ <b>SOURCE</b> → <i>{_html(source_label)}</i>",
+        f"┠ <b>DESTINATION</b> → <i>{_html(destination_label)}</i>",
     ]
+    if message_type:
+        lines.append(f"┠ <b>TYPE</b> → <i>{_html(message_type)}</i>")
+    if file_name:
+        lines.append(f"┠ <b>Filename</b> → <i>{_html(file_name)}</i>")
 
     if phase == "running":
         lines.append("<b>┖ Stop</b> → <i>/cancel</i>")
@@ -1032,6 +1104,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
                     _format_status_text(wrapper),
                     parse_mode=enums.ParseMode.HTML,
                     disable_web_page_preview=True,
+                    reply_markup=_status_reply_markup("main"),
                 )
             except Exception:
                 pass
@@ -1046,6 +1119,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         _format_status_text(queued_state),
         parse_mode=enums.ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=_status_reply_markup("main"),
     )
     try:
         success, failed = await run_clone(
@@ -1077,6 +1151,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         }
         if latest_runtime_state.get("last_successful_message_link"):
             cancelled_state["last_successful_message_link"] = latest_runtime_state["last_successful_message_link"]
+        for key in ("current_message_type", "current_file_name"):
+            if latest_runtime_state.get(key):
+                cancelled_state[key] = latest_runtime_state[key]
         await _save_clone_state(
             store,
             "last",
@@ -1086,6 +1163,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             _format_status_text(cancelled_state),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=_status_reply_markup("main"),
         )
         raise
     except Exception as exc:
@@ -1104,6 +1182,8 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last_successful_source_message_id",
             "last_successful_destination_message_id",
             "last_successful_message_link",
+            "current_message_type",
+            "current_file_name",
         ):
             if latest_runtime_state.get(key):
                 failed_state[key] = latest_runtime_state[key]
@@ -1116,6 +1196,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             _format_status_text(failed_state),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=_status_reply_markup("main"),
         )
         raise
     else:
@@ -1129,11 +1210,15 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "total_messages": latest_runtime_state.get("total_messages", 0),
             "current_message_id": latest_runtime_state.get("current_message_id"),
         }
+        for key in ("current_message_type", "current_file_name"):
+            if latest_runtime_state.get(key):
+                result[key] = latest_runtime_state[key]
         await _save_clone_state(store, "last", result)
         await status.edit_text(
             _format_status_text(result),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=_status_reply_markup("main"),
         )
     finally:
         ACTIVE_CLONE_TASK = None
@@ -1142,6 +1227,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
 
 async def run_bot() -> None:
     _setup_logging()
+    _apply_bootstrap_settings()
 
     bot_token = os.getenv("HEROKU_BOT_TOKEN", "").strip()
     if not bot_token:
@@ -1160,7 +1246,7 @@ async def run_bot() -> None:
         MONGODB_DATA_API_URL,
         MONGODB_DATA_API_KEY,
         MONGODB_DATA_SOURCE,
-        MONGODB_DATABASE,
+        os.getenv("MONGODB_DATABASE", MONGODB_DATABASE).strip(),
         MONGODB_COLLECTION,
         MONGODB_URI,
     )
@@ -1305,6 +1391,7 @@ async def run_bot() -> None:
 
     @bot.on_message(filters.private & filters.command("settings", prefixes="/"))
     async def settings_handler(client, message) -> None:
+        nonlocal admin_ids
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
@@ -1335,11 +1422,13 @@ async def run_bot() -> None:
             try:
                 current_settings[key] = _normalize_setting_value(key, raw_value)
                 await _save_bot_settings(store, current_settings)
+                if key == "owner_id":
+                    admin_ids = _parse_admin_ids(str(current_settings[key] or ""))
             except Exception as exc:
                 await message.reply_text(f"Could not save setting: {exc}")
                 return
             await message.reply_text(
-                f"Saved <code>{key}</code> = <code>{current_settings[key]}</code>",
+                f"Saved <code>{key}</code> = <code>{_html(_masked_setting_value(key, current_settings[key]))}</code>",
                 parse_mode=enums.ParseMode.HTML,
             )
             return
@@ -1351,6 +1440,7 @@ async def run_bot() -> None:
             key = tokens[1].strip()
             if key.lower() == "all":
                 await _save_bot_settings(store, dict(BOT_SETTINGS_DEFAULTS))
+                admin_ids = _parse_admin_ids(str(BOT_SETTINGS_DEFAULTS["owner_id"] or ""))
                 await message.reply_text("All settings were reset to defaults.")
                 return
             if key not in BOT_SETTINGS_DEFAULTS:
@@ -1358,8 +1448,10 @@ async def run_bot() -> None:
                 return
             current_settings[key] = BOT_SETTINGS_DEFAULTS[key]
             await _save_bot_settings(store, current_settings)
+            if key == "owner_id":
+                admin_ids = _parse_admin_ids(str(current_settings[key] or ""))
             await message.reply_text(
-                f"Reset <code>{key}</code> to <code>{BOT_SETTINGS_DEFAULTS[key]}</code>",
+                f"Reset <code>{key}</code> to <code>{_html(_masked_setting_value(key, BOT_SETTINGS_DEFAULTS[key]))}</code>",
                 parse_mode=enums.ParseMode.HTML,
             )
             return
@@ -1368,6 +1460,7 @@ async def run_bot() -> None:
 
     @bot.on_callback_query(filters.regex(r"^settings:"))
     async def settings_callback_handler(client, callback_query) -> None:
+        nonlocal admin_ids
         user = getattr(callback_query, "from_user", None)
         user_id = getattr(user, "id", None)
         if not isinstance(user_id, int) or user_id not in admin_ids:
@@ -1438,6 +1531,8 @@ async def run_bot() -> None:
             current_settings[key] = BOT_SETTINGS_DEFAULTS[key]
             try:
                 await _save_bot_settings(store, current_settings)
+                if key == "owner_id":
+                    admin_ids = _parse_admin_ids(str(current_settings[key] or ""))
             except Exception as exc:
                 await callback_query.answer(f"Could not reset: {exc}", show_alert=True)
                 return

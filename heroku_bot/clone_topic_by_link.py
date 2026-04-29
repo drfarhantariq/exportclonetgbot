@@ -93,6 +93,8 @@ class WzmlTransferReporter:
         failed: int,
         payload: dict[str, Any],
         status_callback: Optional["StatusCallback"],
+        message_type: str | None = None,
+        file_name: str | None = None,
     ) -> None:
         self.source_message_id = source_message_id
         self.index = index
@@ -101,6 +103,8 @@ class WzmlTransferReporter:
         self.failed = failed
         self.payload = payload
         self.status_callback = status_callback
+        self.message_type = message_type
+        self.file_name = file_name
 
         self._download_started_at = time.time()
         self._upload_started_at: float | None = None
@@ -172,6 +176,8 @@ class WzmlTransferReporter:
             upload_speed_bps=up.speed_bps,
             upload_speed=f"{_get_readable_file_size(up.speed_bps)}/s",
             upload_eta=up_eta,
+            current_message_type=self.message_type,
+            current_file_name=self.file_name,
         )
 
     async def on_download_progress(self, current: int, total: int, *args: Any) -> None:
@@ -211,6 +217,46 @@ def _ensure_runtime_dirs() -> None:
 
 
 StatusCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def _message_media_type(message: Any | None) -> str:
+    if message is None or getattr(message, "empty", False):
+        return "Unknown"
+    if getattr(message, "video", None):
+        return "Video"
+    if getattr(message, "animation", None):
+        return "Video"
+    document = getattr(message, "document", None)
+    if document:
+        mime_type = str(getattr(document, "mime_type", "") or "").lower()
+        file_name = str(getattr(document, "file_name", "") or "").lower()
+        if mime_type == "application/pdf" or file_name.endswith(".pdf"):
+            return "PDF"
+        if mime_type.startswith("video/"):
+            return "Video"
+        return "Document"
+    if getattr(message, "photo", None):
+        return "Photo"
+    if getattr(message, "audio", None):
+        return "Audio"
+    if getattr(message, "voice", None):
+        return "Voice"
+    if getattr(message, "sticker", None):
+        return "Sticker"
+    if getattr(message, "text", None):
+        return "Text"
+    return "Unsupported"
+
+
+def _message_file_name(message: Any | None) -> str | None:
+    if message is None:
+        return None
+    for attr in ("document", "video", "animation", "audio"):
+        media = getattr(message, attr, None)
+        file_name = str(getattr(media, "file_name", "") or "").strip() if media else ""
+        if file_name:
+            return file_name
+    return None
 
 
 async def _save_clone_status(
@@ -730,6 +776,37 @@ async def _clone_topic_messages(
         destination_message = None
         used_restricted_media_fallback = False
         try:
+            if not dry_run and source_message is None:
+                try:
+                    source_message = await telegram.get_message(
+                        endpoints.source_chat_id,
+                        source_message_id,
+                    )
+                except Exception:
+                    logging.getLogger("topic_clone").debug(
+                        "source message metadata lookup failed",
+                        exc_info=True,
+                        extra={
+                            "event": "source_message_metadata_lookup_failed",
+                            "message_id": source_message_id,
+                        },
+                    )
+
+            current_message_type = _message_media_type(source_message)
+            current_file_name = _message_file_name(source_message)
+            await _save_clone_status(
+                status_callback,
+                "running",
+                payload,
+                current_index=index,
+                total_messages=total_messages,
+                success=success,
+                failed=failed,
+                current_message_id=source_message_id,
+                current_message_type=current_message_type,
+                current_file_name=current_file_name,
+            )
+
             if dry_run:
                 print(
                     f"[DRY RUN] {index}/{total_messages} copy "
@@ -739,10 +816,13 @@ async def _clone_topic_messages(
             else:
                 copied_with_hidden_sender = None
                 if hide_sender_name:
-                    source_message = await telegram.get_message(
-                        endpoints.source_chat_id,
-                        source_message_id,
-                    )
+                    if source_message is None:
+                        source_message = await telegram.get_message(
+                            endpoints.source_chat_id,
+                            source_message_id,
+                        )
+                        current_message_type = _message_media_type(source_message)
+                        current_file_name = _message_file_name(source_message)
                     reporter = WzmlTransferReporter(
                         source_message_id=source_message_id,
                         index=index,
@@ -751,6 +831,8 @@ async def _clone_topic_messages(
                         failed=failed,
                         payload=payload,
                         status_callback=status_callback,
+                        message_type=current_message_type,
+                        file_name=current_file_name,
                     )
                     copied_with_hidden_sender = await _clone_message_with_hidden_sender(
                         telegram,
@@ -784,6 +866,8 @@ async def _clone_topic_messages(
                             failed=failed,
                             payload=payload,
                             status_callback=status_callback,
+                            message_type=current_message_type,
+                            file_name=current_file_name,
                         )
                         destination_message = await _clone_restricted_message(
                             telegram,
@@ -810,6 +894,8 @@ async def _clone_topic_messages(
                 last_successful_source_message_id=source_message_id,
                 last_successful_destination_message_id=destination_message_id,
                 last_successful_message_link=last_successful_message_link,
+                current_message_type=current_message_type,
+                current_file_name=current_file_name,
             )
         except asyncio.CancelledError:
             raise
@@ -833,6 +919,8 @@ async def _clone_topic_messages(
                 failed=failed,
                 current_message_id=source_message_id,
                 error=str(exc),
+                current_message_type=_message_media_type(source_message),
+                current_file_name=_message_file_name(source_message),
             )
             print(f"[{index}/{total_messages}] failed for message {source_message_id}: {exc}")
             if not continue_on_error:
