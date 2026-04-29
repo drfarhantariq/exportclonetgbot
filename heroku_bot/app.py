@@ -478,6 +478,15 @@ def _normalize_setting_value(key: str, value: Any) -> Any:
     return value
 
 
+def _setting_default(key: str) -> Any:
+    env_name = ENV_SETTING_KEYS.get(key)
+    if env_name:
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return BOT_SETTINGS_DEFAULTS[key]
+
+
 def _masked_setting_value(key: str, value: Any) -> str:
     text = str(value or "")
     if key not in SECRET_SETTING_KEYS:
@@ -523,11 +532,22 @@ def _login_help_text() -> str:
     return (
         "<b>Telegram Session Login</b>\n\n"
         "Use <code>/login</code> to generate a Pyrogram user session string.\n"
-        "The bot will ask for phone number, Telegram login code, and 2FA password if enabled.\n\n"
+        "If <code>TG_SESSION_STRING</code> is already set, the bot will not ask you to login again.\n\n"
         "You can also start with:\n"
         "<code>/login &lt;api_id&gt; &lt;api_hash&gt;</code>\n\n"
+        "To replace an existing session, use:\n"
+        "<code>/login force</code>\n"
+        "<code>/login force &lt;api_id&gt; &lt;api_hash&gt;</code>\n\n"
         "Cancel anytime with <code>/login cancel</code>."
     )
+
+
+def _configured_session_string(settings: dict[str, Any] | None = None) -> str:
+    if isinstance(settings, dict):
+        value = str(settings.get("tg_session_string") or "").strip()
+        if value:
+            return value
+    return os.getenv("TG_SESSION_STRING", "").strip()
 
 
 def _resume_clone_payload_from_state(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -590,23 +610,28 @@ async def _load_bot_settings(store: MongoStateStore) -> dict[str, Any]:
     except Exception:
         stored = _read_json_file(_snapshot_path("bot_settings"))
 
-    merged = dict(BOT_SETTINGS_DEFAULTS)
+    merged = {key: _setting_default(key) for key in BOT_SETTINGS_DEFAULTS}
     if isinstance(stored, dict):
-        for key, default_value in BOT_SETTINGS_DEFAULTS.items():
+        for key in BOT_SETTINGS_DEFAULTS:
+            default_value = _setting_default(key)
             if key not in stored:
                 continue
             try:
-                merged[key] = _normalize_setting_value(key, stored[key])
+                value = _normalize_setting_value(key, stored[key])
             except Exception:
                 merged[key] = default_value
+                continue
+            if key in ENV_SETTING_KEYS and not str(value or "").strip() and str(default_value or "").strip():
+                continue
+            merged[key] = value
     _apply_env_settings(merged)
     return merged
 
 
 async def _save_bot_settings(store: MongoStateStore, settings: dict[str, Any]) -> None:
     normalized = {
-        key: _normalize_setting_value(key, settings.get(key, default))
-        for key, default in BOT_SETTINGS_DEFAULTS.items()
+        key: _normalize_setting_value(key, settings.get(key, _setting_default(key)))
+        for key in BOT_SETTINGS_DEFAULTS
     }
     _write_json_file(_snapshot_path("bot_settings"), normalized)
     try:
@@ -619,8 +644,8 @@ async def _save_bot_settings(store: MongoStateStore, settings: dict[str, Any]) -
 def _format_bot_settings(settings: dict[str, Any]) -> str:
     lines = ["<b>Bot Settings</b>"]
     for key in sorted(BOT_SETTINGS_DEFAULTS):
-        current = settings.get(key, BOT_SETTINGS_DEFAULTS[key])
-        default = BOT_SETTINGS_DEFAULTS[key]
+        current = settings.get(key, _setting_default(key))
+        default = _setting_default(key)
         lines.append(
             f"<code>{key}</code> = <code>{_html(_masked_setting_value(key, current))}</code> "
             f"(default: <code>{_html(_masked_setting_value(key, default))}</code>)"
@@ -689,8 +714,8 @@ def _settings_markup(page: int = 0, state: str = "view") -> InlineKeyboardMarkup
 
 
 def _format_setting_detail(settings: dict[str, Any], key: str, page: int, state: str, user) -> str:
-    current = settings.get(key, BOT_SETTINGS_DEFAULTS[key])
-    default = BOT_SETTINGS_DEFAULTS[key]
+    current = settings.get(key, _setting_default(key))
+    default = _setting_default(key)
     lines = [
         f"<b>{_html(_display_name(user))}</b>",
         "/settings",
@@ -1574,6 +1599,18 @@ async def run_bot() -> None:
         await _close_login_flow(user_id)
         current_settings = await _load_bot_settings(store)
 
+        force_login = bool(tokens and tokens[0].lower() == "force")
+        if force_login:
+            tokens = tokens[1:]
+
+        if _configured_session_string(current_settings) and not force_login:
+            await message.reply_text(
+                "A Telegram user session string is already configured, so login is not needed.\n\n"
+                "To replace it, use <code>/login force</code>.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+
         if len(tokens) >= 2:
             try:
                 current_settings["tg_api_id"] = _normalize_setting_value("tg_api_id", tokens[0])
@@ -1744,19 +1781,20 @@ async def run_bot() -> None:
                 return
             key = tokens[1].strip()
             if key.lower() == "all":
-                await _save_bot_settings(store, dict(BOT_SETTINGS_DEFAULTS))
-                admin_ids = _parse_admin_ids(str(BOT_SETTINGS_DEFAULTS["owner_id"] or ""))
+                reset_settings = {setting_key: _setting_default(setting_key) for setting_key in BOT_SETTINGS_DEFAULTS}
+                await _save_bot_settings(store, reset_settings)
+                admin_ids = _parse_admin_ids(str(reset_settings["owner_id"] or ""))
                 await message.reply_text("All settings were reset to defaults.")
                 return
             if key not in BOT_SETTINGS_DEFAULTS:
                 await message.reply_text(f"Unknown setting: {key}")
                 return
-            current_settings[key] = BOT_SETTINGS_DEFAULTS[key]
+            current_settings[key] = _setting_default(key)
             await _save_bot_settings(store, current_settings)
             if key == "owner_id":
                 admin_ids = _parse_admin_ids(str(current_settings[key] or ""))
             await message.reply_text(
-                f"Reset <code>{key}</code> to <code>{_html(_masked_setting_value(key, BOT_SETTINGS_DEFAULTS[key]))}</code>",
+                f"Reset <code>{key}</code> to <code>{_html(_masked_setting_value(key, _setting_default(key)))}</code>",
                 parse_mode=enums.ParseMode.HTML,
             )
             return
@@ -1833,7 +1871,7 @@ async def run_bot() -> None:
             if key not in BOT_SETTINGS_DEFAULTS:
                 await callback_query.answer("Unknown setting.", show_alert=True)
                 return
-            current_settings[key] = BOT_SETTINGS_DEFAULTS[key]
+            current_settings[key] = _setting_default(key)
             try:
                 await _save_bot_settings(store, current_settings)
                 if key == "owner_id":
@@ -1904,6 +1942,14 @@ async def run_bot() -> None:
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
         bot_settings = await _load_bot_settings(store)
+        if not _configured_session_string(bot_settings):
+            await message.reply_text(
+                "No Telegram user session string is configured yet.\n\n"
+                "Set it from your deploy environment as <code>TG_SESSION_STRING</code>, "
+                "or generate one with <code>/login</code>.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
 
         if command_text.lower() in {"last", "resume"}:
             stored = await store.load("export:last")
@@ -1948,6 +1994,14 @@ async def run_bot() -> None:
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
         bot_settings = await _load_bot_settings(store)
+        if not _configured_session_string(bot_settings):
+            await message.reply_text(
+                "No Telegram user session string is configured yet.\n\n"
+                "Set it from your deploy environment as <code>TG_SESSION_STRING</code>, "
+                "or generate one with <code>/login</code>.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
 
         if command_text.lower() in {"last", "resume"}:
             stored = await store.load("clone:last")
