@@ -22,6 +22,38 @@ from hyper_download import HyperTGDownload
 
 T = TypeVar("T")
 
+from pyrogram.session.session import Session, TLObject
+
+
+if not getattr(Session.invoke, "_topic_cloner_sleep_patch", False):
+    _original_session_invoke = Session.invoke
+
+    async def _patched_session_invoke(
+        self,
+        query: TLObject,
+        retries: int = Session.MAX_RETRIES,
+        timeout: float = Session.WAIT_TIMEOUT,
+        sleep_threshold: float = Session.SLEEP_THRESHOLD,
+    ):
+        # Pyrogram's media download code hardcodes small sleep thresholds for
+        # GetFile calls. When Telegram asks for a larger wait, Pyrogram logs the
+        # FloodWait inside get_file and returns an empty file. Raise only low
+        # non-negative thresholds to the client setting; preserve negative
+        # thresholds because Pyrogram uses them to mean "raise immediately".
+        client_threshold = getattr(getattr(self, "client", None), "sleep_threshold", None)
+        if client_threshold is not None and sleep_threshold >= 0:
+            sleep_threshold = max(sleep_threshold, client_threshold)
+        return await _original_session_invoke(
+            self,
+            query,
+            retries=retries,
+            timeout=timeout,
+            sleep_threshold=sleep_threshold,
+        )
+
+    _patched_session_invoke._topic_cloner_sleep_patch = True
+    Session.invoke = _patched_session_invoke
+
 
 class TelegramService:
     def __init__(
@@ -52,7 +84,7 @@ class TelegramService:
             session_string=settings.session_string,
             in_memory=True,
             no_updates=not receive_updates,
-            sleep_threshold=60,
+            sleep_threshold=86400,
             **self._transmission_options(),
         )
 
@@ -104,7 +136,7 @@ class TelegramService:
             bot_token=token,
             in_memory=True,
             no_updates=True,
-            sleep_threshold=60,
+            sleep_threshold=86400,
             **self._transmission_options(),
         )
         try:

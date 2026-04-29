@@ -62,6 +62,7 @@ class AppSettings:
     bot_status_response_timeout_sec: float
     enable_bot_prefetch: bool
     action_delay_sec: float
+    restricted_media_cooldown_sec: float
     retry_limit: int
     clone_old_messages: bool
     clone_limit: int
@@ -162,6 +163,7 @@ def load_settings(config_path: str | Path) -> tuple[AppSettings, list[MappingCon
         bot_status_response_timeout_sec=_read_float_env("BOT_STATUS_RESPONSE_TIMEOUT_SEC", 20.0),
         enable_bot_prefetch=_read_bool_env("ENABLE_BOT_PREFETCH", False),
         action_delay_sec=_read_float_env("ACTION_DELAY_SEC", 0.35),
+        restricted_media_cooldown_sec=_read_float_env("RESTRICTED_MEDIA_COOLDOWN_SEC", 0.0),
         retry_limit=_read_int_env("RETRY_LIMIT", 3),
         clone_old_messages=_read_bool_env("CLONE_OLD_MESSAGES", True),
         clone_limit=_read_int_env("CLONE_LIMIT", 0),

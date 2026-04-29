@@ -728,6 +728,7 @@ async def _clone_topic_messages(
 
         source_message = None
         destination_message = None
+        used_restricted_media_fallback = False
         try:
             if dry_run:
                 print(
@@ -769,6 +770,7 @@ async def _clone_topic_messages(
                             message_id=source_message_id,
                         )
                     except ChatForwardsRestricted:
+                        used_restricted_media_fallback = True
                         if source_message is None:
                             source_message = await telegram.get_message(
                                 endpoints.source_chat_id,
@@ -837,8 +839,15 @@ async def _clone_topic_messages(
                 raise
 
         has_more = index < total_messages
-        if has_more and not dry_run and delay_sec > 0:
-            await asyncio.sleep(delay_sec)
+        if has_more and not dry_run:
+            next_delay_sec = delay_sec
+            if used_restricted_media_fallback:
+                next_delay_sec = max(
+                    next_delay_sec,
+                    telegram.settings.restricted_media_cooldown_sec,
+                )
+            if next_delay_sec > 0:
+                await asyncio.sleep(next_delay_sec)
 
     return (success, failed)
 
