@@ -494,8 +494,22 @@ class TelegramService:
             if source_message.video:
                 duration, width, height = await self._video_upload_metadata(file_path, source_message.video)
                 thumb = await self._generate_video_thumbnail(file_path, duration)
-                if thumb:
-                    width, height = await asyncio.to_thread(self._image_size, thumb, width, height)
+                self.logger.info(
+                    "uploading downloaded video: duration=%s width=%s height=%s source_duration=%s file=%s",
+                    duration,
+                    width,
+                    height,
+                    int(getattr(source_message.video, "duration", 0) or 0),
+                    file_path,
+                    extra={
+                        "event": "video_upload_metadata",
+                        "file": str(file_path),
+                        "duration": duration,
+                        "width": width,
+                        "height": height,
+                        "source_duration": int(getattr(source_message.video, "duration", 0) or 0),
+                    },
+                )
                 return await self.write_call(
                     "send_downloaded_video_to_topic",
                     lambda: self.app.send_video(
@@ -517,8 +531,22 @@ class TelegramService:
             if source_message.animation:
                 duration, width, height = await self._video_upload_metadata(file_path, source_message.animation)
                 thumb = await self._generate_video_thumbnail(file_path, duration)
-                if thumb:
-                    width, height = await asyncio.to_thread(self._image_size, thumb, width, height)
+                self.logger.info(
+                    "uploading downloaded animation: duration=%s width=%s height=%s source_duration=%s file=%s",
+                    duration,
+                    width,
+                    height,
+                    int(getattr(source_message.animation, "duration", 0) or 0),
+                    file_path,
+                    extra={
+                        "event": "animation_upload_metadata",
+                        "file": str(file_path),
+                        "duration": duration,
+                        "width": width,
+                        "height": height,
+                        "source_duration": int(getattr(source_message.animation, "duration", 0) or 0),
+                    },
+                )
                 return await self.write_call(
                     "send_downloaded_animation_to_topic",
                     lambda: self.app.send_animation(
@@ -715,21 +743,6 @@ class TelegramService:
 
         return mean >= 8.0 and contrast >= 5.0 and thumb_path.stat().st_size <= 200 * 1024
 
-    @staticmethod
-    def _image_size(image_path: Path, fallback_width: int, fallback_height: int) -> tuple[int, int]:
-        try:
-            from PIL import Image
-        except ImportError:
-            return fallback_width, fallback_height
-
-        try:
-            with Image.open(image_path) as image:
-                width, height = image.size
-        except OSError:
-            return fallback_width, fallback_height
-
-        return int(width or fallback_width), int(height or fallback_height)
-
     async def _probe_video_metadata(self, file_path: Path) -> tuple[int, int, int]:
         process = None
         try:
@@ -769,22 +782,80 @@ class TelegramService:
         except json.JSONDecodeError:
             return 0, 0, 0
 
-        duration = 0
-        try:
-            duration = round(float(payload.get("format", {}).get("duration") or 0))
-        except (TypeError, ValueError):
-            duration = 0
-
         width = 0
         height = 0
+        video_stream = None
         for stream in payload.get("streams", []):
             if stream.get("codec_type") != "video":
                 continue
+            video_stream = stream
             width = int(stream.get("width") or 0)
             height = int(stream.get("height") or 0)
             break
 
+        duration = self._duration_from_ffprobe_payload(payload, video_stream)
         return duration, width, height
+
+    @classmethod
+    def _duration_from_ffprobe_payload(cls, payload: dict, video_stream: dict | None) -> int:
+        candidates = [
+            payload.get("format", {}).get("duration"),
+        ]
+        if video_stream:
+            candidates.extend(
+                [
+                    video_stream.get("duration"),
+                    video_stream.get("tags", {}).get("DURATION"),
+                    video_stream.get("tags", {}).get("duration"),
+                ]
+            )
+
+            duration_ts = video_stream.get("duration_ts")
+            time_base = video_stream.get("time_base")
+            if duration_ts and time_base:
+                candidates.append(cls._duration_from_time_base(duration_ts, time_base))
+
+        for value in candidates:
+            duration = cls._coerce_duration(value)
+            if duration > 0:
+                return duration
+        return 0
+
+    @staticmethod
+    def _duration_from_time_base(duration_ts, time_base) -> float | None:
+        try:
+            numerator, denominator = str(time_base).split("/", 1)
+            return float(duration_ts) * float(numerator) / float(denominator)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    @staticmethod
+    def _coerce_duration(value) -> int:
+        if value in (None, ""):
+            return 0
+
+        if isinstance(value, (int, float)):
+            return max(1, round(float(value))) if float(value) > 0 else 0
+
+        text = str(value).strip()
+        if not text:
+            return 0
+
+        try:
+            parsed = float(text)
+            return max(1, round(parsed)) if parsed > 0 else 0
+        except ValueError:
+            pass
+
+        match = re.match(r"^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$", text)
+        if not match:
+            return 0
+
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2))
+        seconds = float(match.group(3))
+        total = hours * 3600 + minutes * 60 + seconds
+        return max(1, round(total)) if total > 0 else 0
 
     @staticmethod
     def _ffmpeg_binary() -> str:
