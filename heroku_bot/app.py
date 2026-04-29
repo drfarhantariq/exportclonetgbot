@@ -34,6 +34,12 @@ os.environ.setdefault("LEECH_BOT_USERNAME", "@placeholder_bot")
 os.environ.setdefault("LEECH_BOT_ID", "0")
 
 from pyrogram import Client, enums, filters
+from pyrogram.errors import (
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    PhoneNumberInvalid,
+    SessionPasswordNeeded,
+)
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from clone_topic_by_link import run_clone
@@ -303,6 +309,7 @@ def _bundle_help_text() -> str:
         "/settings - View bot runtime settings\n"
         "/settings set <key> <value> - Change a runtime setting\n"
         "/settings reset <key>|all - Reset one or all settings\n"
+        "/login - Generate and save a Telegram user session string\n"
         "/log - Upload the current bot log file\n"
         "/cancel - Cancel the active clone job\n"
         "/restart - Restart the bot process\n\n"
@@ -349,6 +356,7 @@ ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
 ACTIVE_STATUS_WATCH_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
 ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
+ACTIVE_LOGIN_FLOWS: dict[int, dict[str, Any]] = {}
 SETTINGS_PAGE_SIZE = 10
 
 ENV_SETTING_KEYS = {
@@ -374,6 +382,7 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "clone_default_batch_size": 50,
     "clone_continue_on_error_default": False,
     "clone_hide_sender_name_default": False,
+    "clone_auto_resume_enabled": True,
     "export_default_batch_size": 20,
     "export_default_batch_delay_sec": 2.0,
 }
@@ -394,6 +403,7 @@ BOT_SETTINGS_HELP = (
     "- clone_default_batch_size\n"
     "- clone_continue_on_error_default\n"
     "- clone_hide_sender_name_default\n"
+    "- clone_auto_resume_enabled\n"
     "- export_default_batch_size\n"
     "- export_default_batch_delay_sec\n"
     "- tg_api_id\n"
@@ -442,6 +452,7 @@ def _normalize_setting_value(key: str, value: Any) -> Any:
     if key in {
         "clone_continue_on_error_default",
         "clone_hide_sender_name_default",
+        "clone_auto_resume_enabled",
     }:
         if isinstance(value, bool):
             return value
@@ -489,6 +500,88 @@ def _apply_bootstrap_settings() -> None:
     stored = _read_json_file(_snapshot_path("bot_settings"))
     if isinstance(stored, dict):
         _apply_env_settings(stored)
+
+
+async def _close_login_flow(user_id: int) -> None:
+    flow = ACTIVE_LOGIN_FLOWS.pop(user_id, None)
+    if not flow:
+        return
+    login_client = flow.get("client")
+    if login_client is None:
+        return
+    try:
+        await login_client.disconnect()
+    except Exception:
+        pass
+
+
+def _normalize_login_code(raw: str) -> str:
+    return "".join(char for char in raw.strip() if char.isdigit())
+
+
+def _login_help_text() -> str:
+    return (
+        "<b>Telegram Session Login</b>\n\n"
+        "Use <code>/login</code> to generate a Pyrogram user session string.\n"
+        "The bot will ask for phone number, Telegram login code, and 2FA password if enabled.\n\n"
+        "You can also start with:\n"
+        "<code>/login &lt;api_id&gt; &lt;api_hash&gt;</code>\n\n"
+        "Cancel anytime with <code>/login cancel</code>."
+    )
+
+
+def _resume_clone_payload_from_state(state: dict[str, Any]) -> dict[str, Any] | None:
+    phase = str(state.get("phase", "") or "").lower()
+    if phase not in {"running", "queued"}:
+        return None
+
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else None
+    if not payload:
+        return None
+
+    resumed = dict(payload)
+    last_successful_id = _safe_int(state.get("last_successful_source_message_id"))
+    completed_count = _safe_int(state.get("success")) + _safe_int(state.get("failed"))
+    if completed_count <= 0:
+        completed_count = _safe_int(state.get("current_index"))
+    total_messages = _safe_int(state.get("total_messages"))
+
+    if last_successful_id > 0:
+        message_ids = str(resumed.get("message_ids") or "").strip()
+        if message_ids:
+            remaining_ids = [
+                message_id
+                for message_id in _parse_message_ids_for_resume(message_ids)
+                if message_id > last_successful_id
+            ]
+            resumed["message_ids"] = ",".join(str(message_id) for message_id in remaining_ids)
+            if not remaining_ids:
+                return None
+        else:
+            resumed["start_id"] = last_successful_id + 1
+            if total_messages > 0:
+                resumed["limit"] = max(total_messages - completed_count, 0)
+            elif _safe_int(resumed.get("limit")) > 0:
+                resumed["limit"] = max(_safe_int(resumed.get("limit")) - completed_count, 0)
+            if _safe_int(resumed.get("limit")) == 0 and (total_messages > 0 or _safe_int(payload.get("limit")) > 0):
+                return None
+
+    resumed["resume_from_restart"] = True
+    resumed["resumed_after_source_message_id"] = last_successful_id or None
+    return resumed
+
+
+def _parse_message_ids_for_resume(raw: str) -> list[int]:
+    values: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(int(token))
+        except ValueError:
+            continue
+    return sorted(set(value for value in values if value > 0))
 
 
 async def _load_bot_settings(store: MongoStateStore) -> dict[str, Any]:
@@ -1259,10 +1352,47 @@ async def run_bot() -> None:
         in_memory=True,
     )
 
+    class StartupMessage:
+        def __init__(self, chat_id: int) -> None:
+            self.chat = type("ChatRef", (), {"id": chat_id})()
+
+        async def reply_text(self, text: str, **kwargs):
+            return await bot.send_message(self.chat.id, text, **kwargs)
+
     async def _authorized(message) -> bool:
         user = getattr(message, "from_user", None)
         user_id = getattr(user, "id", None)
         return isinstance(user_id, int) and user_id in admin_ids
+
+    async def _auto_resume_clone_after_start() -> None:
+        if ACTIVE_CLONE_TASK is not None and not ACTIVE_CLONE_TASK.done():
+            return
+
+        bot_settings = await _load_bot_settings(store)
+        if not bool(bot_settings.get("clone_auto_resume_enabled", True)):
+            return
+
+        state = await _load_state(store, "clone:last")
+        if not isinstance(state, dict):
+            return
+
+        payload = _resume_clone_payload_from_state(state)
+        if payload is None:
+            return
+
+        requested_by_id = _safe_int(payload.get("requested_by_id"))
+        target_chat_id = requested_by_id if requested_by_id in admin_ids else sorted(admin_ids)[0]
+        message = StartupMessage(target_chat_id)
+        try:
+            await bot.send_message(
+                target_chat_id,
+                "Heroku restart detected an unfinished clone. Auto-resuming from the last saved checkpoint.",
+            )
+            await _run_clone_job(message, payload, store)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger("heroku_bot").exception("auto resume clone failed")
 
     async def _watch_status_message(chat_id: int, message_id: int, interval_sec: float, last_text: str) -> None:
         key = (chat_id, message_id)
@@ -1388,6 +1518,181 @@ async def run_bot() -> None:
             )
         except Exception:
             pass
+
+    async def _finish_login_flow(user_id: int, login_client: Client, current_settings: dict[str, Any], message) -> None:
+        session_string = await login_client.export_session_string()
+        current_settings["tg_session_string"] = _normalize_setting_value("tg_session_string", session_string)
+        await _save_bot_settings(store, current_settings)
+
+        saved_to_user = True
+        try:
+            await login_client.send_message(
+                "me",
+                f"#WZMLX #PYROGRAM_SESSION_2.0.106\n\n<code>{session_string}</code>",
+            )
+        except Exception:
+            saved_to_user = False
+
+        await _close_login_flow(user_id)
+        if saved_to_user:
+            await message.reply_text(
+                "Login complete. The session string was saved to bot settings and sent to Saved Messages.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        else:
+            await message.reply_text(
+                "Login complete. The session string was saved to bot settings, but I could not send it to Saved Messages.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+
+    @bot.on_message(filters.private & filters.command("login", prefixes="/"))
+    async def login_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+
+        user = getattr(message, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int):
+            await message.reply_text("Could not identify the requesting user.")
+            return
+
+        raw_text = message.text or ""
+        parts = raw_text.split(maxsplit=1)
+        command_text = parts[1].strip() if len(parts) > 1 else ""
+        tokens = shlex.split(command_text) if command_text else []
+
+        if tokens and tokens[0].lower() in {"cancel", "stop"}:
+            await _close_login_flow(user_id)
+            await message.reply_text("Login cancelled.")
+            return
+
+        if tokens and tokens[0].lower() in {"help", "-h", "--help"}:
+            await message.reply_text(_login_help_text(), parse_mode=enums.ParseMode.HTML)
+            return
+
+        await _close_login_flow(user_id)
+        current_settings = await _load_bot_settings(store)
+
+        if len(tokens) >= 2:
+            try:
+                current_settings["tg_api_id"] = _normalize_setting_value("tg_api_id", tokens[0])
+                current_settings["tg_api_hash"] = _normalize_setting_value("tg_api_hash", tokens[1])
+                await _save_bot_settings(store, current_settings)
+            except Exception as exc:
+                await message.reply_text(f"Could not use API credentials: {exc}")
+                return
+
+        try:
+            api_id = int(str(current_settings.get("tg_api_id") or os.getenv("TG_API_ID", "0")).strip() or "0")
+        except ValueError:
+            api_id = 0
+        api_hash = str(current_settings.get("tg_api_hash") or os.getenv("TG_API_HASH", "")).strip()
+
+        if api_id <= 0 or not api_hash:
+            await message.reply_text(
+                "Set API credentials first:\n"
+                "<code>/settings set tg_api_id &lt;api_id&gt;</code>\n"
+                "<code>/settings set tg_api_hash &lt;api_hash&gt;</code>\n\n"
+                "Or start with:\n"
+                "<code>/login &lt;api_id&gt; &lt;api_hash&gt;</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+
+        login_client = Client(
+            name=f"session-login-{user_id}",
+            api_id=api_id,
+            api_hash=api_hash,
+            in_memory=True,
+        )
+        try:
+            await login_client.connect()
+        except Exception as exc:
+            await message.reply_text(f"Could not start Telegram login: {exc}")
+            return
+
+        ACTIVE_LOGIN_FLOWS[user_id] = {
+            "step": "phone",
+            "client": login_client,
+            "settings": current_settings,
+        }
+        await message.reply_text(
+            "Send the phone number for the Telegram user account in international format.\n"
+            "Example: <code>+15551234567</code>\n\n"
+            "Cancel anytime with <code>/login cancel</code>.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    @bot.on_message(filters.private & filters.text)
+    async def login_step_handler(client, message) -> None:
+        user = getattr(message, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in ACTIVE_LOGIN_FLOWS:
+            return
+        if not await _authorized(message):
+            return
+
+        text = (message.text or "").strip()
+        if text.startswith("/"):
+            return
+
+        flow = ACTIVE_LOGIN_FLOWS[user_id]
+        login_client = flow.get("client")
+        if login_client is None:
+            await _close_login_flow(user_id)
+            await message.reply_text("Login state expired. Start again with /login.")
+            return
+
+        step = str(flow.get("step") or "")
+        try:
+            if step == "phone":
+                sent_code = await login_client.send_code(text)
+                flow["phone_number"] = text
+                flow["phone_code_hash"] = sent_code.phone_code_hash
+                flow["step"] = "code"
+                await message.reply_text(
+                    "Telegram sent a login code. Send that code here.\n"
+                    "You can type it with or without spaces.",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                return
+
+            if step == "code":
+                code = _normalize_login_code(text)
+                if not code:
+                    await message.reply_text("Send the numeric Telegram login code.")
+                    return
+                try:
+                    await login_client.sign_in(
+                        phone_number=flow["phone_number"],
+                        phone_code_hash=flow["phone_code_hash"],
+                        phone_code=code,
+                    )
+                except SessionPasswordNeeded:
+                    flow["step"] = "password"
+                    await message.reply_text("Two-step verification is enabled. Send the 2FA password.")
+                    return
+                await _finish_login_flow(user_id, login_client, flow["settings"], message)
+                return
+
+            if step == "password":
+                await login_client.check_password(text)
+                await _finish_login_flow(user_id, login_client, flow["settings"], message)
+                return
+
+            await _close_login_flow(user_id)
+            await message.reply_text("Login state was invalid. Start again with /login.")
+        except PhoneNumberInvalid:
+            await message.reply_text("That phone number was rejected. Send it in international format, like +15551234567.")
+        except PhoneCodeInvalid:
+            await message.reply_text("That code was invalid. Send the latest Telegram login code again.")
+        except PhoneCodeExpired:
+            await _close_login_flow(user_id)
+            await message.reply_text("The login code expired. Start again with /login.")
+        except Exception as exc:
+            await _close_login_flow(user_id)
+            await message.reply_text(f"Login failed: {exc}")
 
     @bot.on_message(filters.private & filters.command("settings", prefixes="/"))
     async def settings_handler(client, message) -> None:
@@ -1649,9 +1954,11 @@ async def run_bot() -> None:
             if stored is None:
                 await message.reply_text("No saved clone profile found.")
                 return
-            payload = stored.get("payload") if isinstance(stored, dict) else None
+            payload = _resume_clone_payload_from_state(stored) if isinstance(stored, dict) else None
+            if payload is None and isinstance(stored, dict):
+                payload = stored.get("payload") if str(stored.get("phase", "")).lower() not in {"running", "queued"} else None
             if not isinstance(payload, dict):
-                await message.reply_text("Saved clone profile is invalid.")
+                await message.reply_text("Saved clone profile is invalid or already fully resumed.")
                 return
         else:
             normalized = _normalize_clone_command(command_text)
@@ -1694,6 +2001,7 @@ async def run_bot() -> None:
 
     await bot.start()
     print("Heroku topic bot is running.")
+    asyncio.create_task(_auto_resume_clone_after_start())
     try:
         await asyncio.Event().wait()
     finally:
