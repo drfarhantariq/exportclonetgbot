@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -19,6 +20,11 @@ try:
 except Exception:
     MongoClient = None
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 BUNDLE_DIR = Path(__file__).resolve().parent
 load_dotenv(BUNDLE_DIR / ".env")
 os.environ.setdefault("HEROKU_RUNTIME_DIR", str(BUNDLE_DIR / "runtime"))
@@ -28,6 +34,7 @@ os.environ.setdefault("LEECH_BOT_USERNAME", "@placeholder_bot")
 os.environ.setdefault("LEECH_BOT_ID", "0")
 
 from pyrogram import Client, enums, filters
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from clone_topic_by_link import run_clone
 from export_topic_list import run_export
@@ -45,12 +52,36 @@ STATE_DIR = RUNTIME_DIR / "state"
 EXPORTS_DIR = RUNTIME_DIR / "exports"
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_FILE = Path(os.getenv("LOG_FILE_PATH", str(LOG_DIR / "app.log"))).expanduser()
+BOT_STARTED_AT = time.time()
 
 
 def _ensure_runtime_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _snapshot_path(name: str) -> Path:
+    _ensure_runtime_dirs()
+    safe_name = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in name)
+    return STATE_DIR / f"{safe_name}.json"
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _setup_logging() -> None:
@@ -315,11 +346,16 @@ def _normalize_clone_command(command_text: str) -> str:
 
 ACTIVE_CLONE_TASK: asyncio.Task | None = None
 ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
+ACTIVE_STATUS_WATCH_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
+ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
+SETTINGS_PAGE_SIZE = 10
 
 BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "clone_status_update_interval_sec": 2.0,
     "clone_status_success_update_interval_sec": 1.5,
     "clone_status_keepalive_interval_sec": 10.0,
+    "status_command_update_interval_sec": 2.0,
     "clone_default_delay_sec": 0.35,
     "clone_default_batch_size": 50,
     "clone_continue_on_error_default": False,
@@ -339,6 +375,7 @@ BOT_SETTINGS_HELP = (
     "- clone_status_update_interval_sec\n"
     "- clone_status_success_update_interval_sec\n"
     "- clone_status_keepalive_interval_sec\n"
+    "- status_command_update_interval_sec\n"
     "- clone_default_delay_sec\n"
     "- clone_default_batch_size\n"
     "- clone_continue_on_error_default\n"
@@ -365,6 +402,7 @@ def _normalize_setting_value(key: str, value: Any) -> Any:
         "clone_status_update_interval_sec",
         "clone_status_success_update_interval_sec",
         "clone_status_keepalive_interval_sec",
+        "status_command_update_interval_sec",
         "clone_default_delay_sec",
         "export_default_batch_delay_sec",
     }:
@@ -434,107 +472,342 @@ def _format_bot_settings(settings: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_status_payload(payload: dict[str, Any] | None) -> str:
-    if payload is None:
-        return "None"
-    return json.dumps(payload, indent=2, sort_keys=True)
+def _display_name(user) -> str:
+    first_name = str(getattr(user, "first_name", "") or "").strip()
+    last_name = str(getattr(user, "last_name", "") or "").strip()
+    username = str(getattr(user, "username", "") or "").strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part)
+    return full_name or username or "Admin"
 
 
-def _format_clone_status(state: dict[str, Any]) -> str:
-    parts = []
-    phase = state.get("phase", "unknown")
-    parts.append(f"Phase: {phase.title()}")
+def _settings_page_count() -> int:
+    return max((len(BOT_SETTINGS_DEFAULTS) + SETTINGS_PAGE_SIZE - 1) // SETTINGS_PAGE_SIZE, 1)
 
-    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
-    source = payload.get("source_link", "n/a")
-    dest = payload.get("destination_link", "n/a")
-    source_label = _format_clone_endpoint(payload, "source")
-    destination_label = _format_clone_endpoint(payload, "destination")
-    parts.append(f"Source: {source_label or source}")
-    parts.append(f"Leech: {destination_label or dest}")
 
-    if phase in {"running", "queued"}:
-        parts.append(
-            f"Progress: {state.get('current_index', 0)}/{state.get('total_messages', 0)}"
+def _settings_page_keys(page: int) -> list[str]:
+    keys = sorted(BOT_SETTINGS_DEFAULTS)
+    bounded_page = min(max(page, 0), _settings_page_count() - 1)
+    start = bounded_page * SETTINGS_PAGE_SIZE
+    return keys[start : start + SETTINGS_PAGE_SIZE]
+
+
+def _format_settings_panel(settings: dict[str, Any], page: int, state: str, user) -> str:
+    page = min(max(page, 0), _settings_page_count() - 1)
+    state = state if state in {"view", "edit"} else "view"
+    return (
+        f"<b>{_html(_display_name(user))}</b>\n"
+        "/settings\n\n"
+        f"Config Variables | Page: {page} | State: {state}"
+    )
+
+
+def _settings_markup(page: int = 0, state: str = "view") -> InlineKeyboardMarkup:
+    page = min(max(page, 0), _settings_page_count() - 1)
+    state = state if state in {"view", "edit"} else "view"
+    rows: list[list[InlineKeyboardButton]] = []
+    key_buttons = [
+        InlineKeyboardButton(key, callback_data=f"settings:key:{page}:{state}:{key}")
+        for key in _settings_page_keys(page)
+    ]
+    rows.extend(key_buttons[index : index + 2] for index in range(0, len(key_buttons), 2))
+
+    toggle_label = "View" if state == "edit" else "Edit"
+    toggle_state = "view" if state == "edit" else "edit"
+    rows.append(
+        [
+            InlineKeyboardButton(toggle_label, callback_data=f"settings:page:{page}:{toggle_state}"),
+            InlineKeyboardButton("Back", callback_data=f"settings:page:{page}:view"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("Close", callback_data="settings:close")])
+
+    page_buttons = [
+        InlineKeyboardButton(str(index), callback_data=f"settings:page:{index}:{state}")
+        for index in range(_settings_page_count())
+    ]
+    rows.extend(page_buttons[index : index + 8] for index in range(0, len(page_buttons), 8))
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_setting_detail(settings: dict[str, Any], key: str, page: int, state: str, user) -> str:
+    current = settings.get(key, BOT_SETTINGS_DEFAULTS[key])
+    default = BOT_SETTINGS_DEFAULTS[key]
+    lines = [
+        f"<b>{_html(_display_name(user))}</b>",
+        "/settings",
+        "",
+        f"Config Variable | Page: {page} | State: {state}",
+        "",
+        f"<b>{_html(key)}</b>",
+        f"┠ <b>Current</b> → <code>{_html(current)}</code>",
+        f"┠ <b>Default</b> → <code>{_html(default)}</code>",
+    ]
+    if state == "edit":
+        lines.extend(
+            [
+                "┃",
+                "┖ Send:",
+                f"<code>/settings set {key} &lt;value&gt;</code>",
+            ]
         )
-        parts.append(
-            f"Success: {state.get('success', 0)} | Failed: {state.get('failed', 0)}"
-        )
-        current_message_id = state.get("current_message_id")
-        if current_message_id:
-            parts.append(f"Current message: {current_message_id}")
-        transfer_stage = state.get("transfer_stage")
-        if transfer_stage:
-            parts.append(f"Transfer stage: {transfer_stage}")
-            parts.append(
-                "Download: "
-                f"{state.get('download_current', 0)}/{state.get('download_total', 0)} "
-                f"at {state.get('download_speed', '0B/s')} "
-                f"(eta {state.get('download_eta', '-')})"
-            )
-            parts.append(
-                "Upload: "
-                f"{state.get('upload_current', 0)}/{state.get('upload_total', 0)} "
-                f"at {state.get('upload_speed', '0B/s')} "
-                f"(eta {state.get('upload_eta', '-')})"
-            )
-        if state.get("error"):
-            parts.append(f"Last error: {state.get('error')}")
-        if phase == "running":
-            parts.append("Cancel: /cancel")
     else:
-        if state.get("success") is not None or state.get("failed") is not None:
-            parts.append(
-                f"Success: {state.get('success', 0)} | Failed: {state.get('failed', 0)}"
-            )
-        if state.get("last_successful_message_link"):
-            parts.append(f"Last successful transfer: {state.get('last_successful_message_link')}")
-        if state.get("error"):
-            parts.append(f"Error: {state.get('error')}")
-
-    started_at = state.get("started_at")
-    updated_at = state.get("updated_at")
-    if started_at is not None:
-        parts.append(f"Started: {time.ctime(float(started_at))}")
-    if updated_at is not None:
-        parts.append(f"Updated: {time.ctime(float(updated_at))}")
-
-    return "\n".join(parts)
+        lines.append("┖ Tap Edit for the set command.")
+    return "\n".join(lines)
 
 
-def _format_clone_status_compact(state: dict[str, Any]) -> str:
-    phase = str(state.get("phase", "unknown")).lower()
-    current = int(state.get("current_index", 0) or 0)
-    total = int(state.get("total_messages", 0) or 0)
-    success = int(state.get("success", 0) or 0)
-    failed = int(state.get("failed", 0) or 0)
+def _setting_detail_markup(key: str, page: int, state: str = "view") -> InlineKeyboardMarkup:
+    state = state if state in {"view", "edit"} else "view"
+    toggle_label = "View" if state == "edit" else "Edit"
+    toggle_state = "view" if state == "edit" else "edit"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(toggle_label, callback_data=f"settings:key:{page}:{toggle_state}:{key}"),
+                InlineKeyboardButton("Reset", callback_data=f"settings:reset:{page}:{state}:{key}"),
+            ],
+            [InlineKeyboardButton("Back", callback_data=f"settings:page:{page}:{state}")],
+            [InlineKeyboardButton("Close", callback_data="settings:close")],
+        ]
+    )
+
+
+def _html(value: Any) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def _readable_file_size(size_in_bytes: Any) -> str:
+    try:
+        size = float(size_in_bytes or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return "0B"
+
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    return f"{size:.2f}{units[unit_index]}"
+
+
+def _readable_time(seconds: Any) -> str:
+    try:
+        remaining = int(max(float(seconds or 0), 0))
+    except (TypeError, ValueError):
+        remaining = 0
+    if remaining <= 0:
+        return "0s"
+
+    parts = []
+    for suffix, length in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if remaining >= length:
+            value, remaining = divmod(remaining, length)
+            parts.append(f"{value}{suffix}")
+    return "".join(parts) or "0s"
+
+
+def _progress_bar(percent: float) -> str:
+    bounded = min(max(float(percent), 0.0), 100.0)
+    filled = int(bounded // 8)
+    return f"[{'⬢' * filled}{'⬡' * (12 - filled)}]"
+
+
+def _format_percent(value: float) -> str:
+    return f"{min(max(value, 0.0), 100.0):.1f}%"
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _status_task_title(state: dict[str, Any]) -> str:
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
+    current = _safe_int(state.get("current_index"))
+    total = _safe_int(state.get("total_messages"))
     current_message_id = state.get("current_message_id")
+    topic = _format_clone_endpoint(payload, "source")
+    if current_message_id:
+        return f"Clone Task {current}/{total or '?'} · Source #{current_message_id}"
+    if topic:
+        return f"Clone Task · {topic}"
+    return "Clone Task"
+
+
+def _status_requester(payload: dict[str, Any]) -> str:
+    user_id = payload.get("requested_by_id")
+    name = str(payload.get("requested_by_name") or "Admin").strip() or "Admin"
+    if user_id:
+        return f"<a href=\"tg://user?id={_html(user_id)}\">{_html(name)}</a> ( #ID{_html(user_id)} )"
+    return _html(name)
+
+
+def _clone_stage_label(state: dict[str, Any]) -> str:
+    phase = str(state.get("phase", "unknown")).lower()
+    if phase == "running":
+        stage = str(state.get("transfer_stage") or "").lower()
+        if stage == "upload":
+            return "Upload"
+        if stage == "download":
+            return "Download"
+        return "Clone"
+    return phase.title()
+
+
+def _clone_progress_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    stage = str(state.get("transfer_stage") or "").lower()
+    if stage in {"download", "upload"}:
+        current = _safe_int(state.get(f"{stage}_current"))
+        total = _safe_int(state.get(f"{stage}_total"))
+        percent = (current / total * 100.0) if total > 0 else 0.0
+        speed = str(state.get(f"{stage}_speed") or "0B/s")
+        eta_seconds = None
+        speed_bps = _safe_float(state.get(f"{stage}_speed_bps"))
+        if speed_bps > 0 and total > 0:
+            eta_seconds = max((total - current) / speed_bps, 0.0)
+        return {
+            "percent": percent,
+            "processed": _readable_file_size(current),
+            "total": _readable_file_size(total),
+            "unit": "",
+            "speed": speed,
+            "eta_seconds": eta_seconds,
+        }
+
+    current = _safe_int(state.get("current_index"))
+    total = _safe_int(state.get("total_messages"))
+    percent = (current / total * 100.0) if total > 0 else 0.0
+    started_at = _safe_float(state.get("started_at"))
+    elapsed = max(time.time() - started_at, 0.0) if started_at > 0 else 0.0
+    eta_seconds = None
+    if current > 0 and total > current and elapsed > 0:
+        eta_seconds = (total - current) * (elapsed / current)
+    return {
+        "percent": percent,
+        "processed": str(current),
+        "total": str(total),
+        "unit": "messages",
+        "speed": "-",
+        "eta_seconds": eta_seconds,
+    }
+
+
+def _format_bot_stats() -> str:
+    if psutil is None:
+        return f"⌬ <b><u>Bot Stats</u></b>\n┖ <b>UP</b> → {_readable_time(time.time() - BOT_STARTED_AT)}"
+
+    _ensure_runtime_dirs()
+    disk = psutil.disk_usage(str(RUNTIME_DIR))
+    return (
+        "⌬ <b><u>Bot Stats</u></b>"
+        f"\n┟ <b>CPU</b> → {psutil.cpu_percent()}% | <b>F</b> → {_readable_file_size(disk.free)} [{round(100 - disk.percent, 1)}%]"
+        f"\n┖ <b>RAM</b> → {psutil.virtual_memory().percent}% | <b>UP</b> → {_readable_time(time.time() - BOT_STARTED_AT)}"
+    )
+
+
+def _format_clone_status_panel(state: dict[str, Any]) -> str:
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
+    phase = str(state.get("phase", "unknown")).lower()
+    snapshot = _clone_progress_snapshot(state)
+    percent = snapshot["percent"]
+    started_at = _safe_float(state.get("started_at"))
+    elapsed = max(time.time() - started_at, 0.0) if started_at > 0 else 0.0
+    eta_seconds = snapshot.get("eta_seconds")
+    total_time = elapsed + (float(eta_seconds) if eta_seconds is not None else 0.0)
+    eta_text = "-" if eta_seconds is None else _readable_time(eta_seconds)
+
+    processed = f"{snapshot['processed']} of {snapshot['total']}"
+    if snapshot.get("unit"):
+        processed = f"{processed} {snapshot['unit']}"
+
+    source_label = _format_clone_endpoint(payload, "source") or payload.get("source_link", "n/a")
+    destination_label = _format_clone_endpoint(payload, "destination") or payload.get("destination_link", "n/a")
+
+    lines = [
+        f"<b>1.</b> <b><i>{_html(_status_task_title(state))}</i></b>",
+        "",
+        f"<b>Task By {_status_requester(payload)}</b>",
+        f"┟ {_progress_bar(percent)} <i>{_format_percent(percent)}</i>",
+        f"┠ <b>Processed</b> → <i>{_html(processed)}</i>",
+        f"┠ <b>Status</b> → <b>{_html(_clone_stage_label(state))}</b>",
+        f"┠ <b>Speed</b> → <i>{_html(snapshot['speed'])}</i>",
+        f"┠ <b>Time</b> → <i>{_html(eta_text)} of {_html(_readable_time(total_time))} ( {_html(_readable_time(elapsed))} )</i>",
+        "┠ <b>Engine</b> → <i>Pyrogram</i>",
+        f"┠ <b>In Mode</b> → <i>{_html(source_label)}</i>",
+        f"┠ <b>Out Mode</b> → <i>{_html(destination_label)}</i>",
+    ]
 
     if phase == "running":
-        dl_speed = state.get("download_speed")
-        up_speed = state.get("upload_speed")
-        speed_text = ""
-        if dl_speed or up_speed:
-            speed_text = f" | DL: {dl_speed or '0B/s'} | UP: {up_speed or '0B/s'}"
-        return (
-            f"Live: {current}/{total} | Forwarded: {success} | Failed: {failed} "
-            f"| Current: {current_message_id or '-'}{speed_text}"
+        lines.append("<b>┖ Stop</b> → <i>/cancel</i>")
+    elif phase == "completed":
+        lines.append(
+            f"┖ <b>Result</b> → <i>Forwarded {state.get('success', 0)} | Failed {state.get('failed', 0)}</i>"
         )
-    if phase == "queued":
-        return "Live: queued"
-    if phase == "completed":
-        return f"Live: completed | Forwarded: {success} | Failed: {failed}"
-    if phase == "cancelled":
-        return f"Live: cancelled at {current}/{total} | Forwarded: {success} | Failed: {failed}"
-    if phase == "failed":
-        link = str(state.get("last_successful_message_link") or "").strip()
-        if link:
-            return (
-                f"Live: failed at {current}/{total} | Forwarded: {success} | Failed: {failed} "
-                f"| Last OK: {link}"
-            )
-        return f"Live: failed at {current}/{total} | Forwarded: {success} | Failed: {failed}"
-    return f"Live: {phase} | Forwarded: {success} | Failed: {failed}"
+    elif phase in {"failed", "cancelled"}:
+        error = state.get("error")
+        if error:
+            lines.append(f"┠ <b>Error</b> → <i>{_html(error)}</i>")
+        lines.append(
+            f"┖ <b>Result</b> → <i>Forwarded {state.get('success', 0)} | Failed {state.get('failed', 0)}</i>"
+        )
+    else:
+        lines.append(f"┖ <b>Phase</b> → <i>{_html(phase.title())}</i>")
+
+    last_link = str(state.get("last_successful_message_link") or "").strip()
+    if last_link and phase in {"failed", "cancelled"}:
+        lines.append(f"\nLast successful transfer: {_html(last_link)}")
+
+    return "\n".join(lines)
+
+
+def _format_clone_status_with_stats(state: dict[str, Any]) -> str:
+    return f"{_format_clone_status_panel(state)}\n\n{_format_bot_stats()}"
+
+
+def _format_export_status(state: dict[str, Any]) -> str:
+    phase = str(state.get("phase", "unknown")).title()
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
+    lines = [f"Phase: {_html(phase)}"]
+
+    topic_link = payload.get("topic_link")
+    if topic_link:
+        lines.append(f"Topic: {_html(topic_link)}")
+
+    output = state.get("output") or payload.get("out_path")
+    if output:
+        lines.append(f"Output: {_html(output)}")
+
+    batch_size = payload.get("batch_size")
+    batch_delay = payload.get("batch_delay_sec")
+    if batch_size or batch_delay is not None:
+        lines.append(f"Batch: {_html(batch_size or '-')} messages, delay {_html(batch_delay if batch_delay is not None else '-')}s")
+
+    upload_topic_link = payload.get("upload_topic_link")
+    if upload_topic_link:
+        lines.append(f"Upload topic: {_html(upload_topic_link)}")
+
+    flags = []
+    if payload.get("caption_file_names"):
+        flags.append("caption file names")
+    if payload.get("onwards"):
+        flags.append("onwards")
+    if flags:
+        lines.append(f"Options: {_html(', '.join(flags))}")
+
+    if state.get("error"):
+        lines.append(f"Error: {_html(state.get('error'))}")
+
+    return "\n".join(lines)
 
 
 def _format_clone_endpoint(payload: dict[str, Any], prefix: str) -> str:
@@ -557,6 +830,107 @@ async def _save_clone_state(store: MongoStateStore, label: str, state: dict[str,
         await store.save(f"clone:{label}", state)
     except Exception:
         _write_json_file(_snapshot_path(f"clone_{label}"), state)
+
+
+async def _load_state(store: MongoStateStore, key: str) -> dict[str, Any] | None:
+    try:
+        return await store.load(key)
+    except Exception:
+        return _read_json_file(_snapshot_path(key.replace(":", "_")))
+
+
+def _status_reply_markup(view: str = "main") -> InlineKeyboardMarkup:
+    if view == "overview":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Back", callback_data="status:back")],
+                [InlineKeyboardButton("Close", callback_data="status:close")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📜 TStats", callback_data="status:tstats"),
+                InlineKeyboardButton("♻️ Refresh", callback_data="status:refresh"),
+            ],
+            [InlineKeyboardButton("Close", callback_data="status:close")],
+        ]
+    )
+
+
+def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
+    phase = str((clone_state or {}).get("phase", "")).lower()
+    transfer_stage = str((clone_state or {}).get("transfer_stage") or "").lower()
+    is_running = phase == "running"
+    is_queued = phase == "queued"
+
+    download_count = 1 if is_running and transfer_stage == "download" else 0
+    upload_count = 1 if is_running and transfer_stage == "upload" else 0
+    clone_count = 1 if is_running and transfer_stage not in {"download", "upload"} else 0
+    queued_dl_count = 1 if is_queued else 0
+
+    download_speed = "0B/s"
+    upload_speed = "0B/s"
+    if is_running and clone_state:
+        if transfer_stage == "download":
+            download_speed = str(clone_state.get("download_speed") or "0B/s")
+        elif transfer_stage == "upload":
+            upload_speed = str(clone_state.get("upload_speed") or "0B/s")
+
+    return "\n".join(
+        [
+            "☷ <b>Tasks Overview :</b>",
+            "",
+            f"┏ <b>Download</b>: {download_count} | <b>Upload</b>: {upload_count}",
+            "┣ <b>Seed</b>: 0 | <b>Archive</b>: 0",
+            "┣ <b>Extract</b>: 0 | <b>Split</b>: 0",
+            f"┣ <b>QueueDL</b>: {queued_dl_count} | <b>QueueUP</b>: 0",
+            "┣ <b>Clone</b>: "
+            f"{clone_count} | <b>CheckUp</b>: 0",
+            "┣ <b>Paused</b>: 0 | <b>SamVideo</b>: 0",
+            "┣ <b>Convert</b>: 0 | <b>FFmpeg</b>: 0",
+            "┃",
+            f"┣ <b>Total Download Speed</b>: {_html(download_speed)}",
+            f"┣ <b>Total Upload Speed</b>: {_html(upload_speed)}",
+            "┗ <b>Total Seeding Speed</b>: 0B/s",
+        ]
+    )
+
+
+def _format_combined_status_text(
+    clone_state: dict[str, Any] | None,
+    export_state: dict[str, Any] | None,
+) -> str:
+    messages = []
+    if clone_state:
+        messages.append(_format_clone_status_panel(clone_state))
+    else:
+        messages.append("No saved clone state.")
+
+    if export_state:
+        messages.append("\n<b>Export Status</b>")
+        messages.append(_format_export_status(export_state))
+
+    messages.append(_format_bot_stats())
+    return "\n\n".join(messages)
+
+
+async def _load_combined_status_text(store: MongoStateStore) -> tuple[str, dict[str, Any] | None]:
+    export_state, clone_state = await asyncio.gather(
+        _load_state(store, "export:last"),
+        _load_state(store, "clone:last"),
+    )
+    return _format_combined_status_text(clone_state, export_state), clone_state
+
+
+async def _load_status_view_text(store: MongoStateStore, view: str) -> tuple[str, dict[str, Any] | None]:
+    export_state, clone_state = await asyncio.gather(
+        _load_state(store, "export:last"),
+        _load_state(store, "clone:last"),
+    )
+    if view == "overview":
+        return _format_tasks_overview(clone_state), clone_state
+    return _format_combined_status_text(clone_state, export_state), clone_state
 
 
 async def _run_export_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
@@ -594,6 +968,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     ACTIVE_CLONE_CANCEL_EVENT = asyncio.Event()
     ACTIVE_CLONE_TASK = asyncio.current_task()
     bot_settings = await _load_bot_settings(store)
+    job_started_at = time.time()
 
     last_status_edit_at = 0.0
     last_reported_success = -1
@@ -603,54 +978,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     status_update_lock = asyncio.Lock()
 
     def _format_status_text(state: dict[str, Any]) -> str:
-        phase = state.get("phase", "running")
-        payload_info = state.get("payload") if isinstance(state.get("payload"), dict) else payload
-        source_label = _format_clone_endpoint(payload_info, "source")
-        destination_label = _format_clone_endpoint(payload_info, "destination")
-        route_lines = ""
-        if source_label or destination_label:
-            route_lines = (
-                f"Source: {source_label or payload_info.get('source_link', 'n/a')}\n"
-                f"Leech: {destination_label or payload_info.get('destination_link', 'n/a')}\n\n"
-            )
-        if phase == "queued":
-            return f"{route_lines}Clone queued. Waiting to start..."
-
-        total = state.get("total_messages", 0)
-        current = state.get("current_index", 0)
-        success = state.get("success", 0)
-        failed = state.get("failed", 0)
-        current_message_id = state.get("current_message_id")
-
-        if phase == "completed":
-            return (
-                f"{route_lines}Clone complete. Forwarded successfully: {success}, Failed: {failed}."
-            )
-        if phase == "cancelled":
-            return (
-                f"{route_lines}Clone cancelled. Progress: {current}/{total} "
-                f"(forwarded={success}, failed={failed})."
-            )
-        if phase == "failed":
-            last_successful_link = str(state.get("last_successful_message_link") or "").strip()
-            last_successful_line = (
-                f"\nLast successful transfer: {last_successful_link}" if last_successful_link else ""
-            )
-            return (
-                f"{route_lines}Clone failed after {current}/{total}. "
-                f"forwarded={success}, failed={failed}. "
-                f"Error: {state.get('error', 'unknown')}"
-                f"{last_successful_line}"
-            )
-        return (
-            f"{route_lines}"
-            f"Cloning messages: {current}/{total}\n"
-            f"Forwarded successfully: {success}\n"
-            f"Failed: {failed}\n"
-            f"Current source message: {current_message_id}\n"
-            f"Download speed: {state.get('download_speed', '0B/s')} (eta {state.get('download_eta', '-')})\n"
-            f"Upload speed: {state.get('upload_speed', '0B/s')} (eta {state.get('upload_eta', '-')})"
-        )
+        return _format_clone_status_with_stats(state)
 
     async def _save_state_inner(state: dict[str, Any]) -> None:
         nonlocal last_status_edit_at, last_reported_success, last_reported_index, latest_state_payload, latest_runtime_state
@@ -672,6 +1000,8 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
                 if key in state:
                     enriched_payload[key] = state[key]
             wrapper["payload"] = enriched_payload
+        if str(wrapper.get("phase", "")).lower() == "running":
+            wrapper["started_at"] = latest_runtime_state.get("started_at") or job_started_at
         latest_state_payload = dict(wrapper["payload"])
         latest_runtime_state = dict(wrapper)
         await _save_clone_state(store, "last", wrapper)
@@ -698,7 +1028,11 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
 
         async with status_update_lock:
             try:
-                await status.edit_text(_format_status_text(wrapper))
+                await status.edit_text(
+                    _format_status_text(wrapper),
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
             except Exception:
                 pass
             else:
@@ -706,8 +1040,13 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
                 last_reported_success = success
                 last_reported_index = current_index
 
-    await _save_clone_state(store, "last", {"phase": "queued", "payload": payload})
-    status = await message.reply_text("Clone started.")
+    queued_state = {"phase": "queued", "payload": payload, "started_at": job_started_at}
+    await _save_clone_state(store, "last", queued_state)
+    status = await message.reply_text(
+        _format_status_text(queued_state),
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
     try:
         success, failed = await run_clone(
             source_link=payload["source_link"],
@@ -729,6 +1068,12 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "phase": "cancelled",
             "payload": latest_state_payload,
             "error": "Cancelled by user",
+            "started_at": latest_runtime_state.get("started_at", job_started_at),
+            "current_index": latest_runtime_state.get("current_index", 0),
+            "total_messages": latest_runtime_state.get("total_messages", 0),
+            "success": latest_runtime_state.get("success", 0),
+            "failed": latest_runtime_state.get("failed", 0),
+            "current_message_id": latest_runtime_state.get("current_message_id"),
         }
         if latest_runtime_state.get("last_successful_message_link"):
             cancelled_state["last_successful_message_link"] = latest_runtime_state["last_successful_message_link"]
@@ -737,7 +1082,11 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last",
             cancelled_state,
         )
-        await status.edit_text("Clone cancelled.")
+        await status.edit_text(
+            _format_status_text(cancelled_state),
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         raise
     except Exception as exc:
         failed_state = {
@@ -749,6 +1098,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "success": latest_runtime_state.get("success", 0),
             "failed": latest_runtime_state.get("failed", 0),
             "current_message_id": latest_runtime_state.get("current_message_id"),
+            "started_at": latest_runtime_state.get("started_at", job_started_at),
         }
         for key in (
             "last_successful_source_message_id",
@@ -762,7 +1112,11 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last",
             failed_state,
         )
-        await status.edit_text(_format_status_text(failed_state))
+        await status.edit_text(
+            _format_status_text(failed_state),
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         raise
     else:
         result = {
@@ -770,9 +1124,17 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "payload": latest_state_payload,
             "success": success,
             "failed": failed,
+            "started_at": latest_runtime_state.get("started_at", job_started_at),
+            "current_index": latest_runtime_state.get("current_index", 0),
+            "total_messages": latest_runtime_state.get("total_messages", 0),
+            "current_message_id": latest_runtime_state.get("current_message_id"),
         }
         await _save_clone_state(store, "last", result)
-        await status.edit_text(_format_status_text(result))
+        await status.edit_text(
+            _format_status_text(result),
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     finally:
         ACTIVE_CLONE_TASK = None
         ACTIVE_CLONE_CANCEL_EVENT = None
@@ -816,6 +1178,37 @@ async def run_bot() -> None:
         user_id = getattr(user, "id", None)
         return isinstance(user_id, int) and user_id in admin_ids
 
+    async def _watch_status_message(chat_id: int, message_id: int, interval_sec: float, last_text: str) -> None:
+        key = (chat_id, message_id)
+        try:
+            while True:
+                await asyncio.sleep(max(interval_sec, 0.5))
+                view = ACTIVE_STATUS_VIEWS.get(key, "main")
+                text, clone_state = await _load_status_view_text(store, view)
+                last_text = ACTIVE_STATUS_LAST_TEXTS.get(key, last_text)
+                if text != last_text:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=text,
+                            parse_mode=enums.ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_markup=_status_reply_markup(view),
+                        )
+                    except Exception:
+                        break
+                    last_text = text
+                    ACTIVE_STATUS_LAST_TEXTS[key] = text
+
+                phase = str((clone_state or {}).get("phase", "")).lower()
+                if phase and phase != "running":
+                    break
+        finally:
+            ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+            ACTIVE_STATUS_VIEWS.pop(key, None)
+            ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
+
     @bot.on_message(filters.private & filters.command("start", prefixes="/"))
     async def start_handler(client, message) -> None:
         if not await _authorized(message):
@@ -835,19 +1228,80 @@ async def run_bot() -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
-        export_state = await store.load("export:last")
-        clone_state = await store.load("clone:last")
-        messages = []
-        if clone_state:
-            messages.append("<b>Clone Status</b>")
-            messages.append(_format_clone_status_compact(clone_state))
-            messages.append(_format_clone_status(clone_state))
+        text, clone_state = await _load_status_view_text(store, "main")
+        sent = await message.reply_text(
+            text,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=_status_reply_markup("main"),
+        )
+
+        phase = str((clone_state or {}).get("phase", "")).lower()
+        key = (sent.chat.id, sent.id)
+        ACTIVE_STATUS_VIEWS[key] = "main"
+        ACTIVE_STATUS_LAST_TEXTS[key] = text
+        if phase == "running":
+            bot_settings = await _load_bot_settings(store)
+            interval_sec = float(bot_settings["status_command_update_interval_sec"])
+            previous_task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+            if previous_task is not None:
+                previous_task.cancel()
+            ACTIVE_STATUS_WATCH_TASKS[key] = asyncio.create_task(
+                _watch_status_message(sent.chat.id, sent.id, interval_sec, text)
+            )
+
+    @bot.on_callback_query(filters.regex(r"^status:(close|tstats|back|refresh)$"))
+    async def status_callback_handler(client, callback_query) -> None:
+        user = getattr(callback_query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in admin_ids:
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        status_message = getattr(callback_query, "message", None)
+        if status_message is None:
+            await callback_query.answer()
+            return
+
+        key = (status_message.chat.id, status_message.id)
+        action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
+
+        if action == "close":
+            task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+            if task is not None:
+                task.cancel()
+            ACTIVE_STATUS_VIEWS.pop(key, None)
+            ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
+            await callback_query.answer("Closed.")
+            try:
+                await status_message.delete()
+            except Exception:
+                try:
+                    await status_message.edit_text("Closed.")
+                except Exception:
+                    pass
+            return
+
+        if action == "tstats":
+            view = "overview"
+        elif action == "back":
+            view = "main"
         else:
-            messages.append("No saved clone state.")
-        if export_state:
-            messages.append("\n<b>Export Status</b>")
-            messages.append(_format_status_payload(export_state))
-        await message.reply_text("\n\n".join(messages), parse_mode=enums.ParseMode.HTML)
+            view = ACTIVE_STATUS_VIEWS.get(key, "main")
+
+        ACTIVE_STATUS_VIEWS[key] = view
+        text, _ = await _load_status_view_text(store, view)
+        ACTIVE_STATUS_LAST_TEXTS[key] = text
+        await callback_query.answer("Refreshed." if action == "refresh" else "")
+        try:
+            await status_message.edit_text(
+                text,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_status_reply_markup(view),
+            )
+        except Exception:
+            pass
 
     @bot.on_message(filters.private & filters.command("settings", prefixes="/"))
     async def settings_handler(client, message) -> None:
@@ -864,8 +1318,9 @@ async def run_bot() -> None:
 
         if not tokens or tokens[0].lower() in {"show", "list"}:
             await message.reply_text(
-                _format_bot_settings(current_settings),
+                _format_settings_panel(current_settings, 0, "view", getattr(message, "from_user", None)),
                 parse_mode=enums.ParseMode.HTML,
+                reply_markup=_settings_markup(0, "view"),
             )
             return
 
@@ -910,6 +1365,94 @@ async def run_bot() -> None:
             return
 
         await message.reply_text(BOT_SETTINGS_HELP)
+
+    @bot.on_callback_query(filters.regex(r"^settings:"))
+    async def settings_callback_handler(client, callback_query) -> None:
+        user = getattr(callback_query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in admin_ids:
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        settings_message = getattr(callback_query, "message", None)
+        if settings_message is None:
+            await callback_query.answer()
+            return
+
+        data = str(getattr(callback_query, "data", "") or "")
+        parts = data.split(":", 4)
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "close":
+            await callback_query.answer("Closed.")
+            try:
+                await settings_message.delete()
+            except Exception:
+                try:
+                    await settings_message.edit_text("Closed.")
+                except Exception:
+                    pass
+            return
+
+        current_settings = await _load_bot_settings(store)
+
+        if action == "page" and len(parts) >= 4:
+            page = _safe_int(parts[2])
+            state = parts[3] if parts[3] in {"view", "edit"} else "view"
+            await callback_query.answer()
+            try:
+                await settings_message.edit_text(
+                    _format_settings_panel(current_settings, page, state, user),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=_settings_markup(page, state),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "key" and len(parts) >= 5:
+            page = _safe_int(parts[2])
+            state = parts[3] if parts[3] in {"view", "edit"} else "view"
+            key = parts[4]
+            if key not in BOT_SETTINGS_DEFAULTS:
+                await callback_query.answer("Unknown setting.", show_alert=True)
+                return
+            await callback_query.answer()
+            try:
+                await settings_message.edit_text(
+                    _format_setting_detail(current_settings, key, page, state, user),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=_setting_detail_markup(key, page, state),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "reset" and len(parts) >= 5:
+            page = _safe_int(parts[2])
+            state = parts[3] if parts[3] in {"view", "edit"} else "view"
+            key = parts[4]
+            if key not in BOT_SETTINGS_DEFAULTS:
+                await callback_query.answer("Unknown setting.", show_alert=True)
+                return
+            current_settings[key] = BOT_SETTINGS_DEFAULTS[key]
+            try:
+                await _save_bot_settings(store, current_settings)
+            except Exception as exc:
+                await callback_query.answer(f"Could not reset: {exc}", show_alert=True)
+                return
+            await callback_query.answer("Reset.")
+            try:
+                await settings_message.edit_text(
+                    _format_setting_detail(current_settings, key, page, state, user),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=_setting_detail_markup(key, page, state),
+                )
+            except Exception:
+                pass
+            return
+
+        await callback_query.answer()
 
     @bot.on_message(filters.private & filters.command("log", prefixes="/"))
     async def log_handler(client, message) -> None:
@@ -1044,6 +1587,14 @@ async def run_bot() -> None:
                 else bool(bot_settings["clone_hide_sender_name_default"]),
             }
 
+        user = getattr(message, "from_user", None)
+        payload = dict(payload)
+        payload["requested_by_id"] = getattr(user, "id", None)
+        payload["requested_by_name"] = (
+            getattr(user, "first_name", None)
+            or getattr(user, "username", None)
+            or "Admin"
+        )
         await _run_clone_job(message, payload, store)
 
     await bot.start()
