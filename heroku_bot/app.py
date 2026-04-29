@@ -318,6 +318,7 @@ def _bundle_help_text() -> str:
         "[--limit N] [--delay-sec S] [--batch-size N] [--message-ids 1,2,3] [--dry-run] "
         "[--continue-on-error] [--hide-sender-name]\n"
         "/clone <source_link> <destination_link>\n"
+        "/clone status\n"
         "/clone last or /clone resume\n\n"
         "Export:\n"
         "/export --topic-link <link> [--config <path>] [--out <file>] [--batch-size N] "
@@ -1048,6 +1049,25 @@ def _status_reply_markup(view: str = "main") -> InlineKeyboardMarkup:
     )
 
 
+def _clone_status_reply_markup(view: str = "main") -> InlineKeyboardMarkup:
+    if view == "overview":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Back", callback_data="clone_status:back")],
+                [InlineKeyboardButton("Close", callback_data="clone_status:close")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📜 TStats", callback_data="clone_status:tstats"),
+                InlineKeyboardButton("♻️ Refresh", callback_data="clone_status:refresh"),
+            ],
+            [InlineKeyboardButton("Close", callback_data="clone_status:close")],
+        ]
+    )
+
+
 def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
     phase = str((clone_state or {}).get("phase", "")).lower()
     transfer_stage = str((clone_state or {}).get("transfer_stage") or "").lower()
@@ -1121,6 +1141,15 @@ async def _load_status_view_text(store: MongoStateStore, view: str) -> tuple[str
     if view == "overview":
         return _format_tasks_overview(clone_state), clone_state
     return _format_combined_status_text(clone_state, export_state), clone_state
+
+
+async def _load_clone_status_view_text(store: MongoStateStore, view: str) -> tuple[str, dict[str, Any] | None]:
+    clone_state = await _load_state(store, "clone:last")
+    if view == "overview":
+        return _format_tasks_overview(clone_state), clone_state
+    if clone_state:
+        return _format_clone_status_with_stats(clone_state), clone_state
+    return f"No saved clone state.\n\n{_format_bot_stats()}", None
 
 
 async def _run_export_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
@@ -1222,7 +1251,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
                     _format_status_text(wrapper),
                     parse_mode=enums.ParseMode.HTML,
                     disable_web_page_preview=True,
-                    reply_markup=_status_reply_markup("main"),
+                    reply_markup=_clone_status_reply_markup("main"),
                 )
             except Exception:
                 pass
@@ -1237,7 +1266,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         _format_status_text(queued_state),
         parse_mode=enums.ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=_status_reply_markup("main"),
+        reply_markup=_clone_status_reply_markup("main"),
     )
     try:
         success, failed = await run_clone(
@@ -1281,7 +1310,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             _format_status_text(cancelled_state),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=_status_reply_markup("main"),
+            reply_markup=_clone_status_reply_markup("main"),
         )
         raise
     except Exception as exc:
@@ -1314,7 +1343,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             _format_status_text(failed_state),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=_status_reply_markup("main"),
+            reply_markup=_clone_status_reply_markup("main"),
         )
         raise
     else:
@@ -1336,7 +1365,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             _format_status_text(result),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=_status_reply_markup("main"),
+            reply_markup=_clone_status_reply_markup("main"),
         )
     finally:
         ACTIVE_CLONE_TASK = None
@@ -1544,6 +1573,44 @@ async def run_bot() -> None:
         except Exception:
             pass
 
+    @bot.on_callback_query(filters.regex(r"^clone_status:(close|tstats|back|refresh)$"))
+    async def clone_status_callback_handler(client, callback_query) -> None:
+        user = getattr(callback_query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in admin_ids:
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        status_message = getattr(callback_query, "message", None)
+        if status_message is None:
+            await callback_query.answer()
+            return
+
+        action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
+        if action == "close":
+            await callback_query.answer("Closed.")
+            try:
+                await status_message.delete()
+            except Exception:
+                try:
+                    await status_message.edit_text("Closed.")
+                except Exception:
+                    pass
+            return
+
+        view = "overview" if action == "tstats" else "main"
+        text, _ = await _load_clone_status_view_text(store, view)
+        await callback_query.answer("Refreshed." if action == "refresh" else "")
+        try:
+            await status_message.edit_text(
+                text,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_clone_status_reply_markup(view),
+            )
+        except Exception:
+            pass
+
     async def _finish_login_flow(user_id: int, login_client: Client, current_settings: dict[str, Any], message) -> None:
         session_string = await login_client.export_session_string()
         current_settings["tg_session_string"] = _normalize_setting_value("tg_session_string", session_string)
@@ -1661,7 +1728,7 @@ async def run_bot() -> None:
             parse_mode=enums.ParseMode.HTML,
         )
 
-    @bot.on_message(filters.private & filters.text)
+    @bot.on_message(filters.private & filters.text, group=1)
     async def login_step_handler(client, message) -> None:
         user = getattr(message, "from_user", None)
         user_id = getattr(user, "id", None)
@@ -1941,6 +2008,7 @@ async def run_bot() -> None:
         raw_text = message.text or ""
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
+
         bot_settings = await _load_bot_settings(store)
         if not _configured_session_string(bot_settings):
             await message.reply_text(
@@ -1993,6 +2061,17 @@ async def run_bot() -> None:
         raw_text = message.text or ""
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
+
+        if command_text.lower() == "status":
+            text, _ = await _load_clone_status_view_text(store, "main")
+            await message.reply_text(
+                text,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_clone_status_reply_markup("main"),
+            )
+            return
+
         bot_settings = await _load_bot_settings(store)
         if not _configured_session_string(bot_settings):
             await message.reply_text(
