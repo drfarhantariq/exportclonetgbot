@@ -351,7 +351,7 @@ class TelegramService:
                 result = await hyper.download_media(
                     message,
                     file_name=str(target_path),
-                    progress=progress,
+                    progress=progress_handler,
                     dump_chat=self.hyper_dump_chat,
                 )
             except Exception:
@@ -387,13 +387,26 @@ class TelegramService:
     def _resolve_downloaded_path(result: str) -> str:
         downloaded_path = Path(result)
         if downloaded_path.is_dir():
-            files = [p for p in downloaded_path.rglob("*") if p.is_file()]
+            files = [p for p in downloaded_path.rglob("*") if p.is_file() and p.suffix.lower() != ".temp"]
+            if not files:
+                files = [p for p in downloaded_path.rglob("*") if p.is_file()]
             if not files:
                 raise RuntimeError(
                     f"Media download failed: no file found inside {downloaded_path}"
                 )
             # Prefer the most recently modified file in case multiple files were created.
-            downloaded_path = max(files, key=lambda p: p.stat().st_mtime)
+            downloaded_path = max(files, key=TelegramService._safe_mtime)
+
+        if downloaded_path.suffix.lower() == ".temp":
+            final_path = downloaded_path.with_suffix("")
+            if final_path.exists():
+                downloaded_path = final_path
+            else:
+                try:
+                    downloaded_path.rename(final_path)
+                    downloaded_path = final_path
+                except OSError:
+                    pass
 
         try:
             size = downloaded_path.stat().st_size
@@ -404,6 +417,13 @@ class TelegramService:
             raise RuntimeError(f"Media download failed: downloaded file is empty ({downloaded_path})")
 
         return str(downloaded_path)
+
+    @staticmethod
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
 
     def _wrap_progress_callback(self, progress):
         if progress is None:
@@ -422,7 +442,7 @@ class TelegramService:
         def _handler(current, total, *args):
             nonlocal last_report_at
             now = monotonic()
-            if current < total and now - last_report_at < 0.75:
+            if current < total and now - last_report_at < 0.35:
                 return
             last_report_at = now
 
@@ -658,13 +678,22 @@ class TelegramService:
         if os.getenv("GENERATE_VIDEO_THUMBNAILS", "true").strip().lower() in {"0", "false", "no", "off"}:
             return None
 
+        ffmpeg_binary = self._ffmpeg_binary()
+        if not await self._binary_available(ffmpeg_binary):
+            self.logger.warning(
+                "ffmpeg is not available; video thumbnail generation is disabled. "
+                "Install the Heroku apt buildpack with an Aptfile containing ffmpeg.",
+                extra={"event": "ffmpeg_missing", "binary": ffmpeg_binary},
+            )
+            return None
+
         thumb_path = file_path.with_name(f"{file_path.stem}.tg-thumb.jpg")
         timestamps = self._thumbnail_timestamps(duration)
 
         for timestamp in timestamps:
             if thumb_path.exists():
                 thumb_path.unlink(missing_ok=True)
-            if await self._extract_video_thumbnail(file_path, thumb_path, timestamp):
+            if await self._extract_video_thumbnail(file_path, thumb_path, timestamp, ffmpeg_binary):
                 self.logger.info(
                     "generated video frame thumbnail",
                     extra={"event": "video_thumbnail_generated", "path": str(thumb_path), "timestamp": timestamp},
@@ -672,7 +701,7 @@ class TelegramService:
                 return thumb_path
 
         self.logger.warning(
-            "could not generate a non-black video frame thumbnail; upload will use Telegram default",
+            "could not generate a usable video frame thumbnail; upload will use Telegram default",
             extra={"event": "video_thumbnail_generation_failed", "file": str(file_path)},
         )
         return None
@@ -691,11 +720,17 @@ class TelegramService:
             ]
         return [float(midpoint), max(duration * 0.75, 1.0), 1.0]
 
-    async def _extract_video_thumbnail(self, file_path: Path, thumb_path: Path, timestamp: float) -> bool:
+    async def _extract_video_thumbnail(
+        self,
+        file_path: Path,
+        thumb_path: Path,
+        timestamp: float,
+        ffmpeg_binary: str,
+    ) -> bool:
         process = None
         try:
             process = await asyncio.create_subprocess_exec(
-                self._ffmpeg_binary(),
+                ffmpeg_binary,
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -704,9 +739,9 @@ class TelegramService:
                 "-i",
                 str(file_path),
                 "-vf",
-                "thumbnail",
+                "scale='min(480,iw)':-2",
                 "-q:v",
-                "1",
+                "2",
                 "-frames:v",
                 "1",
                 "-f",
@@ -716,7 +751,7 @@ class TelegramService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45)
         except (FileNotFoundError, TimeoutError, asyncio.TimeoutError):
             if process is not None and process.returncode is None:
                 process.kill()
@@ -759,6 +794,29 @@ class TelegramService:
             return False
 
         return mean >= 8.0 and contrast >= 5.0 and thumb_path.stat().st_size <= 200 * 1024
+
+    async def _binary_available(self, binary: str) -> bool:
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                binary,
+                "-version",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except (FileNotFoundError, TimeoutError, asyncio.TimeoutError):
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            return False
+        except Exception:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            self.logger.debug("binary availability check failed", exc_info=True)
+            return False
+        return process.returncode == 0
 
     async def _probe_video_metadata(self, file_path: Path) -> tuple[int, int, int]:
         process = None

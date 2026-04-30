@@ -313,11 +313,11 @@ class HyperTGDownload:
                     result = progress(self._processed_bytes, self.file_size, *progress_args)
                     if inspect.isawaitable(result):
                         await result
-                await sleep(1)
+                await sleep(0.35)
             except (CancelledError, StopTransmission):
                 break
             except Exception:
-                await sleep(1)
+                await sleep(0.35)
 
     async def single_part(self, start, end, part_index, max_retries=3):
         until_bytes, from_bytes = min(end, self.file_size - 1), start

@@ -356,6 +356,7 @@ def _normalize_clone_command(command_text: str) -> str:
 
 ACTIVE_CLONE_TASK: asyncio.Task | None = None
 ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
+ACTIVE_CLONE_LATEST_STATE: dict[str, Any] | None = None
 ACTIVE_STATUS_WATCH_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
 ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
@@ -377,11 +378,11 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "mongodb_database": os.getenv("MONGODB_DATABASE", "topic_ops").strip(),
     "owner_id": os.getenv("BOT_ADMIN_USER_IDS", "").strip(),
     "tg_session_string": os.getenv("TG_SESSION_STRING", "").strip(),
-    "clone_status_update_interval_sec": 2.0,
-    "clone_status_success_update_interval_sec": 1.5,
-    "clone_status_keepalive_interval_sec": 10.0,
-    "status_command_update_interval_sec": 2.0,
-    "clone_default_delay_sec": 0.35,
+    "clone_status_update_interval_sec": 0.75,
+    "clone_status_success_update_interval_sec": 0.5,
+    "clone_status_keepalive_interval_sec": 5.0,
+    "status_command_update_interval_sec": 1.0,
+    "clone_default_delay_sec": 0.2,
     "clone_default_batch_size": 50,
     "clone_continue_on_error_default": False,
     "clone_hide_sender_name_default": False,
@@ -564,7 +565,13 @@ def _resume_clone_payload_from_state(state: dict[str, Any]) -> dict[str, Any] | 
 
     resumed = dict(payload)
     last_successful_id = _safe_int(state.get("last_successful_source_message_id"))
-    completed_count = _safe_int(state.get("success")) + _safe_int(state.get("failed"))
+    if last_successful_id <= 0:
+        last_successful_id = _safe_int(state.get("last_processed_source_message_id"))
+    completed_count = (
+        _safe_int(state.get("success"))
+        + _safe_int(state.get("failed"))
+        + _safe_int(state.get("skipped"))
+    )
     if completed_count <= 0:
         completed_count = _safe_int(state.get("current_index"))
     total_messages = _safe_int(state.get("total_messages"))
@@ -970,7 +977,7 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
 
     lines = [
         "━━━━━━━━━━━━━━━━",
-        "<b>CLONE STATUS</b>",
+        "<b>MSZ CLONE BOT</b>",
         "━━━━━━━━━━━━━━━━",
         "",
         f"<b>1.</b> <b><i>{_html(_status_task_title(state))}</i></b>",
@@ -1001,15 +1008,19 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
     if phase == "running":
         lines.append("<b>┖ Stop</b> → <i>/cancel</i>")
     elif phase == "completed":
+        skipped = _safe_int(state.get("skipped"))
+        skipped_text = f" | Skipped {skipped}" if skipped else ""
         lines.append(
-            f"┖ <b>Result</b> → <i>Forwarded {state.get('success', 0)} | Failed {state.get('failed', 0)}</i>"
+            f"┖ <b>Result</b> → <i>Forwarded {state.get('success', 0)} | Failed {state.get('failed', 0)}{skipped_text}</i>"
         )
     elif phase in {"failed", "cancelled"}:
         error = state.get("error")
         if error:
             lines.append(f"┠ <b>Error</b> → <i>{_html(error)}</i>")
+        skipped = _safe_int(state.get("skipped"))
+        skipped_text = f" | Skipped {skipped}" if skipped else ""
         lines.append(
-            f"┖ <b>Result</b> → <i>Forwarded {state.get('success', 0)} | Failed {state.get('failed', 0)}</i>"
+            f"┖ <b>Result</b> → <i>Forwarded {state.get('success', 0)} | Failed {state.get('failed', 0)}{skipped_text}</i>"
         )
     else:
         lines.append(f"┖ <b>Phase</b> → <i>{_html(phase.title())}</i>")
@@ -1084,6 +1095,8 @@ async def _save_clone_state(store: MongoStateStore, label: str, state: dict[str,
 
 
 async def _load_state(store: MongoStateStore, key: str) -> dict[str, Any] | None:
+    if key == "clone:last" and ACTIVE_CLONE_LATEST_STATE is not None:
+        return dict(ACTIVE_CLONE_LATEST_STATE)
     try:
         return await store.load(key)
     except Exception:
@@ -1242,7 +1255,7 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
 
 
 async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
-    global ACTIVE_CLONE_TASK, ACTIVE_CLONE_CANCEL_EVENT
+    global ACTIVE_CLONE_TASK, ACTIVE_CLONE_CANCEL_EVENT, ACTIVE_CLONE_LATEST_STATE
 
     ACTIVE_CLONE_CANCEL_EVENT = asyncio.Event()
     ACTIVE_CLONE_TASK = asyncio.current_task()
@@ -1253,15 +1266,23 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     last_reported_success = -1
     last_reported_index = -1
     last_reported_flood_wait_until = 0.0
+    last_persisted_at = 0.0
+    last_persisted_success = -1
+    last_persisted_failed = -1
+    last_persisted_flood_wait_until = 0.0
     latest_state_payload = dict(payload)
     latest_runtime_state: dict[str, Any] = {"phase": "queued", "payload": dict(payload)}
     status_update_lock = asyncio.Lock()
+    state_persist_lock = asyncio.Lock()
 
     def _format_status_text(state: dict[str, Any]) -> str:
         return _format_clone_status_with_stats(state)
 
     async def _save_state_inner(state: dict[str, Any]) -> None:
-        nonlocal last_status_edit_at, last_reported_success, last_reported_index, last_reported_flood_wait_until, latest_state_payload, latest_runtime_state
+        global ACTIVE_CLONE_LATEST_STATE
+        nonlocal last_status_edit_at, last_reported_success, last_reported_index, last_reported_flood_wait_until
+        nonlocal last_persisted_at, last_persisted_success, last_persisted_failed, last_persisted_flood_wait_until
+        nonlocal latest_state_payload, latest_runtime_state
         wrapper = dict(state)
         if isinstance(state.get("payload"), dict):
             wrapper["payload"] = state["payload"]
@@ -1284,11 +1305,12 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             wrapper["started_at"] = latest_runtime_state.get("started_at") or job_started_at
         latest_state_payload = dict(wrapper["payload"])
         latest_runtime_state = dict(wrapper)
-        await _save_clone_state(store, "last", wrapper)
+        ACTIVE_CLONE_LATEST_STATE = dict(wrapper)
 
         now = time.time()
         phase = str(wrapper.get("phase", "running"))
         success = int(wrapper.get("success", 0) or 0)
+        failed = int(wrapper.get("failed", 0) or 0)
         current_index = int(wrapper.get("current_index", 0) or 0)
         flood_wait_until = _safe_float(wrapper.get("flood_wait_until"))
 
@@ -1306,24 +1328,41 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             or (progress_changed and now - last_status_edit_at >= progress_interval)
             or now - last_status_edit_at >= keepalive_interval
         )
-        if not should_edit:
-            return
+        if should_edit:
+            async with status_update_lock:
+                edited = await _edit_status_message(
+                    status,
+                    _format_status_text(wrapper),
+                    reply_markup=_clone_status_reply_markup("main"),
+                    sleep_on_flood=False,
+                )
+                if edited:
+                    last_status_edit_at = now
+                    last_reported_success = success
+                    last_reported_index = current_index
+                    last_reported_flood_wait_until = flood_wait_until
 
-        async with status_update_lock:
-            edited = await _edit_status_message(
-                status,
-                _format_status_text(wrapper),
-                reply_markup=_clone_status_reply_markup("main"),
-                sleep_on_flood=False,
-            )
-            if edited:
-                last_status_edit_at = now
-                last_reported_success = success
-                last_reported_index = current_index
-                last_reported_flood_wait_until = flood_wait_until
+        should_persist = (
+            phase != "running"
+            or success != last_persisted_success
+            or failed != last_persisted_failed
+            or (flood_wait_until > 0 and flood_wait_until != last_persisted_flood_wait_until)
+            or now - last_persisted_at >= keepalive_interval
+        )
+        if should_persist:
+            async with state_persist_lock:
+                await _save_clone_state(store, "last", wrapper)
+                last_persisted_at = now
+                last_persisted_success = success
+                last_persisted_failed = failed
+                last_persisted_flood_wait_until = flood_wait_until
 
     queued_state = {"phase": "queued", "payload": payload, "started_at": job_started_at}
+    ACTIVE_CLONE_LATEST_STATE = dict(queued_state)
     await _save_clone_state(store, "last", queued_state)
+    last_persisted_at = time.time()
+    last_persisted_success = 0
+    last_persisted_failed = 0
     status = await message.reply_text(
         _format_status_text(queued_state),
         parse_mode=enums.ParseMode.HTML,
@@ -1356,11 +1395,20 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "total_messages": latest_runtime_state.get("total_messages", 0),
             "success": latest_runtime_state.get("success", 0),
             "failed": latest_runtime_state.get("failed", 0),
+            "skipped": latest_runtime_state.get("skipped", 0),
             "current_message_id": latest_runtime_state.get("current_message_id"),
         }
         if latest_runtime_state.get("last_successful_message_link"):
             cancelled_state["last_successful_message_link"] = latest_runtime_state["last_successful_message_link"]
-        for key in ("current_message_type", "current_file_name", "flood_wait_operation", "flood_wait_seconds", "flood_wait_until"):
+        for key in (
+            "last_processed_source_message_id",
+            "current_message_type",
+            "current_file_name",
+            "skipped_reason",
+            "flood_wait_operation",
+            "flood_wait_seconds",
+            "flood_wait_until",
+        ):
             if latest_runtime_state.get(key):
                 cancelled_state[key] = latest_runtime_state[key]
         await _save_clone_state(
@@ -1368,6 +1416,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last",
             cancelled_state,
         )
+        ACTIVE_CLONE_LATEST_STATE = dict(cancelled_state)
         await _edit_status_message(
             status,
             _format_status_text(cancelled_state),
@@ -1383,15 +1432,18 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "total_messages": latest_runtime_state.get("total_messages", 0),
             "success": latest_runtime_state.get("success", 0),
             "failed": latest_runtime_state.get("failed", 0),
+            "skipped": latest_runtime_state.get("skipped", 0),
             "current_message_id": latest_runtime_state.get("current_message_id"),
             "started_at": latest_runtime_state.get("started_at", job_started_at),
         }
         for key in (
             "last_successful_source_message_id",
+            "last_processed_source_message_id",
             "last_successful_destination_message_id",
             "last_successful_message_link",
             "current_message_type",
             "current_file_name",
+            "skipped_reason",
             "flood_wait_operation",
             "flood_wait_seconds",
             "flood_wait_until",
@@ -1403,6 +1455,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last",
             failed_state,
         )
+        ACTIVE_CLONE_LATEST_STATE = dict(failed_state)
         await _edit_status_message(
             status,
             _format_status_text(failed_state),
@@ -1415,6 +1468,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "payload": latest_state_payload,
             "success": success,
             "failed": failed,
+            "skipped": latest_runtime_state.get("skipped", 0),
             "started_at": latest_runtime_state.get("started_at", job_started_at),
             "current_index": latest_runtime_state.get("current_index", 0),
             "total_messages": latest_runtime_state.get("total_messages", 0),
@@ -1423,7 +1477,10 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         for key in ("current_message_type", "current_file_name"):
             if latest_runtime_state.get(key):
                 result[key] = latest_runtime_state[key]
+        if latest_runtime_state.get("last_processed_source_message_id"):
+            result["last_processed_source_message_id"] = latest_runtime_state["last_processed_source_message_id"]
         await _save_clone_state(store, "last", result)
+        ACTIVE_CLONE_LATEST_STATE = dict(result)
         await _edit_status_message(
             status,
             _format_status_text(result),
@@ -1621,16 +1678,16 @@ async def run_bot() -> None:
         else:
             view = ACTIVE_STATUS_VIEWS.get(key, "main")
 
+        await callback_query.answer()
         ACTIVE_STATUS_VIEWS[key] = view
         text, _ = await _load_status_view_text(store, view)
         ACTIVE_STATUS_LAST_TEXTS[key] = text
-        await callback_query.answer("Refreshed." if action == "refresh" else "")
         try:
-            await status_message.edit_text(
+            await _edit_status_message(
+                status_message,
                 text,
-                parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
                 reply_markup=_status_reply_markup(view),
+                sleep_on_flood=False,
             )
         except Exception:
             pass
@@ -1649,7 +1706,10 @@ async def run_bot() -> None:
             return
 
         action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
+        key = (status_message.chat.id, status_message.id)
         if action == "close":
+            ACTIVE_STATUS_VIEWS.pop(key, None)
+            ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
             await callback_query.answer("Closed.")
             try:
                 await status_message.delete()
@@ -1660,15 +1720,23 @@ async def run_bot() -> None:
                     pass
             return
 
-        view = "overview" if action == "tstats" else "main"
+        if action == "tstats":
+            view = "overview"
+        elif action == "back":
+            view = "main"
+        else:
+            view = ACTIVE_STATUS_VIEWS.get(key, "main")
+
+        await callback_query.answer()
+        ACTIVE_STATUS_VIEWS[key] = view
         text, _ = await _load_clone_status_view_text(store, view)
-        await callback_query.answer("Refreshed." if action == "refresh" else "")
+        ACTIVE_STATUS_LAST_TEXTS[key] = text
         try:
-            await status_message.edit_text(
+            await _edit_status_message(
+                status_message,
                 text,
-                parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
                 reply_markup=_clone_status_reply_markup(view),
+                sleep_on_flood=False,
             )
         except Exception:
             pass

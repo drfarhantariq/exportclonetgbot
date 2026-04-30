@@ -154,6 +154,47 @@ The bot also extracts a non-black JPEG thumbnail from the video itself for each 
 
 ## Heroku Setup (Recommended)
 
+### Local deploy script
+
+You can deploy from this workspace without opening the Colab notebook:
+
+```bash
+python scripts/deploy_heroku.py --app <your-app-name>
+```
+
+The script reads config vars from `heroku_bot/.env`, prepares a clean temporary bundle from `heroku_bot/`, sets Heroku config vars, adds the apt buildpack for `ffmpeg`, pushes to Heroku, and scales `worker=1`.
+
+Useful options:
+
+```bash
+# Update changed bot code on the same Heroku app
+python scripts/deploy_heroku.py --app <your-app-name> --redeploy
+
+# Delete the old Heroku app and deploy from scratch with the same name
+python scripts/deploy_heroku.py --app <your-app-name> --recreate
+
+# Show logs only, without redeploying
+python scripts/deploy_heroku.py --app <your-app-name> --logs
+
+# Create the Heroku app if it does not already exist
+python scripts/deploy_heroku.py --app <your-app-name> --create-app --region eu
+
+# Set/override a config var without editing .env
+python scripts/deploy_heroku.py --app <your-app-name> --config HYPER_THREADS=4
+```
+
+`--recreate` destroys the Heroku app before deploying, so its Heroku config and dynos are rebuilt from your local `heroku_bot/.env`. MongoDB data stored outside Heroku is not deleted.
+
+The script installs the Heroku CLI automatically if it is missing. If `HEROKU_EMAIL` and `HEROKU_API_KEY` are present in `heroku_bot/.env`, it also writes `~/.netrc` automatically for API-key auth like the Colab notebook:
+
+```bash
+python scripts/deploy_heroku.py --app <your-app-name>
+```
+
+For that mode, add `HEROKU_EMAIL` and `HEROKU_API_KEY` to `heroku_bot/.env`, or pass them as `--heroku-email` and `--heroku-api-key`. Use `--no-write-netrc` if you want to rely on an existing `heroku login` session instead.
+
+The Colab notebook remains available as an alternative deploy path.
+
 1. Create app and set stack:
 
 ```bash

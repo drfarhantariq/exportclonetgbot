@@ -91,6 +91,7 @@ class WzmlTransferReporter:
         total_messages: int,
         success: int,
         failed: int,
+        skipped: int,
         payload: dict[str, Any],
         status_callback: Optional["StatusCallback"],
         message_type: str | None = None,
@@ -101,6 +102,7 @@ class WzmlTransferReporter:
         self.total_messages = total_messages
         self.success = success
         self.failed = failed
+        self.skipped = skipped
         self.payload = payload
         self.status_callback = status_callback
         self.message_type = message_type
@@ -112,6 +114,7 @@ class WzmlTransferReporter:
         self._upload_snapshot = TransferSnapshot("upload", 0, 0, 0.0, None)
         self._last_progress: dict[str, tuple[int, float, float]] = {}
         self._last_emit_at = 0.0
+        self._last_stage = ""
 
     def _snapshot(self, stage: str, current: int, total: int) -> TransferSnapshot:
         now = time.time()
@@ -141,9 +144,12 @@ class WzmlTransferReporter:
 
     async def _emit(self, *, force: bool = False) -> None:
         now = time.time()
-        if not force and now - self._last_emit_at < 1.0:
+        active_stage = "upload" if self._upload_snapshot.current > 0 else "download"
+        stage_changed = active_stage != self._last_stage
+        if not force and not stage_changed and now - self._last_emit_at < 0.5:
             return
         self._last_emit_at = now
+        self._last_stage = active_stage
 
         dl = self._download_snapshot
         up = self._upload_snapshot
@@ -164,8 +170,9 @@ class WzmlTransferReporter:
             total_messages=self.total_messages,
             success=self.success,
             failed=self.failed,
+            skipped=self.skipped,
             current_message_id=self.source_message_id,
-            transfer_stage="upload" if up.current > 0 else "download",
+            transfer_stage=active_stage,
             download_current=dl.current,
             download_total=dl.total,
             download_speed_bps=dl.speed_bps,
@@ -219,8 +226,34 @@ def _ensure_runtime_dirs() -> None:
 StatusCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+class SkippedMessageError(RuntimeError):
+    """Raised for Telegram messages that should be skipped without aborting a clone."""
+
+
 def _is_uncopyable_message_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "can't copy this message" in str(exc).lower()
+
+
+def _unsupported_message_reason(message: Any | None) -> str:
+    if message is None:
+        return "source message is unavailable"
+    if getattr(message, "empty", False):
+        return "source message is empty or deleted"
+    service = getattr(message, "service", None)
+    if service is not None:
+        return f"service message skipped: {service}"
+    classification = classify_message(message)
+    if classification.kind == MessageKind.UNSUPPORTED:
+        return classification.reason
+    return "message has no downloadable media"
+
+
+def _is_skippable_unsupported_message(message: Any | None) -> bool:
+    if message is None or getattr(message, "empty", False):
+        return True
+    if getattr(message, "service", None) is not None:
+        return True
+    return classify_message(message).kind == MessageKind.UNSUPPORTED
 
 
 def _message_media_type(message: Any | None) -> str:
@@ -507,9 +540,10 @@ async def _download_and_upload_message(
         )
 
     if not getattr(source_message, "media", None):
-        raise RuntimeError(
-            f"Restricted message type is unsupported for fallback upload: {classification.kind.value}"
-        )
+        reason = _unsupported_message_reason(source_message)
+        if classification.kind == MessageKind.UNSUPPORTED:
+            raise SkippedMessageError(reason)
+        raise RuntimeError(f"Restricted message has no downloadable media: {reason}")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         download_path = Path(temp_dir)
@@ -520,7 +554,8 @@ async def _download_and_upload_message(
         )
         media_file_name = getattr(media, "file_name", "") if media is not None else ""
         if media_file_name:
-            target_file = download_path / Path(media_file_name).name
+            safe_media_file_name = Path(str(media_file_name).replace("\x00", "")).name.strip()
+            target_file = download_path / (safe_media_file_name or f"{source_message.id}.bin")
         else:
             fallback_ext = ".bin"
             if getattr(source_message, "photo", None):
@@ -540,33 +575,7 @@ async def _download_and_upload_message(
         if not download_result:
             raise RuntimeError("Failed to download restricted media")
 
-        downloaded_file = Path(download_result)
-        if downloaded_file.is_dir():
-            files = [p for p in downloaded_file.rglob("*") if p.is_file() and p.suffix.lower() != ".temp"]
-            if not files:
-                files = [p for p in downloaded_file.rglob("*") if p.is_file()]
-            if not files:
-                raise RuntimeError(
-                    f"Failed to find downloaded file inside {downloaded_file}"
-                )
-            downloaded_file = max(files, key=lambda p: p.stat().st_mtime)
-
-        if downloaded_file.suffix.lower() == ".temp":
-            without_temp = downloaded_file.with_suffix("")
-            if without_temp.exists():
-                downloaded_file = without_temp
-            else:
-                try:
-                    downloaded_file.rename(without_temp)
-                    downloaded_file = without_temp
-                except OSError:
-                    pass
-
-        if not downloaded_file.exists() or not downloaded_file.is_file():
-            raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}")
-        if downloaded_file.stat().st_size <= 0:
-            downloaded_file.unlink(missing_ok=True)
-            raise RuntimeError(f"Downloaded media file is empty: {downloaded_file}")
+        downloaded_file = await _resolve_downloaded_media_file(download_result)
 
         sent_message = await telegram.send_downloaded_media_to_topic(
             chat_id=endpoints.destination_chat_id,
@@ -580,6 +589,56 @@ async def _download_and_upload_message(
         if reporter is not None:
             await reporter.complete()
         return sent_message
+
+
+async def _resolve_downloaded_media_file(download_result: str | Path) -> Path:
+    downloaded_file = Path(download_result)
+
+    if downloaded_file.is_dir():
+        def _candidate_files() -> list[Path]:
+            files = [p for p in downloaded_file.rglob("*") if p.is_file() and p.suffix.lower() != ".temp"]
+            if files:
+                return files
+            return [p for p in downloaded_file.rglob("*") if p.is_file()]
+
+        files = await asyncio.to_thread(_candidate_files)
+        if not files:
+            raise RuntimeError(f"Failed to find downloaded file inside {downloaded_file}")
+        downloaded_file = max(files, key=_safe_mtime)
+
+    if downloaded_file.suffix.lower() == ".temp":
+        without_temp = downloaded_file.with_suffix("")
+        if without_temp.exists():
+            downloaded_file = without_temp
+        else:
+            try:
+                downloaded_file.rename(without_temp)
+                downloaded_file = without_temp
+            except OSError:
+                pass
+
+    for attempt in range(3):
+        try:
+            if downloaded_file.exists() and downloaded_file.is_file():
+                size = downloaded_file.stat().st_size
+                if size > 0:
+                    return downloaded_file
+                if attempt == 2:
+                    downloaded_file.unlink(missing_ok=True)
+                    raise RuntimeError(f"Downloaded media file is empty: {downloaded_file}")
+        except OSError as exc:
+            if attempt == 2:
+                raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}") from exc
+        await asyncio.sleep(0.2)
+
+    raise RuntimeError(f"Downloaded media path is invalid: {downloaded_file}")
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 async def _clone_restricted_message(
@@ -754,18 +813,21 @@ async def _clone_topic_messages(
             total_messages=0,
             success=0,
             failed=0,
+            skipped=0,
             current_message_id=None,
         )
         return (0, 0)
 
     success = 0
     failed = 0
+    skipped = 0
     total_messages = len(source_ids)
     progress_state: dict[str, Any] = {
         "current_index": 0,
         "total_messages": total_messages,
         "success": 0,
         "failed": 0,
+        "skipped": 0,
         "current_message_id": None,
     }
 
@@ -793,6 +855,7 @@ async def _clone_topic_messages(
         total_messages=total_messages,
         success=0,
         failed=0,
+        skipped=0,
         current_message_id=None,
     )
 
@@ -811,6 +874,7 @@ async def _clone_topic_messages(
                         "total_messages": total_messages,
                         "success": success,
                         "failed": failed,
+                        "skipped": skipped,
                         "current_message_id": source_message_id,
                     }
                 )
@@ -846,6 +910,7 @@ async def _clone_topic_messages(
                     total_messages=total_messages,
                     success=success,
                     failed=failed,
+                    skipped=skipped,
                     current_message_id=source_message_id,
                     current_message_type=current_message_type,
                     current_file_name=current_file_name,
@@ -873,6 +938,7 @@ async def _clone_topic_messages(
                             total_messages=total_messages,
                             success=success,
                             failed=failed,
+                            skipped=skipped,
                             payload=payload,
                             status_callback=status_callback,
                             message_type=current_message_type,
@@ -904,12 +970,15 @@ async def _clone_topic_messages(
                                     endpoints.source_chat_id,
                                     source_message_id,
                                 )
+                            if _is_skippable_unsupported_message(source_message):
+                                raise SkippedMessageError(_unsupported_message_reason(source_message))
                             reporter = WzmlTransferReporter(
                                 source_message_id=source_message_id,
                                 index=index,
                                 total_messages=total_messages,
                                 success=success,
                                 failed=failed,
+                                skipped=skipped,
                                 payload=payload,
                                 status_callback=status_callback,
                                 message_type=current_message_type,
@@ -931,6 +1000,8 @@ async def _clone_topic_messages(
                 progress_state.update(
                     {
                         "success": success,
+                        "skipped": skipped,
+                        "last_processed_source_message_id": source_message_id,
                         "last_successful_source_message_id": source_message_id,
                         "last_successful_destination_message_id": destination_message_id,
                         "last_successful_message_link": last_successful_message_link,
@@ -944,7 +1015,9 @@ async def _clone_topic_messages(
                     total_messages=total_messages,
                     success=success,
                     failed=failed,
+                    skipped=skipped,
                     current_message_id=source_message_id,
+                    last_processed_source_message_id=source_message_id,
                     last_successful_source_message_id=source_message_id,
                     last_successful_destination_message_id=destination_message_id,
                     last_successful_message_link=last_successful_message_link,
@@ -953,6 +1026,33 @@ async def _clone_topic_messages(
                 )
             except asyncio.CancelledError:
                 raise
+            except SkippedMessageError as exc:
+                skipped += 1
+                progress_state["skipped"] = skipped
+                logging.getLogger("topic_clone").info(
+                    "skipped unsupported source message",
+                    extra={
+                        "event": "clone_message_skipped",
+                        "message_id": source_message_id,
+                        "reason": str(exc),
+                    },
+                )
+                await _save_clone_status(
+                    status_callback,
+                    "running",
+                    payload,
+                    current_index=index,
+                    total_messages=total_messages,
+                    success=success,
+                    failed=failed,
+                    skipped=skipped,
+                    current_message_id=source_message_id,
+                    last_processed_source_message_id=source_message_id,
+                    skipped_reason=str(exc),
+                    current_message_type=_message_media_type(source_message),
+                    current_file_name=_message_file_name(source_message),
+                )
+                print(f"[{index}/{total_messages}] skipped source message {source_message_id}: {exc}")
             except Exception as exc:
                 failed += 1
                 progress_state["failed"] = failed
@@ -972,6 +1072,7 @@ async def _clone_topic_messages(
                     total_messages=total_messages,
                     success=success,
                     failed=failed,
+                    skipped=skipped,
                     current_message_id=source_message_id,
                     error=str(exc),
                     current_message_type=_message_media_type(source_message),
