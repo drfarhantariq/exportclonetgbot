@@ -219,6 +219,10 @@ def _ensure_runtime_dirs() -> None:
 StatusCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+def _is_uncopyable_message_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and "can't copy this message" in str(exc).lower()
+
+
 def _message_media_type(message: Any | None) -> str:
     if message is None or getattr(message, "empty", False):
         return "Unknown"
@@ -757,6 +761,30 @@ async def _clone_topic_messages(
     success = 0
     failed = 0
     total_messages = len(source_ids)
+    progress_state: dict[str, Any] = {
+        "current_index": 0,
+        "total_messages": total_messages,
+        "success": 0,
+        "failed": 0,
+        "current_message_id": None,
+    }
+
+    previous_flood_wait_callback = telegram.flood_wait_callback
+
+    async def _report_flood_wait(wait: dict[str, object]) -> None:
+        wait_seconds = float(wait.get("wait_seconds") or 0)
+        wait_until = float(wait.get("wait_until") or (time.time() + wait_seconds))
+        await _save_clone_status(
+            status_callback,
+            "running",
+            payload,
+            **progress_state,
+            flood_wait_operation=str(wait.get("operation") or "telegram"),
+            flood_wait_seconds=wait_seconds,
+            flood_wait_until=wait_until,
+        )
+
+    telegram.flood_wait_callback = _report_flood_wait
     await _save_clone_status(
         status_callback,
         "running",
@@ -768,96 +796,77 @@ async def _clone_topic_messages(
         current_message_id=None,
     )
 
-    for index, source_message_id in enumerate(source_ids, start=1):
-        if cancel_event and cancel_event.is_set():
-            raise asyncio.CancelledError("Clone cancelled by user")
+    try:
+        for index, source_message_id in enumerate(source_ids, start=1):
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError("Clone cancelled by user")
 
-        source_message = None
-        destination_message = None
-        used_restricted_media_fallback = False
-        try:
-            if not dry_run and source_message is None:
-                try:
-                    source_message = await telegram.get_message(
-                        endpoints.source_chat_id,
-                        source_message_id,
-                    )
-                except Exception:
-                    logging.getLogger("topic_clone").debug(
-                        "source message metadata lookup failed",
-                        exc_info=True,
-                        extra={
-                            "event": "source_message_metadata_lookup_failed",
-                            "message_id": source_message_id,
-                        },
-                    )
-
-            current_message_type = _message_media_type(source_message)
-            current_file_name = _message_file_name(source_message)
-            await _save_clone_status(
-                status_callback,
-                "running",
-                payload,
-                current_index=index,
-                total_messages=total_messages,
-                success=success,
-                failed=failed,
-                current_message_id=source_message_id,
-                current_message_type=current_message_type,
-                current_file_name=current_file_name,
-            )
-
-            if dry_run:
-                print(
-                    f"[DRY RUN] {index}/{total_messages} copy "
-                    f"{endpoints.source_chat_id}:{source_message_id} -> "
-                    f"{endpoints.destination_chat_id}:{endpoints.destination_topic_id}"
+            source_message = None
+            destination_message = None
+            used_restricted_media_fallback = False
+            try:
+                progress_state.update(
+                    {
+                        "current_index": index,
+                        "total_messages": total_messages,
+                        "success": success,
+                        "failed": failed,
+                        "current_message_id": source_message_id,
+                    }
                 )
-            else:
-                copied_with_hidden_sender = None
-                if hide_sender_name:
-                    if source_message is None:
+                if not dry_run and source_message is None:
+                    try:
                         source_message = await telegram.get_message(
                             endpoints.source_chat_id,
                             source_message_id,
                         )
-                        current_message_type = _message_media_type(source_message)
-                        current_file_name = _message_file_name(source_message)
-                    reporter = WzmlTransferReporter(
-                        source_message_id=source_message_id,
-                        index=index,
-                        total_messages=total_messages,
-                        success=success,
-                        failed=failed,
-                        payload=payload,
-                        status_callback=status_callback,
-                        message_type=current_message_type,
-                        file_name=current_file_name,
-                    )
-                    copied_with_hidden_sender = await _clone_message_with_hidden_sender(
-                        telegram,
-                        endpoints,
-                        source_message,
-                        reporter=reporter,
-                    )
-
-                if copied_with_hidden_sender is not None:
-                    destination_message = copied_with_hidden_sender
-                else:
-                    try:
-                        destination_message = await telegram.copy_message_to_topic(
-                            chat_id=endpoints.destination_chat_id,
-                            from_chat_id=endpoints.source_chat_id,
-                            topic_id=endpoints.destination_topic_id,
-                            message_id=source_message_id,
+                    except Exception:
+                        logging.getLogger("topic_clone").debug(
+                            "source message metadata lookup failed",
+                            exc_info=True,
+                            extra={
+                                "event": "source_message_metadata_lookup_failed",
+                                "message_id": source_message_id,
+                            },
                         )
-                    except ChatForwardsRestricted:
-                        used_restricted_media_fallback = True
+
+                current_message_type = _message_media_type(source_message)
+                current_file_name = _message_file_name(source_message)
+                progress_state.update(
+                    {
+                        "current_message_type": current_message_type,
+                        "current_file_name": current_file_name,
+                    }
+                )
+                await _save_clone_status(
+                    status_callback,
+                    "running",
+                    payload,
+                    current_index=index,
+                    total_messages=total_messages,
+                    success=success,
+                    failed=failed,
+                    current_message_id=source_message_id,
+                    current_message_type=current_message_type,
+                    current_file_name=current_file_name,
+                )
+
+                if dry_run:
+                    print(
+                        f"[DRY RUN] {index}/{total_messages} copy "
+                        f"{endpoints.source_chat_id}:{source_message_id} -> "
+                        f"{endpoints.destination_chat_id}:{endpoints.destination_topic_id}"
+                    )
+                else:
+                    copied_with_hidden_sender = None
+                    if hide_sender_name:
                         if source_message is None:
                             source_message = await telegram.get_message(
                                 endpoints.source_chat_id,
                                 source_message_id,
                             )
+                            current_message_type = _message_media_type(source_message)
+                            current_file_name = _message_file_name(source_message)
                         reporter = WzmlTransferReporter(
                             source_message_id=source_message_id,
                             index=index,
@@ -869,73 +878,121 @@ async def _clone_topic_messages(
                             message_type=current_message_type,
                             file_name=current_file_name,
                         )
-                        destination_message = await _clone_restricted_message(
+                        copied_with_hidden_sender = await _clone_message_with_hidden_sender(
                             telegram,
                             endpoints,
                             source_message,
                             reporter=reporter,
                         )
-                print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
-            success += 1
-            destination_message_id = getattr(destination_message, "id", None)
-            last_successful_message_link = _build_destination_message_link(
-                endpoints,
-                int(destination_message_id) if isinstance(destination_message_id, int) else None,
-            )
-            await _save_clone_status(
-                status_callback,
-                "running",
-                payload,
-                current_index=index,
-                total_messages=total_messages,
-                success=success,
-                failed=failed,
-                current_message_id=source_message_id,
-                last_successful_source_message_id=source_message_id,
-                last_successful_destination_message_id=destination_message_id,
-                last_successful_message_link=last_successful_message_link,
-                current_message_type=current_message_type,
-                current_file_name=current_file_name,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            failed += 1
-            logging.getLogger("topic_clone").exception(
-                "clone message failed",
-                extra={
-                    "event": "clone_message_failure",
-                    "message_id": source_message_id,
-                    "error": str(exc),
-                },
-            )
-            await _save_clone_status(
-                status_callback,
-                "running",
-                payload,
-                current_index=index,
-                total_messages=total_messages,
-                success=success,
-                failed=failed,
-                current_message_id=source_message_id,
-                error=str(exc),
-                current_message_type=_message_media_type(source_message),
-                current_file_name=_message_file_name(source_message),
-            )
-            print(f"[{index}/{total_messages}] failed for message {source_message_id}: {exc}")
-            if not continue_on_error:
-                raise
 
-        has_more = index < total_messages
-        if has_more and not dry_run:
-            next_delay_sec = delay_sec
-            if used_restricted_media_fallback:
-                next_delay_sec = max(
-                    next_delay_sec,
-                    telegram.settings.restricted_media_cooldown_sec,
+                    if copied_with_hidden_sender is not None:
+                        destination_message = copied_with_hidden_sender
+                    else:
+                        try:
+                            destination_message = await telegram.copy_message_to_topic(
+                                chat_id=endpoints.destination_chat_id,
+                                from_chat_id=endpoints.source_chat_id,
+                                topic_id=endpoints.destination_topic_id,
+                                message_id=source_message_id,
+                            )
+                        except Exception as exc:
+                            if not isinstance(exc, ChatForwardsRestricted) and not _is_uncopyable_message_error(exc):
+                                raise
+                            used_restricted_media_fallback = True
+                            if source_message is None:
+                                source_message = await telegram.get_message(
+                                    endpoints.source_chat_id,
+                                    source_message_id,
+                                )
+                            reporter = WzmlTransferReporter(
+                                source_message_id=source_message_id,
+                                index=index,
+                                total_messages=total_messages,
+                                success=success,
+                                failed=failed,
+                                payload=payload,
+                                status_callback=status_callback,
+                                message_type=current_message_type,
+                                file_name=current_file_name,
+                            )
+                            destination_message = await _clone_restricted_message(
+                                telegram,
+                                endpoints,
+                                source_message,
+                                reporter=reporter,
+                            )
+                    print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
+                success += 1
+                destination_message_id = getattr(destination_message, "id", None)
+                last_successful_message_link = _build_destination_message_link(
+                    endpoints,
+                    int(destination_message_id) if isinstance(destination_message_id, int) else None,
                 )
-            if next_delay_sec > 0:
-                await asyncio.sleep(next_delay_sec)
+                progress_state.update(
+                    {
+                        "success": success,
+                        "last_successful_source_message_id": source_message_id,
+                        "last_successful_destination_message_id": destination_message_id,
+                        "last_successful_message_link": last_successful_message_link,
+                    }
+                )
+                await _save_clone_status(
+                    status_callback,
+                    "running",
+                    payload,
+                    current_index=index,
+                    total_messages=total_messages,
+                    success=success,
+                    failed=failed,
+                    current_message_id=source_message_id,
+                    last_successful_source_message_id=source_message_id,
+                    last_successful_destination_message_id=destination_message_id,
+                    last_successful_message_link=last_successful_message_link,
+                    current_message_type=current_message_type,
+                    current_file_name=current_file_name,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failed += 1
+                progress_state["failed"] = failed
+                logging.getLogger("topic_clone").exception(
+                    "clone message failed",
+                    extra={
+                        "event": "clone_message_failure",
+                        "message_id": source_message_id,
+                        "error": str(exc),
+                    },
+                )
+                await _save_clone_status(
+                    status_callback,
+                    "running",
+                    payload,
+                    current_index=index,
+                    total_messages=total_messages,
+                    success=success,
+                    failed=failed,
+                    current_message_id=source_message_id,
+                    error=str(exc),
+                    current_message_type=_message_media_type(source_message),
+                    current_file_name=_message_file_name(source_message),
+                )
+                print(f"[{index}/{total_messages}] failed for message {source_message_id}: {exc}")
+                if not continue_on_error:
+                    raise
+
+            has_more = index < total_messages
+            if has_more and not dry_run:
+                next_delay_sec = delay_sec
+                if used_restricted_media_fallback:
+                    next_delay_sec = max(
+                        next_delay_sec,
+                        telegram.settings.restricted_media_cooldown_sec,
+                    )
+                if next_delay_sec > 0:
+                    await asyncio.sleep(next_delay_sec)
+    finally:
+        telegram.flood_wait_callback = previous_flood_wait_callback
 
     return (success, failed)
 

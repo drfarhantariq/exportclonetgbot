@@ -35,9 +35,11 @@ os.environ.setdefault("LEECH_BOT_ID", "0")
 
 from pyrogram import Client, enums, filters
 from pyrogram.errors import (
+    FloodWait,
     PhoneCodeExpired,
     PhoneCodeInvalid,
     PhoneNumberInvalid,
+    RPCError,
     SessionPasswordNeeded,
 )
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -816,6 +818,52 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _is_invalid_status_message_error(exc: Exception) -> bool:
+    message = str(exc).upper()
+    return "MESSAGE_ID_INVALID" in message or "MESSAGE TO EDIT NOT FOUND" in message
+
+
+async def _edit_status_message(
+    status: Any,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    sleep_on_flood: bool = True,
+) -> bool:
+    try:
+        await status.edit_text(
+            text,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+        return True
+    except FloodWait as exc:
+        wait_seconds = int(getattr(exc, "value", 0) or 0)
+        if not sleep_on_flood:
+            return False
+        await asyncio.sleep(wait_seconds + 1)
+        try:
+            await status.edit_text(
+                text,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as retry_exc:
+            if not _is_invalid_status_message_error(retry_exc):
+                logging.getLogger("heroku_bot").debug("status edit retry failed", exc_info=True)
+            return False
+    except RPCError as exc:
+        if not _is_invalid_status_message_error(exc):
+            logging.getLogger("heroku_bot").debug("status edit failed", exc_info=True)
+        return False
+    except Exception:
+        logging.getLogger("heroku_bot").debug("status edit failed", exc_info=True)
+        return False
+
+
 def _status_task_title(state: dict[str, Any]) -> str:
     payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
     current = _safe_int(state.get("current_index"))
@@ -921,6 +969,10 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
     file_name = str(state.get("current_file_name") or "").strip()
 
     lines = [
+        "━━━━━━━━━━━━━━━━",
+        "<b>CLONE STATUS</b>",
+        "━━━━━━━━━━━━━━━━",
+        "",
         f"<b>1.</b> <b><i>{_html(_status_task_title(state))}</i></b>",
         "",
         f"<b>Task By {_status_requester(payload)}</b>",
@@ -933,6 +985,14 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
         f"┠ <b>SOURCE</b> → <i>{_html(source_label)}</i>",
         f"┠ <b>DESTINATION</b> → <i>{_html(destination_label)}</i>",
     ]
+    flood_wait_until = _safe_float(state.get("flood_wait_until"))
+    flood_wait_seconds = _safe_float(state.get("flood_wait_seconds"))
+    if flood_wait_until > time.time() or (flood_wait_seconds > 0 and not flood_wait_until):
+        remaining = max(flood_wait_until - time.time(), 0.0) if flood_wait_until else flood_wait_seconds
+        operation = str(state.get("flood_wait_operation") or "telegram")
+        lines.append(
+            f"┠ <b>FloodWait</b> → <i>{_html(_readable_time(remaining))} for {_html(operation)}</i>"
+        )
     if message_type:
         lines.append(f"┠ <b>TYPE</b> → <i>{_html(message_type)}</i>")
     if file_name:
@@ -1192,6 +1252,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     last_status_edit_at = 0.0
     last_reported_success = -1
     last_reported_index = -1
+    last_reported_flood_wait_until = 0.0
     latest_state_payload = dict(payload)
     latest_runtime_state: dict[str, Any] = {"phase": "queued", "payload": dict(payload)}
     status_update_lock = asyncio.Lock()
@@ -1200,7 +1261,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         return _format_clone_status_with_stats(state)
 
     async def _save_state_inner(state: dict[str, Any]) -> None:
-        nonlocal last_status_edit_at, last_reported_success, last_reported_index, latest_state_payload, latest_runtime_state
+        nonlocal last_status_edit_at, last_reported_success, last_reported_index, last_reported_flood_wait_until, latest_state_payload, latest_runtime_state
         wrapper = dict(state)
         if isinstance(state.get("payload"), dict):
             wrapper["payload"] = state["payload"]
@@ -1229,15 +1290,18 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         phase = str(wrapper.get("phase", "running"))
         success = int(wrapper.get("success", 0) or 0)
         current_index = int(wrapper.get("current_index", 0) or 0)
+        flood_wait_until = _safe_float(wrapper.get("flood_wait_until"))
 
         success_changed = success != last_reported_success
         progress_changed = current_index != last_reported_index
+        flood_wait_changed = flood_wait_until > 0 and flood_wait_until != last_reported_flood_wait_until
         success_interval = float(bot_settings["clone_status_success_update_interval_sec"])
         progress_interval = float(bot_settings["clone_status_update_interval_sec"])
         keepalive_interval = float(bot_settings["clone_status_keepalive_interval_sec"])
 
         should_edit = (
             phase != "running"
+            or flood_wait_changed
             or (success_changed and now - last_status_edit_at >= success_interval)
             or (progress_changed and now - last_status_edit_at >= progress_interval)
             or now - last_status_edit_at >= keepalive_interval
@@ -1246,19 +1310,17 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             return
 
         async with status_update_lock:
-            try:
-                await status.edit_text(
-                    _format_status_text(wrapper),
-                    parse_mode=enums.ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_markup=_clone_status_reply_markup("main"),
-                )
-            except Exception:
-                pass
-            else:
+            edited = await _edit_status_message(
+                status,
+                _format_status_text(wrapper),
+                reply_markup=_clone_status_reply_markup("main"),
+                sleep_on_flood=False,
+            )
+            if edited:
                 last_status_edit_at = now
                 last_reported_success = success
                 last_reported_index = current_index
+                last_reported_flood_wait_until = flood_wait_until
 
     queued_state = {"phase": "queued", "payload": payload, "started_at": job_started_at}
     await _save_clone_state(store, "last", queued_state)
@@ -1298,7 +1360,7 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         }
         if latest_runtime_state.get("last_successful_message_link"):
             cancelled_state["last_successful_message_link"] = latest_runtime_state["last_successful_message_link"]
-        for key in ("current_message_type", "current_file_name"):
+        for key in ("current_message_type", "current_file_name", "flood_wait_operation", "flood_wait_seconds", "flood_wait_until"):
             if latest_runtime_state.get(key):
                 cancelled_state[key] = latest_runtime_state[key]
         await _save_clone_state(
@@ -1306,10 +1368,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last",
             cancelled_state,
         )
-        await status.edit_text(
+        await _edit_status_message(
+            status,
             _format_status_text(cancelled_state),
-            parse_mode=enums.ParseMode.HTML,
-            disable_web_page_preview=True,
             reply_markup=_clone_status_reply_markup("main"),
         )
         raise
@@ -1331,6 +1392,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last_successful_message_link",
             "current_message_type",
             "current_file_name",
+            "flood_wait_operation",
+            "flood_wait_seconds",
+            "flood_wait_until",
         ):
             if latest_runtime_state.get(key):
                 failed_state[key] = latest_runtime_state[key]
@@ -1339,10 +1403,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             "last",
             failed_state,
         )
-        await status.edit_text(
+        await _edit_status_message(
+            status,
             _format_status_text(failed_state),
-            parse_mode=enums.ParseMode.HTML,
-            disable_web_page_preview=True,
             reply_markup=_clone_status_reply_markup("main"),
         )
         raise
@@ -1361,10 +1424,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             if latest_runtime_state.get(key):
                 result[key] = latest_runtime_state[key]
         await _save_clone_state(store, "last", result)
-        await status.edit_text(
+        await _edit_status_message(
+            status,
             _format_status_text(result),
-            parse_mode=enums.ParseMode.HTML,
-            disable_web_page_preview=True,
             reply_markup=_clone_status_reply_markup("main"),
         )
     finally:

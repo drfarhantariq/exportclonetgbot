@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Awaitable, Callable, TypeVar
 
 from pyrogram import Client, filters, raw
@@ -77,6 +77,7 @@ class TelegramService:
             for token in re.split(r"[\s,]+", os.getenv("HELPER_TOKENS", "").strip())
             if token
         ]
+        self.flood_wait_callback: Callable[[dict[str, object]], Awaitable[None]] | None = None
         self.app = Client(
             name="telegram-topic-cloner",
             api_id=settings.api_id,
@@ -188,6 +189,22 @@ class TelegramService:
                 return result
             except FloodWait as exc:
                 wait_seconds = float(getattr(exc, "value", 0) or 0) + self.settings.flood_wait_buffer_sec
+                callback = self.flood_wait_callback
+                if callback is not None:
+                    try:
+                        await callback(
+                            {
+                                "operation": operation,
+                                "wait_seconds": wait_seconds,
+                                "wait_until": time() + wait_seconds,
+                            }
+                        )
+                    except Exception:
+                        self.logger.debug(
+                            "flood wait callback failed",
+                            exc_info=True,
+                            extra={"event": "flood_wait_callback_failed", "operation": operation},
+                        )
                 self.logger.warning(
                     "flood wait",
                     extra={
