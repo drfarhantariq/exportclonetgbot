@@ -1567,13 +1567,25 @@ async def run_bot() -> None:
         except Exception:
             logging.getLogger("heroku_bot").exception("auto resume clone failed")
 
-    async def _watch_status_message(chat_id: int, message_id: int, interval_sec: float, last_text: str) -> None:
+    async def _watch_status_message(
+        chat_id: int,
+        message_id: int,
+        interval_sec: float,
+        last_text: str,
+        *,
+        status_kind: str = "status",
+    ) -> None:
         key = (chat_id, message_id)
         try:
             while True:
                 await asyncio.sleep(max(interval_sec, 0.5))
                 view = ACTIVE_STATUS_VIEWS.get(key, "main")
-                text, clone_state = await _load_status_view_text(store, view)
+                if status_kind == "clone_status":
+                    text, clone_state = await _load_clone_status_view_text(store, view)
+                    reply_markup = _clone_status_reply_markup(view)
+                else:
+                    text, clone_state = await _load_status_view_text(store, view)
+                    reply_markup = _status_reply_markup(view)
                 last_text = ACTIVE_STATUS_LAST_TEXTS.get(key, last_text)
                 if text != last_text:
                     try:
@@ -1583,12 +1595,20 @@ async def run_bot() -> None:
                             text=text,
                             parse_mode=enums.ParseMode.HTML,
                             disable_web_page_preview=True,
-                            reply_markup=_status_reply_markup(view),
+                            reply_markup=reply_markup,
                         )
+                        last_text = text
+                        ACTIVE_STATUS_LAST_TEXTS[key] = text
+                    except FloodWait:
+                        continue
+                    except RPCError as exc:
+                        if _is_invalid_status_message_error(exc):
+                            break
+                        logging.getLogger("heroku_bot").debug("watched status edit failed", exc_info=True)
+                        continue
                     except Exception:
-                        break
-                    last_text = text
-                    ACTIVE_STATUS_LAST_TEXTS[key] = text
+                        logging.getLogger("heroku_bot").debug("watched status edit failed", exc_info=True)
+                        continue
 
                 phase = str((clone_state or {}).get("phase", "")).lower()
                 if phase and phase != "running":
@@ -1597,6 +1617,33 @@ async def run_bot() -> None:
             ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
             ACTIVE_STATUS_VIEWS.pop(key, None)
             ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
+
+    async def _ensure_status_watcher(status_message, last_text: str, status_kind: str) -> None:
+        key = (status_message.chat.id, status_message.id)
+        if key in ACTIVE_STATUS_WATCH_TASKS:
+            return
+
+        view = ACTIVE_STATUS_VIEWS.get(key, "main")
+        if status_kind == "clone_status":
+            _, clone_state = await _load_clone_status_view_text(store, view)
+        else:
+            _, clone_state = await _load_status_view_text(store, view)
+
+        phase = str((clone_state or {}).get("phase", "")).lower()
+        if phase != "running":
+            return
+
+        bot_settings = await _load_bot_settings(store)
+        interval_sec = float(bot_settings["status_command_update_interval_sec"])
+        ACTIVE_STATUS_WATCH_TASKS[key] = asyncio.create_task(
+            _watch_status_message(
+                status_message.chat.id,
+                status_message.id,
+                interval_sec,
+                last_text,
+                status_kind=status_kind,
+            )
+        )
 
     @bot.on_message(filters.private & filters.command("start", prefixes="/"))
     async def start_handler(client, message) -> None:
@@ -1636,7 +1683,7 @@ async def run_bot() -> None:
             if previous_task is not None:
                 previous_task.cancel()
             ACTIVE_STATUS_WATCH_TASKS[key] = asyncio.create_task(
-                _watch_status_message(sent.chat.id, sent.id, interval_sec, text)
+                _watch_status_message(sent.chat.id, sent.id, interval_sec, text, status_kind="status")
             )
 
     @bot.on_callback_query(filters.regex(r"^status:(close|tstats|back|refresh)$"))
@@ -1691,6 +1738,7 @@ async def run_bot() -> None:
             )
         except Exception:
             pass
+        await _ensure_status_watcher(status_message, text, "status")
 
     @bot.on_callback_query(filters.regex(r"^clone_status:(close|tstats|back|refresh)$"))
     async def clone_status_callback_handler(client, callback_query) -> None:
@@ -1708,6 +1756,9 @@ async def run_bot() -> None:
         action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
         key = (status_message.chat.id, status_message.id)
         if action == "close":
+            task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+            if task is not None:
+                task.cancel()
             ACTIVE_STATUS_VIEWS.pop(key, None)
             ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
             await callback_query.answer("Closed.")
@@ -1740,6 +1791,7 @@ async def run_bot() -> None:
             )
         except Exception:
             pass
+        await _ensure_status_watcher(status_message, text, "clone_status")
 
     async def _finish_login_flow(user_id: int, login_client: Client, current_settings: dict[str, Any], message) -> None:
         session_string = await login_client.export_session_string()
@@ -2194,12 +2246,16 @@ async def run_bot() -> None:
 
         if command_text.lower() == "status":
             text, _ = await _load_clone_status_view_text(store, "main")
-            await message.reply_text(
+            sent = await message.reply_text(
                 text,
                 parse_mode=enums.ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=_clone_status_reply_markup("main"),
             )
+            key = (sent.chat.id, sent.id)
+            ACTIVE_STATUS_VIEWS[key] = "main"
+            ACTIVE_STATUS_LAST_TEXTS[key] = text
+            await _ensure_status_watcher(sent, text, "clone_status")
             return
 
         bot_settings = await _load_bot_settings(store)

@@ -1,0 +1,26 @@
+2026-04-30 13:24:45,681 INFO [topic_clone] warming large channel peer
+2026-04-30 13:24:45,766 INFO [topic_clone] warming large channel peer
+2026-04-30 13:25:05,746 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:25:05,746 INFO [topic_clone] uploading downloaded video: duration=6290 width=1024 height=576 source_duration=6290 file=/tmp/tmpsd7bslkh/SESSION DECEMBER25|Medicine|Medicine Endocrinology part 1 ac.mp4
+2026-04-30 13:26:04,148 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:26:04,148 INFO [topic_clone] uploading downloaded video: duration=8581 width=1024 height=576 source_duration=8581 file=/tmp/tmpijurqlev/SESSION DECEMBER25|Medicine|Medicine Hematology.mp4
+2026-04-30 13:26:42,175 INFO [topic_export] warming large channel peer
+2026-04-30 13:26:50,810 INFO [topic_export] warming large channel peer
+2026-04-30 13:26:54,293 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:26:54,293 INFO [topic_clone] uploading downloaded video: duration=6132 width=1024 height=576 source_duration=6132 file=/tmp/tmpeez740gz/SESSION DECEMBER25|Medicine|Medicine Endocrinology part 2 Al.mp4
+2026-04-30 13:27:44,062 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:27:44,063 INFO [topic_clone] uploading downloaded video: duration=5859 width=1024 height=576 source_duration=5859 file=/tmp/tmps36pwnkk/SESSION DECEMBER25|Medicine|Medicine Endocrinology part 3 Di.mp4
+2026-04-30 13:28:13,828 INFO [topic_export] warming large channel peer
+2026-04-30 13:28:22,550 INFO [topic_export] warming large channel peer
+2026-04-30 13:28:34,351 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:28:34,351 INFO [topic_clone] uploading downloaded video: duration=7591 width=1024 height=576 source_duration=7591 file=/tmp/tmp6f3kdvyx/SESSION DECEMBER25|Medicine|Medicine Endocrinology part 4 Th.mp4
+2026-04-30 13:29:29,867 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:29:29,867 INFO [topic_clone] uploading downloaded video: duration=6146 width=1024 height=576 source_duration=6146 file=/tmp/tmpv6wwjill/SESSION DECEMBER25|Medicine|Medicine Endocrinology part 5 Ad.mp4
+2026-04-30 13:30:17,936 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:30:17,936 INFO [topic_clone] uploading downloaded video: duration=5573 width=1024 height=576 source_duration=5573 file=/tmp/tmpkwafioa8/SESSION DECEMBER25|Medicine|Medicine Endocrinology part 6 Ad.mp4
+2026-04-30 13:31:12,791 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:31:12,791 INFO [topic_clone] uploading downloaded video: duration=6948 width=1024 height=576 source_duration=6948 file=/tmp/tmpmngouedb/SESSION DECEMBER25|Medicine|Neurology part -1 (headache, dem.mp4
+2026-04-30 13:32:06,508 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:32:06,508 INFO [topic_clone] uploading downloaded video: duration=6268 width=1024 height=576 source_duration=6268 file=/tmp/tmp1jkbxgfe/SESSION DECEMBER25|Medicine|Neurology part -2 Basal ganglia .mp4
+2026-04-30 13:32:52,115 INFO [topic_clone] generated video frame thumbnail
+2026-04-30 13:32:52,115 INFO [topic_clone] uploading downloaded video: duration=4058 width=1024 height=576 source_duration=4058 file=/tmp/tmp8kwyczvu/SESSION DECEMBER25|Medicine|Neurology part -3 (Cerebellum, m.mp4

@@ -678,12 +678,12 @@ class TelegramService:
         if os.getenv("GENERATE_VIDEO_THUMBNAILS", "true").strip().lower() in {"0", "false", "no", "off"}:
             return None
 
-        ffmpeg_binary = self._ffmpeg_binary()
-        if not await self._binary_available(ffmpeg_binary):
+        ffmpeg_binary = await self._first_available_binary(self._ffmpeg_candidates())
+        if not ffmpeg_binary:
             self.logger.warning(
                 "ffmpeg is not available; video thumbnail generation is disabled. "
-                "Install the Heroku apt buildpack with an Aptfile containing ffmpeg.",
-                extra={"event": "ffmpeg_missing", "binary": ffmpeg_binary},
+                "Install imageio-ffmpeg or the Heroku apt buildpack with an Aptfile containing ffmpeg.",
+                extra={"event": "ffmpeg_missing", "candidates": self._ffmpeg_candidates()},
             )
             return None
 
@@ -934,24 +934,70 @@ class TelegramService:
 
     @staticmethod
     def _ffmpeg_binary() -> str:
+        return TelegramService._ffmpeg_candidates()[0]
+
+    @staticmethod
+    def _ffmpeg_candidates() -> list[str]:
+        candidates: list[str] = []
         configured = os.getenv("FFMPEG_BINARY", "").strip()
         if configured:
-            return configured
-        if binary := shutil.which("ffmpeg"):
-            return binary
+            candidates.append(configured)
+
         try:
             import imageio_ffmpeg
 
-            return imageio_ffmpeg.get_ffmpeg_exe()
+            candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
         except Exception:
-            return "ffmpeg"
+            pass
+
+        if binary := shutil.which("ffmpeg"):
+            candidates.append(binary)
+
+        candidates.append("ffmpeg")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                deduped.append(candidate)
+                seen.add(candidate)
+        return deduped
+
+    async def _first_available_binary(self, candidates: list[str]) -> str | None:
+        for candidate in candidates:
+            if await self._binary_available(candidate):
+                return candidate
+            self.logger.debug(
+                "ffmpeg candidate is not executable",
+                extra={"event": "ffmpeg_candidate_unavailable", "binary": candidate},
+            )
+        return None
+
+    @staticmethod
+    def _ffprobe_candidates() -> list[str]:
+        candidates: list[str] = []
+        configured = os.getenv("FFPROBE_BINARY", "").strip()
+        if configured:
+            candidates.append(configured)
+        if binary := shutil.which("ffprobe"):
+            candidates.append(binary)
+        candidates.append("ffprobe")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                deduped.append(candidate)
+                seen.add(candidate)
+        return deduped
 
     @staticmethod
     def _ffprobe_binary() -> str:
         configured = os.getenv("FFPROBE_BINARY", "").strip()
         if configured:
             return configured
-        return shutil.which("ffprobe") or "ffprobe"
+        if binary := shutil.which("ffprobe"):
+            return binary
+        ffprobe_candidates = TelegramService._ffprobe_candidates()
+        return ffprobe_candidates[0] if ffprobe_candidates else "ffprobe"
 
     async def get_chat(self, chat_id: int | str) -> Chat:
         await self.ensure_peer_cached(chat_id)
