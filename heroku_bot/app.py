@@ -60,6 +60,7 @@ STATE_DIR = RUNTIME_DIR / "state"
 EXPORTS_DIR = RUNTIME_DIR / "exports"
 LOG_DIR = RUNTIME_DIR / "logs"
 LOG_FILE = Path(os.getenv("LOG_FILE_PATH", str(LOG_DIR / "app.log"))).expanduser()
+RESTART_MESSAGE_FILE = STATE_DIR / "restart_message.json"
 BOT_STARTED_AT = time.time()
 
 
@@ -378,10 +379,10 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "mongodb_database": os.getenv("MONGODB_DATABASE", "topic_ops").strip(),
     "owner_id": os.getenv("BOT_ADMIN_USER_IDS", "").strip(),
     "tg_session_string": os.getenv("TG_SESSION_STRING", "").strip(),
-    "clone_status_update_interval_sec": 0.75,
-    "clone_status_success_update_interval_sec": 0.5,
-    "clone_status_keepalive_interval_sec": 5.0,
-    "status_command_update_interval_sec": 1.0,
+    "clone_status_update_interval_sec": 8.0,
+    "clone_status_success_update_interval_sec": 8.0,
+    "clone_status_keepalive_interval_sec": 30.0,
+    "status_command_update_interval_sec": 5.0,
     "clone_default_delay_sec": 0.2,
     "clone_default_batch_size": 50,
     "clone_continue_on_error_default": False,
@@ -390,6 +391,10 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "export_default_batch_size": 20,
     "export_default_batch_delay_sec": 2.0,
 }
+
+MIN_CLONE_AUTO_EDIT_INTERVAL_SEC = 5.0
+MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC = 20.0
+MIN_WATCHED_STATUS_INTERVAL_SEC = 3.0
 
 BOT_SETTINGS_HELP = (
     "Settings commands:\n"
@@ -799,6 +804,16 @@ def _readable_time(seconds: Any) -> str:
             value, remaining = divmod(remaining, length)
             parts.append(f"{value}{suffix}")
     return "".join(parts) or "0s"
+
+
+def _restart_success_text() -> str:
+    started = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(BOT_STARTED_AT))
+    return (
+        "⌬ <b><i>Restarted Successfully!</i></b>\n"
+        f"┟ <b>Date:</b> {time.strftime('%Y-%m-%d', time.gmtime(BOT_STARTED_AT))}\n"
+        f"┠ <b>Time:</b> {time.strftime('%H:%M:%S', time.gmtime(BOT_STARTED_AT))} UTC\n"
+        f"┖ <b>Started:</b> {started}"
+    )
 
 
 def _progress_bar(percent: float) -> str:
@@ -1317,9 +1332,18 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         success_changed = success != last_reported_success
         progress_changed = current_index != last_reported_index
         flood_wait_changed = flood_wait_until > 0 and flood_wait_until != last_reported_flood_wait_until
-        success_interval = float(bot_settings["clone_status_success_update_interval_sec"])
-        progress_interval = float(bot_settings["clone_status_update_interval_sec"])
-        keepalive_interval = float(bot_settings["clone_status_keepalive_interval_sec"])
+        success_interval = max(
+            float(bot_settings["clone_status_success_update_interval_sec"]),
+            MIN_CLONE_AUTO_EDIT_INTERVAL_SEC,
+        )
+        progress_interval = max(
+            float(bot_settings["clone_status_update_interval_sec"]),
+            MIN_CLONE_AUTO_EDIT_INTERVAL_SEC,
+        )
+        keepalive_interval = max(
+            float(bot_settings["clone_status_keepalive_interval_sec"]),
+            MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC,
+        )
 
         should_edit = (
             phase != "running"
@@ -1567,6 +1591,35 @@ async def run_bot() -> None:
         except Exception:
             logging.getLogger("heroku_bot").exception("auto resume clone failed")
 
+    async def _send_restart_notification() -> None:
+        payload = _read_json_file(RESTART_MESSAGE_FILE)
+        if not payload:
+            return
+
+        chat_id = _safe_int(payload.get("chat_id"))
+        message_id = _safe_int(payload.get("message_id"))
+        text = _restart_success_text()
+        try:
+            if chat_id and message_id:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            elif chat_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        except Exception:
+            logging.getLogger("heroku_bot").exception("restart notification failed")
+        finally:
+            RESTART_MESSAGE_FILE.unlink(missing_ok=True)
+
     async def _watch_status_message(
         chat_id: int,
         message_id: int,
@@ -1578,7 +1631,7 @@ async def run_bot() -> None:
         key = (chat_id, message_id)
         try:
             while True:
-                await asyncio.sleep(max(interval_sec, 0.5))
+                await asyncio.sleep(max(interval_sec, MIN_WATCHED_STATUS_INTERVAL_SEC))
                 view = ACTIVE_STATUS_VIEWS.get(key, "main")
                 if status_kind == "clone_status":
                     text, clone_state = await _load_clone_status_view_text(store, view)
@@ -1634,7 +1687,10 @@ async def run_bot() -> None:
             return
 
         bot_settings = await _load_bot_settings(store)
-        interval_sec = float(bot_settings["status_command_update_interval_sec"])
+        interval_sec = max(
+            float(bot_settings["status_command_update_interval_sec"]),
+            MIN_WATCHED_STATUS_INTERVAL_SEC,
+        )
         ACTIVE_STATUS_WATCH_TASKS[key] = asyncio.create_task(
             _watch_status_message(
                 status_message.chat.id,
@@ -1678,7 +1734,10 @@ async def run_bot() -> None:
         ACTIVE_STATUS_LAST_TEXTS[key] = text
         if phase == "running":
             bot_settings = await _load_bot_settings(store)
-            interval_sec = float(bot_settings["status_command_update_interval_sec"])
+            interval_sec = max(
+                float(bot_settings["status_command_update_interval_sec"]),
+                MIN_WATCHED_STATUS_INTERVAL_SEC,
+            )
             previous_task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
             if previous_task is not None:
                 previous_task.cancel()
@@ -2174,12 +2233,68 @@ async def run_bot() -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
-        await message.reply_text("Restarting bot now...")
+        await message.reply_text(
+            "<i>Are you sure you want to restart the bot?</i>",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Yes", callback_data="restart:confirm"),
+                        InlineKeyboardButton("No", callback_data="restart:cancel"),
+                    ]
+                ]
+            ),
+        )
+
+    @bot.on_callback_query(filters.regex(r"^restart:(confirm|cancel)$"))
+    async def restart_callback_handler(client, callback_query) -> None:
+        user = getattr(callback_query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in admin_ids:
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        restart_prompt = getattr(callback_query, "message", None)
+        if restart_prompt is None:
+            await callback_query.answer()
+            return
+
+        action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
+        if action == "cancel":
+            await callback_query.answer("Cancelled.")
+            try:
+                await restart_prompt.edit_text("Restart cancelled.")
+            except Exception:
+                pass
+            return
+
+        await callback_query.answer()
         try:
-            await bot.stop()
+            await restart_prompt.edit_text("<i>Restarting...</i>", parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        _write_json_file(
+            RESTART_MESSAGE_FILE,
+            {
+                "chat_id": restart_prompt.chat.id,
+                "message_id": restart_prompt.id,
+                "requested_at": time.time(),
+            },
+        )
+        asyncio.create_task(_restart_process())
+
+    async def _restart_process() -> None:
+        await asyncio.sleep(1.5)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except Exception:
+            logging.getLogger("heroku_bot").exception("process restart failed; exiting for dyno restart")
+            os._exit(1)
 
     @bot.on_message(filters.private & filters.command("export", prefixes="/"))
     async def export_handler(client, message) -> None:
@@ -2320,6 +2435,7 @@ async def run_bot() -> None:
 
     await bot.start()
     print("Heroku topic bot is running.")
+    asyncio.create_task(_send_restart_notification())
     asyncio.create_task(_auto_resume_clone_after_start())
     try:
         await asyncio.Event().wait()
