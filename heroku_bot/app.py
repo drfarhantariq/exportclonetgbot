@@ -1177,6 +1177,10 @@ def _format_export_status(state: dict[str, Any]) -> str:
     elif fetched_messages or processed_messages:
         lines.append(f"Progress: fetched {_html(fetched_messages)}, processed {_html(processed_messages)}")
 
+    found_message_ids = _safe_int(state.get("found_message_ids"))
+    if found_message_ids and not total_messages:
+        lines.append(f"Messages found: {_html(found_message_ids)}")
+
     current_message_id = state.get("current_message_id")
     if current_message_id:
         lines.append(f"Current message: {_html(current_message_id)}")
@@ -1217,20 +1221,57 @@ def _format_export_status(state: dict[str, Any]) -> str:
 def _format_index_status(state: dict[str, Any]) -> str:
     phase = str(state.get("phase", "unknown")).title()
     payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
-    lines = [f"Phase: {_html(phase)}"]
+    stage = str(state.get("stage") or "").replace("_", " ").title()
+    started_at = _safe_float(state.get("started_at"))
+    elapsed = max(time.time() - started_at, 0.0) if started_at > 0 else 0.0
+    lines = ["<b>Index Status</b>", f"Phase: {_html(phase)}"]
+    if stage:
+        lines.append(f"Stage: {_html(stage)}")
 
     topic_link = payload.get("topic_link")
     if topic_link:
         lines.append(f"Topic: {_html(topic_link)}")
 
-    count = state.get("count")
-    if count is not None:
-        lines.append(f"Text links: {_html(count)}")
-
     batch_size = payload.get("batch_size")
     batch_delay = payload.get("batch_delay_sec")
     if batch_size or batch_delay is not None:
         lines.append(f"Batch: {_html(batch_size or '-')} messages, delay {_html(batch_delay if batch_delay is not None else '-')}s")
+
+    total_messages = _safe_int(state.get("total_messages"))
+    fetched_messages = _safe_int(state.get("fetched_messages"))
+    processed_messages = _safe_int(state.get("processed_messages"))
+    if total_messages > 0:
+        current = processed_messages if state.get("processed_messages") is not None else fetched_messages
+        percent = current / total_messages * 100.0 if current else 0.0
+        lines.append(f"Progress: {_html(current)} of {_html(total_messages)} messages ({_format_percent(percent)})")
+    elif fetched_messages or processed_messages:
+        lines.append(f"Progress: fetched {_html(fetched_messages)}, processed {_html(processed_messages)}")
+
+    found_message_ids = _safe_int(state.get("found_message_ids"))
+    if found_message_ids and not total_messages:
+        lines.append(f"Messages found: {_html(found_message_ids)}")
+
+    current_message_id = state.get("current_message_id")
+    if current_message_id:
+        lines.append(f"Current message: {_html(current_message_id)}")
+
+    text_entries = _safe_int(state.get("text_entries") if state.get("text_entries") is not None else state.get("count"))
+    if text_entries:
+        lines.append(f"Text links found: {_html(text_entries)}")
+
+    send_client = str(state.get("send_client") or "").strip()
+    if send_client:
+        lines.append(f"Sending with: {_html(send_client.replace('_', ' '))}")
+
+    flood_wait_until = _safe_float(state.get("flood_wait_until"))
+    flood_wait_seconds = _safe_float(state.get("flood_wait_seconds"))
+    if flood_wait_until > time.time() or (flood_wait_seconds > 0 and not flood_wait_until):
+        remaining = max(flood_wait_until - time.time(), 0.0) if flood_wait_until else flood_wait_seconds
+        operation = str(state.get("flood_wait_operation") or "telegram")
+        lines.append(f"FloodWait: {_html(_readable_time(remaining))} for {_html(operation)}")
+
+    if elapsed > 0:
+        lines.append(f"Elapsed: {_html(_readable_time(elapsed))}")
 
     header = payload.get("header")
     if header:
@@ -1368,7 +1409,6 @@ def _format_combined_status_text(
         messages.append(_format_export_status(export_state))
 
     if index_state:
-        messages.append("\n<b>Index Status</b>")
         messages.append(_format_index_status(index_state))
 
     messages.append(_format_bot_stats())
@@ -1444,6 +1484,8 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
             if wrapper.get("processed_messages") is not None
             else _safe_int(wrapper.get("fetched_messages"))
         )
+        if not progress:
+            progress = _safe_int(wrapper.get("found_message_ids"))
         phase = str(wrapper.get("phase") or "").lower()
         has_active_flood_wait = _safe_float(wrapper.get("flood_wait_until")) > now
         stage_changed = stage != last_stage
@@ -1498,8 +1540,71 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
 
 
 async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStore, bot: Client) -> None:
-    await store.save("index:last", {"phase": "queued", "payload": payload})
-    status = await message.reply_text("Index generation started.")
+    bot_settings = await _load_bot_settings(store)
+    update_interval_sec = max(
+        float(bot_settings["status_command_update_interval_sec"]),
+        MIN_WATCHED_STATUS_INTERVAL_SEC,
+    )
+    job_started_at = time.time()
+    latest_state: dict[str, Any] = {
+        "phase": "queued",
+        "stage": "queued",
+        "payload": payload,
+        "started_at": job_started_at,
+    }
+    last_edit_at = 0.0
+    last_persist_at = 0.0
+    last_stage = ""
+    last_progress = -1
+    last_text_entries = -1
+
+    await store.save("index:last", latest_state)
+    status = await message.reply_text(
+        _format_index_status(latest_state),
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    async def _save_index_status(update: dict[str, Any]) -> None:
+        nonlocal latest_state, last_edit_at, last_persist_at, last_stage, last_progress, last_text_entries
+        now = time.time()
+        wrapper = dict(latest_state)
+        wrapper.update(update)
+        wrapper["payload"] = payload
+        wrapper["started_at"] = wrapper.get("started_at") or job_started_at
+        latest_state = wrapper
+
+        stage = str(wrapper.get("stage") or "")
+        progress = (
+            _safe_int(wrapper.get("processed_messages"))
+            if wrapper.get("processed_messages") is not None
+            else _safe_int(wrapper.get("fetched_messages"))
+        )
+        text_entries = _safe_int(wrapper.get("text_entries"))
+        phase = str(wrapper.get("phase") or "").lower()
+        has_active_flood_wait = _safe_float(wrapper.get("flood_wait_until")) > now
+        stage_changed = stage != last_stage
+        progress_changed = progress != last_progress
+        text_entries_changed = text_entries != last_text_entries
+        should_update_now = (
+            phase != "running"
+            or stage_changed
+            or has_active_flood_wait
+            or (progress_changed and now - last_edit_at >= update_interval_sec)
+            or (text_entries_changed and now - last_edit_at >= update_interval_sec)
+        )
+
+        if should_update_now:
+            await _edit_status_message(status, _format_index_status(wrapper))
+            last_edit_at = now
+            last_stage = stage
+            last_progress = progress
+            last_text_entries = text_entries
+
+        if should_update_now or now - last_persist_at >= update_interval_sec:
+            await store.save("index:last", wrapper)
+            last_persist_at = now
+
     try:
         count = await run_index(
             topic_link=payload["topic_link"],
@@ -1509,20 +1614,27 @@ async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStor
             onwards=bool(payload["onwards"]),
             bot=bot,
             header=str(payload.get("header") or "INDEX 👆"),
+            status_callback=_save_index_status,
         )
     except Exception as exc:
-        await store.save(
-            "index:last",
-            {"phase": "failed", "payload": payload, "error": str(exc)},
-        )
-        await status.edit_text(f"Index failed: {exc}")
+        failed_state = dict(latest_state)
+        failed_state.update({"phase": "failed", "stage": "failed", "payload": payload, "error": str(exc)})
+        await store.save("index:last", failed_state)
+        await _edit_status_message(status, _format_index_status(failed_state))
         raise
     else:
-        await store.save(
-            "index:last",
-            {"phase": "completed", "payload": payload, "count": count},
+        completed_state = dict(latest_state)
+        completed_state.update(
+            {
+                "phase": "completed",
+                "stage": "completed",
+                "payload": payload,
+                "count": count,
+                "text_entries": count,
+            }
         )
-        await status.edit_text(f"Index complete: {count} text links sent into the topic.")
+        await store.save("index:last", completed_state)
+        await _edit_status_message(status, _format_index_status(completed_state))
 
 
 async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:

@@ -1079,6 +1079,7 @@ class TelegramService:
         topic_id: int,
         start_from_message_id: int = 0,
         batch_size: int = 100,
+        progress_callback: Callable[[dict[str, object]], Awaitable[None]] | None = None,
     ) -> list[int]:
         peer = await self.resolve_input_peer(chat_id)
         offset_id = 0
@@ -1122,6 +1123,20 @@ class TelegramService:
                 break
 
             message_ids.extend(batch_ids)
+            if progress_callback is not None:
+                try:
+                    await progress_callback(
+                        {
+                            "found_message_ids": len(message_ids),
+                            "last_message_id": batch_ids[-1],
+                        }
+                    )
+                except Exception:
+                    self.logger.debug(
+                        "topic message id progress callback failed",
+                        exc_info=True,
+                        extra={"event": "topic_message_id_progress_callback_failed"},
+                    )
             next_offset = min(batch_ids)
             if next_offset == offset_id:
                 break

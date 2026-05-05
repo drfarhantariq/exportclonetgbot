@@ -47,6 +47,7 @@ MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "").strip()
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "bot_state").strip()
 
 ExportStatusCallback = Callable[[dict[str, Any]], Awaitable[None]]
+IndexStatusCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def _parse_export_link(link: str) -> ParsedExportLink:
@@ -580,6 +581,18 @@ async def _notify_export_status(
         logging.getLogger("topic_export").debug("export status callback failed", exc_info=True)
 
 
+async def _notify_index_status(
+    callback: IndexStatusCallback | None,
+    payload: dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    try:
+        await callback(payload)
+    except Exception:
+        logging.getLogger("topic_index").debug("index status callback failed", exc_info=True)
+
+
 async def run_export(
     topic_link: str,
     config_path: str,
@@ -836,6 +849,7 @@ async def run_index(
     onwards: bool,
     bot: Client,
     header: str = "INDEX 👆",
+    status_callback: IndexStatusCallback | None = None,
 ) -> int:
     try:
         settings, _ = load_settings(config_path)
@@ -853,21 +867,148 @@ async def run_index(
     start_message_id = _resolve_start_message_id(parsed, onwards)
     telegram = TelegramService(settings, logger=logging.getLogger("topic_index"), receive_updates=False)
 
+    async def _handle_flood_wait(payload: dict[str, Any]) -> None:
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "running",
+                "stage": "flood_wait",
+                "flood_wait_operation": payload.get("operation"),
+                "flood_wait_seconds": payload.get("wait_seconds"),
+                "flood_wait_until": payload.get("wait_until"),
+            },
+        )
+
     try:
+        telegram.flood_wait_callback = _handle_flood_wait
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "running",
+                "stage": "starting",
+                "source_chat_id": parsed.chat_id,
+                "source_topic_id": parsed.topic_id,
+                "start_message_id": start_message_id,
+            },
+        )
         await telegram.start()
-        messages = await telegram.list_topic_messages(
+        await _notify_index_status(status_callback, {"phase": "running", "stage": "listing_message_ids"})
+
+        async def _handle_found_message_ids(payload: dict[str, object]) -> None:
+            await _notify_index_status(
+                status_callback,
+                {
+                    "phase": "running",
+                    "stage": "listing_message_ids",
+                    "found_message_ids": payload.get("found_message_ids"),
+                    "current_message_id": payload.get("last_message_id"),
+                },
+            )
+
+        message_ids = await telegram.list_topic_message_ids(
             chat_id=parsed.chat_id,
             topic_id=parsed.topic_id,
             start_from_message_id=start_message_id,
             batch_size=batch_size,
-            inter_batch_delay_sec=batch_delay_sec,
+            progress_callback=_handle_found_message_ids,
+        )
+        ordered_ids = sorted(set(message_ids))
+        total_messages = len(ordered_ids)
+        messages = []
+
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "running",
+                "stage": "fetching_messages",
+                "total_messages": total_messages,
+                "fetched_messages": 0,
+                "text_entries": 0,
+            },
         )
 
-        entries = _build_topic_index_entries(messages, parsed.chat_id, parsed.topic_id)
+        for start in range(0, total_messages, batch_size):
+            chunk = ordered_ids[start : start + batch_size]
+            chunk_messages = await telegram.get_messages_bulk(parsed.chat_id, chunk)
+            by_id = {message.id: message for message in chunk_messages}
+            for message_id in chunk:
+                message = by_id.get(message_id)
+                if message is not None:
+                    messages.append(message)
+
+            fetched_messages = min(start + len(chunk), total_messages)
+            await _notify_index_status(
+                status_callback,
+                {
+                    "phase": "running",
+                    "stage": "fetching_messages",
+                    "total_messages": total_messages,
+                    "fetched_messages": fetched_messages,
+                    "current_message_id": chunk[-1] if chunk else None,
+                },
+            )
+
+            has_more = start + batch_size < total_messages
+            if has_more and batch_delay_sec > 0:
+                await asyncio.sleep(batch_delay_sec)
+
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "running",
+                "stage": "scanning_text_messages",
+                "total_messages": total_messages,
+                "fetched_messages": len(messages),
+                "processed_messages": 0,
+                "text_entries": 0,
+            },
+        )
+
+        entries: list[tuple[str, str]] = []
+        for index, message in enumerate(messages, start=1):
+            text = _normalize_text_line(_message_text(message))
+            if text:
+                entries.append((text, build_private_topic_link(parsed.chat_id, parsed.topic_id, message.id)))
+            await _notify_index_status(
+                status_callback,
+                {
+                    "phase": "running",
+                    "stage": "scanning_text_messages",
+                    "total_messages": total_messages,
+                    "fetched_messages": len(messages),
+                    "processed_messages": index,
+                    "text_entries": len(entries),
+                    "current_message_id": message.id,
+                },
+            )
+
         if not entries:
             raise RuntimeError("No text messages were found in the specified topic.")
 
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "running",
+                "stage": "generating_index",
+                "total_messages": total_messages,
+                "fetched_messages": len(messages),
+                "processed_messages": len(messages),
+                "text_entries": len(entries),
+            },
+        )
         index_message = _build_index_message(entries, header=header)
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "running",
+                "stage": "sending_index",
+                "total_messages": total_messages,
+                "fetched_messages": len(messages),
+                "processed_messages": len(messages),
+                "text_entries": len(entries),
+                "send_client": "user_session",
+            },
+        )
         try:
             await telegram.ensure_peer_cached(parsed.chat_id)
             await _send_topic_index_message(
@@ -887,6 +1028,18 @@ async def run_index(
                 },
             )
             try:
+                await _notify_index_status(
+                    status_callback,
+                    {
+                        "phase": "running",
+                        "stage": "sending_index",
+                        "total_messages": total_messages,
+                        "fetched_messages": len(messages),
+                        "processed_messages": len(messages),
+                        "text_entries": len(entries),
+                        "send_client": "bot",
+                    },
+                )
                 await _send_topic_index_message(
                     client=bot,
                     chat_id=parsed.chat_id,
@@ -898,6 +1051,17 @@ async def run_index(
                     "Index was generated, but neither the user session nor the bot could send "
                     f"it into the topic. User session error: {user_send_error}; bot error: {bot_send_error}"
                 ) from bot_send_error
+        await _notify_index_status(
+            status_callback,
+            {
+                "phase": "completed",
+                "stage": "completed",
+                "total_messages": total_messages,
+                "fetched_messages": len(messages),
+                "processed_messages": len(messages),
+                "text_entries": len(entries),
+            },
+        )
         return len(entries)
     finally:
         await telegram.stop()
