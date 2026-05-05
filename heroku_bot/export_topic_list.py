@@ -507,7 +507,7 @@ def _build_topic_index_entries(messages, chat_id: int, topic_id: int) -> list[tu
 
 
 async def _send_topic_index_message(
-    bot: Client,
+    client: Client,
     chat_id: int,
     topic_id: int,
     text: str,
@@ -520,7 +520,7 @@ async def _send_topic_index_message(
     }
 
     try:
-        supports_message_thread_id = "message_thread_id" in inspect.signature(bot.send_message).parameters
+        supports_message_thread_id = "message_thread_id" in inspect.signature(client.send_message).parameters
     except (TypeError, ValueError):
         supports_message_thread_id = False
 
@@ -529,7 +529,7 @@ async def _send_topic_index_message(
     else:
         kwargs["reply_to_message_id"] = topic_id
 
-    await bot.send_message(**kwargs)
+    await client.send_message(**kwargs)
 
 
 def _normalize_text_line(text: str) -> str:
@@ -867,12 +867,37 @@ async def run_index(
         if not entries:
             raise RuntimeError("No text messages were found in the specified topic.")
 
-        await _send_topic_index_message(
-            bot=bot,
-            chat_id=parsed.chat_id,
-            topic_id=parsed.topic_id,
-            text=_build_index_message(entries, header=header),
-        )
+        index_message = _build_index_message(entries, header=header)
+        try:
+            await telegram.ensure_peer_cached(parsed.chat_id)
+            await _send_topic_index_message(
+                client=telegram.app,
+                chat_id=parsed.chat_id,
+                topic_id=parsed.topic_id,
+                text=index_message,
+            )
+        except Exception as user_send_error:
+            logging.getLogger("topic_index").warning(
+                "user session could not send index, falling back to bot",
+                extra={
+                    "event": "index_user_send_failed",
+                    "chat_id": parsed.chat_id,
+                    "topic_id": parsed.topic_id,
+                    "error": str(user_send_error),
+                },
+            )
+            try:
+                await _send_topic_index_message(
+                    client=bot,
+                    chat_id=parsed.chat_id,
+                    topic_id=parsed.topic_id,
+                    text=index_message,
+                )
+            except Exception as bot_send_error:
+                raise RuntimeError(
+                    "Index was generated, but neither the user session nor the bot could send "
+                    f"it into the topic. User session error: {user_send_error}; bot error: {bot_send_error}"
+                ) from bot_send_error
         return len(entries)
     finally:
         await telegram.stop()
