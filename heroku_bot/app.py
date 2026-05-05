@@ -45,7 +45,7 @@ from pyrogram.errors import (
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from clone_topic_by_link import run_clone
-from export_topic_list import run_export
+from export_topic_list import run_export, run_index
 
 DEFAULT_UPLOAD_TOPIC_LINK = "https://t.me/c/3541699273/38603/38604"
 DEFAULT_CONFIG_PATH = BUNDLE_DIR / "config.yaml"
@@ -287,6 +287,17 @@ def _build_export_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_index_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--topic-link", default="")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument("--batch-size", type=int, default=20)
+    parser.add_argument("--batch-delay-sec", type=float, default=2.0)
+    parser.add_argument("--onwards", action="store_true")
+    parser.add_argument("--header", default="INDEX 👆")
+    return parser
+
+
 def _build_clone_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--source-link", default="")
@@ -308,7 +319,7 @@ def _bundle_help_text() -> str:
         "Available commands:\n\n"
         "/start - Show the command guide\n"
         "/help - Show all available commands and examples\n"
-        "/status - Show the latest clone/export status\n"
+        "/status - Show the latest clone/export/index status\n"
         "/settings - View bot runtime settings\n"
         "/settings set <key> <value> - Change a runtime setting\n"
         "/settings reset <key>|all - Reset one or all settings\n"
@@ -327,11 +338,27 @@ def _bundle_help_text() -> str:
         "/export --topic-link <link> [--config <path>] [--out <file>] [--batch-size N] "
         "[--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards]\n"
         "/export <topic_link>\n"
-        "/export last or /export resume"
+        "/export last or /export resume\n\n"
+        "Index:\n"
+        "/index --topic-link <link> [--config <path>] [--batch-size N] [--batch-delay-sec S] "
+        "[--onwards] [--header \"INDEX\"]\n"
+        "/index <topic_link>\n"
+        "/index last or /index resume\n"
+        "Scans the topic for text messages only, uses each text as a clickable HTML link, "
+        "and sends the index back into the same topic. Use --onwards to start from the linked message."
     )
 
 
 def _normalize_export_command(command_text: str) -> str:
+    stripped = command_text.strip()
+    if not stripped:
+        return ""
+    if stripped.lower() in {"last", "resume"} or stripped.startswith("-"):
+        return stripped
+    return f"--topic-link {stripped}"
+
+
+def _normalize_index_command(command_text: str) -> str:
     stripped = command_text.strip()
     if not stripped:
         return ""
@@ -1084,10 +1111,48 @@ def _format_clone_status_with_stats(state: dict[str, Any]) -> str:
     return f"{_format_clone_status_panel(state)}\n\n{_format_bot_stats()}"
 
 
+def _format_clone_completion_message(state: dict[str, Any]) -> str:
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
+    source_label = _format_clone_endpoint(payload, "source") or payload.get("source_link", "n/a")
+    destination_label = _format_clone_endpoint(payload, "destination") or payload.get("destination_link", "n/a")
+
+    success = _safe_int(state.get("success"))
+    failed = _safe_int(state.get("failed"))
+    skipped = _safe_int(state.get("skipped"))
+    processed = success + failed + skipped
+    total_messages = _safe_int(state.get("total_messages"))
+    processed_text = str(processed)
+    if total_messages > 0:
+        processed_text = f"{processed} of {total_messages}"
+
+    started_at = _safe_float(state.get("started_at"))
+    elapsed = max(time.time() - started_at, 0.0) if started_at > 0 else 0.0
+
+    return "\n".join(
+        [
+            "<b>Clone completed</b>",
+            "",
+            f"┠ <b>Source</b> → <i>{_html(source_label)}</i>",
+            f"┠ <b>Destination</b> → <i>{_html(destination_label)}</i>",
+            f"┠ <b>Files processed</b> → <i>{_html(processed_text)}</i>",
+            f"┠ <b>Forwarded</b> → <i>{_html(success)}</i>",
+            f"┠ <b>Failed</b> → <i>{_html(failed)}</i>",
+            f"┠ <b>Skipped</b> → <i>{_html(skipped)}</i>",
+            f"┖ <b>Time taken</b> → <i>{_html(_readable_time(elapsed))}</i>",
+        ]
+    )
+
+
 def _format_export_status(state: dict[str, Any]) -> str:
     phase = str(state.get("phase", "unknown")).title()
     payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
-    lines = [f"Phase: {_html(phase)}"]
+    stage = str(state.get("stage") or "").replace("_", " ").title()
+    started_at = _safe_float(state.get("started_at"))
+    elapsed = max(time.time() - started_at, 0.0) if started_at > 0 else 0.0
+
+    lines = ["<b>Export Status</b>", f"Phase: {_html(phase)}"]
+    if stage:
+        lines.append(f"Stage: {_html(stage)}")
 
     topic_link = payload.get("topic_link")
     if topic_link:
@@ -1102,9 +1167,38 @@ def _format_export_status(state: dict[str, Any]) -> str:
     if batch_size or batch_delay is not None:
         lines.append(f"Batch: {_html(batch_size or '-')} messages, delay {_html(batch_delay if batch_delay is not None else '-')}s")
 
+    total_messages = _safe_int(state.get("total_messages"))
+    fetched_messages = _safe_int(state.get("fetched_messages"))
+    processed_messages = _safe_int(state.get("processed_messages"))
+    if total_messages > 0:
+        current = processed_messages if state.get("processed_messages") is not None else fetched_messages
+        percent = current / total_messages * 100.0 if current else 0.0
+        lines.append(f"Progress: {_html(current)} of {_html(total_messages)} messages ({_format_percent(percent)})")
+    elif fetched_messages or processed_messages:
+        lines.append(f"Progress: fetched {_html(fetched_messages)}, processed {_html(processed_messages)}")
+
+    current_message_id = state.get("current_message_id")
+    if current_message_id:
+        lines.append(f"Current message: {_html(current_message_id)}")
+
+    media_links = _safe_int(state.get("media_links"))
+    text_entries = _safe_int(state.get("text_entries"))
+    if media_links or text_entries:
+        lines.append(f"Entries: {_html(media_links)} media links, {_html(text_entries)} text blocks")
+
     upload_topic_link = payload.get("upload_topic_link")
     if upload_topic_link:
         lines.append(f"Upload topic: {_html(upload_topic_link)}")
+
+    flood_wait_until = _safe_float(state.get("flood_wait_until"))
+    flood_wait_seconds = _safe_float(state.get("flood_wait_seconds"))
+    if flood_wait_until > time.time() or (flood_wait_seconds > 0 and not flood_wait_until):
+        remaining = max(flood_wait_until - time.time(), 0.0) if flood_wait_until else flood_wait_seconds
+        operation = str(state.get("flood_wait_operation") or "telegram")
+        lines.append(f"FloodWait: {_html(_readable_time(remaining))} for {_html(operation)}")
+
+    if elapsed > 0:
+        lines.append(f"Elapsed: {_html(_readable_time(elapsed))}")
 
     flags = []
     if payload.get("caption_file_names"):
@@ -1113,6 +1207,37 @@ def _format_export_status(state: dict[str, Any]) -> str:
         flags.append("onwards")
     if flags:
         lines.append(f"Options: {_html(', '.join(flags))}")
+
+    if state.get("error"):
+        lines.append(f"Error: {_html(state.get('error'))}")
+
+    return "\n".join(lines)
+
+
+def _format_index_status(state: dict[str, Any]) -> str:
+    phase = str(state.get("phase", "unknown")).title()
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
+    lines = [f"Phase: {_html(phase)}"]
+
+    topic_link = payload.get("topic_link")
+    if topic_link:
+        lines.append(f"Topic: {_html(topic_link)}")
+
+    count = state.get("count")
+    if count is not None:
+        lines.append(f"Text links: {_html(count)}")
+
+    batch_size = payload.get("batch_size")
+    batch_delay = payload.get("batch_delay_sec")
+    if batch_size or batch_delay is not None:
+        lines.append(f"Batch: {_html(batch_size or '-')} messages, delay {_html(batch_delay if batch_delay is not None else '-')}s")
+
+    header = payload.get("header")
+    if header:
+        lines.append(f"Header: {_html(header)}")
+
+    if payload.get("onwards"):
+        lines.append("Options: onwards")
 
     if state.get("error"):
         lines.append(f"Error: {_html(state.get('error'))}")
@@ -1231,6 +1356,7 @@ def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
 def _format_combined_status_text(
     clone_state: dict[str, Any] | None,
     export_state: dict[str, Any] | None,
+    index_state: dict[str, Any] | None,
 ) -> str:
     messages = []
     if clone_state:
@@ -1239,29 +1365,34 @@ def _format_combined_status_text(
         messages.append("No saved clone state.")
 
     if export_state:
-        messages.append("\n<b>Export Status</b>")
         messages.append(_format_export_status(export_state))
+
+    if index_state:
+        messages.append("\n<b>Index Status</b>")
+        messages.append(_format_index_status(index_state))
 
     messages.append(_format_bot_stats())
     return "\n\n".join(messages)
 
 
 async def _load_combined_status_text(store: MongoStateStore) -> tuple[str, dict[str, Any] | None]:
-    export_state, clone_state = await asyncio.gather(
+    export_state, clone_state, index_state = await asyncio.gather(
         _load_state(store, "export:last"),
         _load_state(store, "clone:last"),
+        _load_state(store, "index:last"),
     )
-    return _format_combined_status_text(clone_state, export_state), clone_state
+    return _format_combined_status_text(clone_state, export_state, index_state), clone_state
 
 
 async def _load_status_view_text(store: MongoStateStore, view: str) -> tuple[str, dict[str, Any] | None]:
-    export_state, clone_state = await asyncio.gather(
+    export_state, clone_state, index_state = await asyncio.gather(
         _load_state(store, "export:last"),
         _load_state(store, "clone:last"),
+        _load_state(store, "index:last"),
     )
     if view == "overview":
         return _format_tasks_overview(clone_state), clone_state
-    return _format_combined_status_text(clone_state, export_state), clone_state
+    return _format_combined_status_text(clone_state, export_state, index_state), clone_state
 
 
 async def _load_clone_status_view_text(store: MongoStateStore, view: str) -> tuple[str, dict[str, Any] | None]:
@@ -1274,8 +1405,66 @@ async def _load_clone_status_view_text(store: MongoStateStore, view: str) -> tup
 
 
 async def _run_export_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
-    await store.save("export:last", {"phase": "queued", "payload": payload})
-    status = await message.reply_text("Export started.")
+    bot_settings = await _load_bot_settings(store)
+    update_interval_sec = max(
+        float(bot_settings["status_command_update_interval_sec"]),
+        MIN_WATCHED_STATUS_INTERVAL_SEC,
+    )
+    job_started_at = time.time()
+    latest_state: dict[str, Any] = {
+        "phase": "queued",
+        "stage": "queued",
+        "payload": payload,
+        "started_at": job_started_at,
+    }
+    last_edit_at = 0.0
+    last_persist_at = 0.0
+    last_stage = ""
+    last_progress = -1
+
+    await store.save("export:last", latest_state)
+    status = await message.reply_text(
+        _format_export_status(latest_state),
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    async def _save_export_status(update: dict[str, Any]) -> None:
+        nonlocal latest_state, last_edit_at, last_persist_at, last_stage, last_progress
+        now = time.time()
+        wrapper = dict(latest_state)
+        wrapper.update(update)
+        wrapper["payload"] = payload
+        wrapper["started_at"] = wrapper.get("started_at") or job_started_at
+        latest_state = wrapper
+
+        stage = str(wrapper.get("stage") or "")
+        progress = (
+            _safe_int(wrapper.get("processed_messages"))
+            if wrapper.get("processed_messages") is not None
+            else _safe_int(wrapper.get("fetched_messages"))
+        )
+        phase = str(wrapper.get("phase") or "").lower()
+        has_active_flood_wait = _safe_float(wrapper.get("flood_wait_until")) > now
+        stage_changed = stage != last_stage
+        progress_changed = progress != last_progress
+        should_update_now = (
+            phase != "running"
+            or stage_changed
+            or has_active_flood_wait
+            or (progress_changed and now - last_edit_at >= update_interval_sec)
+        )
+
+        if should_update_now:
+            await _edit_status_message(status, _format_export_status(wrapper))
+            last_edit_at = now
+            last_stage = stage
+            last_progress = progress
+
+        if should_update_now or now - last_persist_at >= update_interval_sec:
+            await store.save("export:last", wrapper)
+            last_persist_at = now
+
     try:
         output = await run_export(
             topic_link=payload["topic_link"],
@@ -1286,20 +1475,54 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
             upload_topic_link=payload["upload_topic_link"],
             caption_file_names=bool(payload["caption_file_names"]),
             onwards=bool(payload["onwards"]),
+            status_callback=_save_export_status,
+        )
+    except Exception as exc:
+        failed_state = dict(latest_state)
+        failed_state.update({"phase": "failed", "stage": "failed", "payload": payload, "error": str(exc)})
+        await store.save("export:last", failed_state)
+        await _edit_status_message(status, _format_export_status(failed_state))
+        raise
+    else:
+        completed_state = dict(latest_state)
+        completed_state.update(
+            {
+                "phase": "completed",
+                "stage": "completed",
+                "payload": payload,
+                "output": str(output),
+            }
+        )
+        await store.save("export:last", completed_state)
+        await _edit_status_message(status, _format_export_status(completed_state))
+
+
+async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStore, bot: Client) -> None:
+    await store.save("index:last", {"phase": "queued", "payload": payload})
+    status = await message.reply_text("Index generation started.")
+    try:
+        count = await run_index(
+            topic_link=payload["topic_link"],
+            config_path=payload["config_path"],
+            batch_size=int(payload["batch_size"]),
+            batch_delay_sec=float(payload["batch_delay_sec"]),
+            onwards=bool(payload["onwards"]),
+            bot=bot,
+            header=str(payload.get("header") or "INDEX 👆"),
         )
     except Exception as exc:
         await store.save(
-            "export:last",
+            "index:last",
             {"phase": "failed", "payload": payload, "error": str(exc)},
         )
-        await status.edit_text(f"Export failed: {exc}")
+        await status.edit_text(f"Index failed: {exc}")
         raise
     else:
         await store.save(
-            "export:last",
-            {"phase": "completed", "payload": payload, "output": str(output)},
+            "index:last",
+            {"phase": "completed", "payload": payload, "count": count},
         )
-        await status.edit_text(f"Export complete: {output}")
+        await status.edit_text(f"Index complete: {count} text links sent into the topic.")
 
 
 async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
@@ -1564,6 +1787,14 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             _format_status_text(result),
             reply_markup=_clone_status_reply_markup("main"),
         )
+        try:
+            await message.reply_text(
+                _format_clone_completion_message(result),
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logging.getLogger("heroku_bot").debug("clone completion notification failed", exc_info=True)
     finally:
         ACTIVE_CLONE_TASK = None
         ACTIVE_CLONE_CANCEL_EVENT = None
@@ -1721,9 +1952,16 @@ async def run_bot() -> None:
                 if phase and phase != "running":
                     break
         finally:
-            ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
-            ACTIVE_STATUS_VIEWS.pop(key, None)
-            ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
+            current_task = asyncio.current_task()
+            if ACTIVE_STATUS_WATCH_TASKS.get(key) is current_task:
+                ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+                ACTIVE_STATUS_VIEWS.pop(key, None)
+                ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
+
+    def _cancel_status_watcher(key: tuple[int, int]) -> None:
+        task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _ensure_status_watcher(status_message, last_text: str, status_kind: str) -> None:
         key = (status_message.chat.id, status_message.id)
@@ -1792,9 +2030,7 @@ async def run_bot() -> None:
                 float(bot_settings["status_command_update_interval_sec"]),
                 MIN_WATCHED_STATUS_INTERVAL_SEC,
             )
-            previous_task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
-            if previous_task is not None:
-                previous_task.cancel()
+            _cancel_status_watcher(key)
             ACTIVE_STATUS_WATCH_TASKS[key] = asyncio.create_task(
                 _watch_status_message(sent.chat.id, sent.id, interval_sec, text, status_kind="status")
             )
@@ -1816,9 +2052,7 @@ async def run_bot() -> None:
         action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
 
         if action == "close":
-            task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
-            if task is not None:
-                task.cancel()
+            _cancel_status_watcher(key)
             ACTIVE_STATUS_VIEWS.pop(key, None)
             ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
             await callback_query.answer("Closed.")
@@ -1839,6 +2073,7 @@ async def run_bot() -> None:
             view = ACTIVE_STATUS_VIEWS.get(key, "main")
 
         await callback_query.answer()
+        _cancel_status_watcher(key)
         ACTIVE_STATUS_VIEWS[key] = view
         text, _ = await _load_status_view_text(store, view)
         ACTIVE_STATUS_LAST_TEXTS[key] = text
@@ -1869,9 +2104,7 @@ async def run_bot() -> None:
         action = str(getattr(callback_query, "data", "") or "").split(":", 1)[-1]
         key = (status_message.chat.id, status_message.id)
         if action == "close":
-            task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
-            if task is not None:
-                task.cancel()
+            _cancel_status_watcher(key)
             ACTIVE_STATUS_VIEWS.pop(key, None)
             ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
             await callback_query.answer("Closed.")
@@ -1892,6 +2125,7 @@ async def run_bot() -> None:
             view = ACTIVE_STATUS_VIEWS.get(key, "main")
 
         await callback_query.answer()
+        _cancel_status_watcher(key)
         ACTIVE_STATUS_VIEWS[key] = view
         text, _ = await _load_clone_status_view_text(store, view)
         ACTIVE_STATUS_LAST_TEXTS[key] = text
@@ -2402,6 +2636,60 @@ async def run_bot() -> None:
             }
 
         await _run_export_job(message, payload, store)
+
+    @bot.on_message(filters.private & filters.command("index", prefixes="/"))
+    async def index_handler(client, message) -> None:
+        if not await _authorized(message):
+            await message.reply_text("Not authorized.")
+            return
+
+        raw_text = message.text or ""
+        parts = raw_text.split(maxsplit=1)
+        command_text = parts[1].strip() if len(parts) > 1 else ""
+
+        bot_settings = await _load_bot_settings(store)
+        if not _configured_session_string(bot_settings):
+            await message.reply_text(
+                "No Telegram user session string is configured yet.\n\n"
+                "Set it from your deploy environment as <code>TG_SESSION_STRING</code>, "
+                "or generate one with <code>/login</code>.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+
+        if command_text.lower() in {"last", "resume"}:
+            stored = await _load_state(store, "index:last")
+            if stored is None:
+                await message.reply_text("No saved index profile found.")
+                return
+            payload = stored.get("payload") if isinstance(stored, dict) else None
+            if not isinstance(payload, dict):
+                await message.reply_text("Saved index profile is invalid.")
+                return
+        else:
+            normalized = _normalize_index_command(command_text)
+            try:
+                parsed = _build_index_parser().parse_args(shlex.split(normalized))
+            except SystemExit:
+                await message.reply_text(_bundle_help_text())
+                return
+            if not parsed.topic_link:
+                await message.reply_text(_bundle_help_text())
+                return
+            payload = {
+                "topic_link": parsed.topic_link,
+                "config_path": parsed.config,
+                "batch_size": parsed.batch_size
+                if "--batch-size" in normalized
+                else int(bot_settings["export_default_batch_size"]),
+                "batch_delay_sec": parsed.batch_delay_sec
+                if "--batch-delay-sec" in normalized
+                else float(bot_settings["export_default_batch_delay_sec"]),
+                "onwards": parsed.onwards,
+                "header": parsed.header,
+            }
+
+        await _run_index_job(message, payload, store, bot)
 
     @bot.on_message(filters.private & filters.command("clone", prefixes="/"))
     async def clone_handler(client, message) -> None:

@@ -3,6 +3,7 @@
 This folder is a single Telegram control bot that does both jobs:
 
 - `/export` using `run_export`
+- `/index` using `run_index`
 - `/clone` using `run_clone`
 
 It is designed for Heroku worker dynos and persists last command profiles in MongoDB Data API, so restarts do not lose essential bot state.
@@ -102,6 +103,8 @@ This gives you a local workflow very close to Heroku worker behavior.
 - `/status`
 - `/export --topic-link <link> [options]`
 - `/export last`
+- `/index --topic-link <link> [options]`
+- `/index last`
 - `/clone --source-link <link> --destination-link <link> [options]`
 - `/clone last`
 - `/log`
@@ -109,7 +112,17 @@ This gives you a local workflow very close to Heroku worker behavior.
 Shortcuts are supported:
 
 - `/export <link>`
+- `/index <topic_link>`
 - `/clone <source_link> <destination_link>`
+
+`/index` scans the linked forum topic for text messages only, turns each text message into a clickable link, and sends the generated index back into the same topic.
+
+Useful `/index` options:
+
+- `--onwards` starts at the linked message instead of scanning from the topic root.
+- `--batch-size N` controls how many message IDs are fetched per Telegram request.
+- `--batch-delay-sec S` waits between batches to be gentler with flood limits.
+- `--header "INDEX"` changes the index header text.
 
 ## Required Heroku Config Vars
 
