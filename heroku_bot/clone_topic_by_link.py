@@ -1005,6 +1005,7 @@ async def _clone_topic_messages(
                         "last_successful_source_message_id": source_message_id,
                         "last_successful_destination_message_id": destination_message_id,
                         "last_successful_message_link": last_successful_message_link,
+                        "resume_after_source_message_id": source_message_id,
                     }
                 )
                 await _save_clone_status(
@@ -1021,6 +1022,7 @@ async def _clone_topic_messages(
                     last_successful_source_message_id=source_message_id,
                     last_successful_destination_message_id=destination_message_id,
                     last_successful_message_link=last_successful_message_link,
+                    resume_after_source_message_id=source_message_id,
                     current_message_type=current_message_type,
                     current_file_name=current_file_name,
                 )
@@ -1048,6 +1050,7 @@ async def _clone_topic_messages(
                     skipped=skipped,
                     current_message_id=source_message_id,
                     last_processed_source_message_id=source_message_id,
+                    resume_after_source_message_id=source_message_id,
                     skipped_reason=str(exc),
                     current_message_type=_message_media_type(source_message),
                     current_file_name=_message_file_name(source_message),
