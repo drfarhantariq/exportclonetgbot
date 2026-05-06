@@ -421,7 +421,7 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
 
 MIN_CLONE_AUTO_EDIT_INTERVAL_SEC = 5.0
 MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC = 20.0
-MIN_WATCHED_STATUS_INTERVAL_SEC = 3.0
+MIN_WATCHED_STATUS_INTERVAL_SEC = 5.0
 
 BOT_SETTINGS_HELP = (
     "Settings commands:\n"
@@ -1258,6 +1258,10 @@ def _format_index_status(state: dict[str, Any]) -> str:
     text_entries = _safe_int(state.get("text_entries") if state.get("text_entries") is not None else state.get("count"))
     if text_entries:
         lines.append(f"Text links found: {_html(text_entries)}")
+
+    index_messages = _safe_int(state.get("index_messages"))
+    if index_messages:
+        lines.append(f"Index messages: {_html(index_messages)}")
 
     send_client = str(state.get("send_client") or "").strip()
     if send_client:
@@ -2185,7 +2189,6 @@ async def run_bot() -> None:
             view = ACTIVE_STATUS_VIEWS.get(key, "main")
 
         await callback_query.answer()
-        _cancel_status_watcher(key)
         ACTIVE_STATUS_VIEWS[key] = view
         text, _ = await _load_status_view_text(store, view)
         ACTIVE_STATUS_LAST_TEXTS[key] = text
@@ -2237,7 +2240,6 @@ async def run_bot() -> None:
             view = ACTIVE_STATUS_VIEWS.get(key, "main")
 
         await callback_query.answer()
-        _cancel_status_watcher(key)
         ACTIVE_STATUS_VIEWS[key] = view
         text, _ = await _load_clone_status_view_text(store, view)
         ACTIVE_STATUS_LAST_TEXTS[key] = text

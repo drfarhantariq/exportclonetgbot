@@ -466,20 +466,91 @@ def build_index_message(
     entries: dict[str, str] | list[tuple[str, str]],
     header: str = "INDEX 👆",
 ) -> str:
+    return "\n".join(build_index_message_chunks(entries, header=header)).rstrip() + "\n"
+
+
+def _escape_index_text(display_text: str, max_chars: int | None = None) -> str:
+    raw_text = str(display_text).strip()
+    text = html.escape(raw_text)
+    if max_chars is None or len(text) <= max_chars:
+        return text
+
+    suffix = "..."
+    if max_chars <= len(suffix):
+        return suffix[:max_chars]
+
+    low = 0
+    high = len(raw_text)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = html.escape(raw_text[:middle].rstrip())
+        if len(candidate) + len(suffix) <= max_chars:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best + suffix
+
+
+def _build_index_entry_line(display_text: str, link: str, max_chars: int | None = None) -> str:
+    url = html.escape(str(link).strip(), quote=True)
+    max_text_chars = None
+    if max_chars is not None:
+        fixed_chars = len(f'<a href="{url}"></a>')
+        max_text_chars = max(max_chars - fixed_chars, 0)
+    text = _escape_index_text(display_text, max_chars=max_text_chars)
+    return f'<a href="{url}">{text}</a>'
+
+
+def build_index_message_chunks(
+    entries: dict[str, str] | list[tuple[str, str]],
+    header: str = "INDEX 👆",
+    max_chars: int = TELEGRAM_MESSAGE_SAFE_CHARS,
+) -> list[str]:
     if isinstance(entries, dict):
         normalized_entries = list(entries.items())
     else:
         normalized_entries = list(entries)
 
-    lines = [f"<b>{html.escape(header.strip() or 'INDEX 👆')}</b>"]
+    header_line = f"<b>{html.escape(header.strip() or 'INDEX 👆')}</b>"
+    chunks: list[str] = []
+    lines = [header_line]
+
+    def current_message(next_lines: list[str] | None = None) -> str:
+        message_lines = lines if next_lines is None else next_lines
+        return "\n".join(message_lines).rstrip() + "\n"
+
+    def flush_current() -> None:
+        if len(lines) > 1:
+            chunks.append(current_message())
+
     for display_text, link in normalized_entries:
-        text = html.escape(str(display_text).strip())
         url = html.escape(str(link).strip(), quote=True)
+        text = str(display_text).strip()
         if not text or not url:
             continue
-        lines.append(f'<a href="{url}">{text}</a>')
 
-    return "\n".join(lines).rstrip() + "\n"
+        line = _build_index_entry_line(text, link)
+        candidate_lines = [*lines, line]
+        if len(current_message(candidate_lines)) > max_chars:
+            flush_current()
+            lines = [header_line]
+
+            max_line_chars = max_chars - len(header_line) - 2
+            line = _build_index_entry_line(text, link, max_chars=max_line_chars)
+            candidate_lines = [*lines, line]
+            if len(current_message(candidate_lines)) > max_chars:
+                raise RuntimeError(
+                    "Index contains a link that is too long to fit in one Telegram message."
+                )
+
+        lines.append(line)
+
+    flush_current()
+    if not chunks:
+        chunks.append(current_message())
+    return chunks
 
 
 def _build_index_message(
@@ -487,6 +558,13 @@ def _build_index_message(
     header: str = "INDEX 👆",
 ) -> str:
     return build_index_message(entries, header=header)
+
+
+def _build_index_message_chunks(
+    entries: dict[str, str] | list[tuple[str, str]],
+    header: str = "INDEX 👆",
+) -> list[str]:
+    return build_index_message_chunks(entries, header=header)
 
 
 def _build_topic_index_entries(messages, chat_id: int, topic_id: int) -> list[tuple[str, str]]:
@@ -996,7 +1074,7 @@ async def run_index(
                 "text_entries": len(entries),
             },
         )
-        index_message = _build_index_message(entries, header=header)
+        index_messages = _build_index_message_chunks(entries, header=header)
         await _notify_index_status(
             status_callback,
             {
@@ -1006,17 +1084,21 @@ async def run_index(
                 "fetched_messages": len(messages),
                 "processed_messages": len(messages),
                 "text_entries": len(entries),
+                "index_messages": len(index_messages),
                 "send_client": "user_session",
             },
         )
+        sent_index_messages = 0
         try:
             await telegram.ensure_peer_cached(parsed.chat_id)
-            await _send_topic_index_message(
-                client=telegram.app,
-                chat_id=parsed.chat_id,
-                topic_id=parsed.topic_id,
-                text=index_message,
-            )
+            for index_message in index_messages:
+                await _send_topic_index_message(
+                    client=telegram.app,
+                    chat_id=parsed.chat_id,
+                    topic_id=parsed.topic_id,
+                    text=index_message,
+                )
+                sent_index_messages += 1
         except Exception as user_send_error:
             logging.getLogger("topic_index").warning(
                 "user session could not send index, falling back to bot",
@@ -1037,15 +1119,17 @@ async def run_index(
                         "fetched_messages": len(messages),
                         "processed_messages": len(messages),
                         "text_entries": len(entries),
+                        "index_messages": len(index_messages),
                         "send_client": "bot",
                     },
                 )
-                await _send_topic_index_message(
-                    client=bot,
-                    chat_id=parsed.chat_id,
-                    topic_id=parsed.topic_id,
-                    text=index_message,
-                )
+                for index_message in index_messages[sent_index_messages:]:
+                    await _send_topic_index_message(
+                        client=bot,
+                        chat_id=parsed.chat_id,
+                        topic_id=parsed.topic_id,
+                        text=index_message,
+                    )
             except Exception as bot_send_error:
                 raise RuntimeError(
                     "Index was generated, but neither the user session nor the bot could send "
@@ -1060,6 +1144,7 @@ async def run_index(
                 "fetched_messages": len(messages),
                 "processed_messages": len(messages),
                 "text_entries": len(entries),
+                "index_messages": len(index_messages),
             },
         )
         return len(entries)
