@@ -325,7 +325,7 @@ def _bundle_help_text() -> str:
         "/settings reset <key>|all - Reset one or all settings\n"
         "/login - Generate and save a Telegram user session string\n"
         "/log - Upload the current bot log file\n"
-        "/cancel - Cancel the active clone job\n"
+        "/cancel [clone|export|index] - Cancel a running job\n"
         "/restart - Restart the bot process\n\n"
         "Clone:\n"
         "/clone --source-link <link> --destination-link <link> [--config <path>] [--start-id N] "
@@ -385,6 +385,8 @@ def _normalize_clone_command(command_text: str) -> str:
 ACTIVE_CLONE_TASK: asyncio.Task | None = None
 ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
 ACTIVE_CLONE_LATEST_STATE: dict[str, Any] | None = None
+ACTIVE_EXPORT_TASK: asyncio.Task | None = None
+ACTIVE_INDEX_TASK: asyncio.Task | None = None
 ACTIVE_STATUS_WATCH_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
 ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
@@ -422,6 +424,7 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
 MIN_CLONE_AUTO_EDIT_INTERVAL_SEC = 5.0
 MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC = 20.0
 MIN_WATCHED_STATUS_INTERVAL_SEC = 5.0
+MAX_STATUS_FLOOD_SLEEP_SEC = 30
 
 BOT_SETTINGS_HELP = (
     "Settings commands:\n"
@@ -910,6 +913,9 @@ async def _edit_status_message(
     reply_markup: InlineKeyboardMarkup | None = None,
     sleep_on_flood: bool = True,
 ) -> bool:
+    if status is None:
+        return False
+
     try:
         await status.edit_text(
             text,
@@ -920,7 +926,14 @@ async def _edit_status_message(
         return True
     except FloodWait as exc:
         wait_seconds = int(getattr(exc, "value", 0) or 0)
-        if not sleep_on_flood:
+        if not sleep_on_flood or wait_seconds > MAX_STATUS_FLOOD_SLEEP_SEC:
+            logging.getLogger("heroku_bot").warning(
+                "skipping status edit because Telegram requested a flood wait",
+                extra={
+                    "event": "status_edit_flood_wait_skipped",
+                    "wait_seconds": wait_seconds,
+                },
+            )
             return False
         await asyncio.sleep(wait_seconds + 1)
         try:
@@ -942,6 +955,47 @@ async def _edit_status_message(
     except Exception:
         logging.getLogger("heroku_bot").debug("status edit failed", exc_info=True)
         return False
+
+
+async def _reply_status_message(
+    message: Any,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Any | None:
+    try:
+        return await message.reply_text(
+            text,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+    except FloodWait as exc:
+        wait_seconds = int(getattr(exc, "value", 0) or 0)
+        if wait_seconds <= MAX_STATUS_FLOOD_SLEEP_SEC:
+            await asyncio.sleep(wait_seconds + 1)
+            try:
+                return await message.reply_text(
+                    text,
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup,
+                )
+            except Exception:
+                logging.getLogger("heroku_bot").debug("status reply retry failed", exc_info=True)
+                return None
+
+        logging.getLogger("heroku_bot").warning(
+            "skipping status reply because Telegram requested a flood wait",
+            extra={
+                "event": "status_reply_flood_wait_skipped",
+                "wait_seconds": wait_seconds,
+            },
+        )
+        return None
+    except Exception:
+        logging.getLogger("heroku_bot").debug("status reply failed", exc_info=True)
+        return None
 
 
 def _status_task_title(state: dict[str, Any]) -> str:
@@ -1359,6 +1413,14 @@ def _clone_status_reply_markup(view: str = "main") -> InlineKeyboardMarkup:
     )
 
 
+def _job_status_reply_markup(kind: str, phase: str) -> InlineKeyboardMarkup | None:
+    if phase.lower() not in {"queued", "running"}:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Cancel", callback_data=f"job_cancel:{kind}")]]
+    )
+
+
 def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
     phase = str((clone_state or {}).get("phase", "")).lower()
     transfer_stage = str((clone_state or {}).get("transfer_stage") or "").lower()
@@ -1449,6 +1511,9 @@ async def _load_clone_status_view_text(store: MongoStateStore, view: str) -> tup
 
 
 async def _run_export_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
+    global ACTIVE_EXPORT_TASK
+
+    ACTIVE_EXPORT_TASK = asyncio.current_task()
     bot_settings = await _load_bot_settings(store)
     update_interval_sec = max(
         float(bot_settings["status_command_update_interval_sec"]),
@@ -1467,10 +1532,10 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
     last_progress = -1
 
     await store.save("export:last", latest_state)
-    status = await message.reply_text(
+    status = await _reply_status_message(
+        message,
         _format_export_status(latest_state),
-        parse_mode=enums.ParseMode.HTML,
-        disable_web_page_preview=True,
+        reply_markup=_job_status_reply_markup("export", "queued"),
     )
 
     async def _save_export_status(update: dict[str, Any]) -> None:
@@ -1502,7 +1567,11 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
         )
 
         if should_update_now:
-            await _edit_status_message(status, _format_export_status(wrapper))
+            await _edit_status_message(
+                status,
+                _format_export_status(wrapper),
+                reply_markup=_job_status_reply_markup("export", phase),
+            )
             last_edit_at = now
             last_stage = stage
             last_progress = progress
@@ -1523,11 +1592,32 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
             onwards=bool(payload["onwards"]),
             status_callback=_save_export_status,
         )
+    except asyncio.CancelledError:
+        cancelled_state = dict(latest_state)
+        cancelled_state.update(
+            {
+                "phase": "cancelled",
+                "stage": "cancelled",
+                "payload": payload,
+                "error": "Cancelled by user",
+            }
+        )
+        await store.save("export:last", cancelled_state)
+        await _edit_status_message(
+            status,
+            _format_export_status(cancelled_state),
+            reply_markup=_job_status_reply_markup("export", "cancelled"),
+        )
+        return
     except Exception as exc:
         failed_state = dict(latest_state)
         failed_state.update({"phase": "failed", "stage": "failed", "payload": payload, "error": str(exc)})
         await store.save("export:last", failed_state)
-        await _edit_status_message(status, _format_export_status(failed_state))
+        await _edit_status_message(
+            status,
+            _format_export_status(failed_state),
+            reply_markup=_job_status_reply_markup("export", "failed"),
+        )
         raise
     else:
         completed_state = dict(latest_state)
@@ -1540,10 +1630,20 @@ async def _run_export_job(message, payload: dict[str, Any], store: MongoStateSto
             }
         )
         await store.save("export:last", completed_state)
-        await _edit_status_message(status, _format_export_status(completed_state))
+        await _edit_status_message(
+            status,
+            _format_export_status(completed_state),
+            reply_markup=_job_status_reply_markup("export", "completed"),
+        )
+    finally:
+        if ACTIVE_EXPORT_TASK is asyncio.current_task():
+            ACTIVE_EXPORT_TASK = None
 
 
 async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStore, bot: Client) -> None:
+    global ACTIVE_INDEX_TASK
+
+    ACTIVE_INDEX_TASK = asyncio.current_task()
     bot_settings = await _load_bot_settings(store)
     update_interval_sec = max(
         float(bot_settings["status_command_update_interval_sec"]),
@@ -1563,10 +1663,10 @@ async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStor
     last_text_entries = -1
 
     await store.save("index:last", latest_state)
-    status = await message.reply_text(
+    status = await _reply_status_message(
+        message,
         _format_index_status(latest_state),
-        parse_mode=enums.ParseMode.HTML,
-        disable_web_page_preview=True,
+        reply_markup=_job_status_reply_markup("index", "queued"),
     )
 
     async def _save_index_status(update: dict[str, Any]) -> None:
@@ -1599,7 +1699,11 @@ async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStor
         )
 
         if should_update_now:
-            await _edit_status_message(status, _format_index_status(wrapper))
+            await _edit_status_message(
+                status,
+                _format_index_status(wrapper),
+                reply_markup=_job_status_reply_markup("index", phase),
+            )
             last_edit_at = now
             last_stage = stage
             last_progress = progress
@@ -1620,11 +1724,32 @@ async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStor
             header=str(payload.get("header") or "INDEX 👆"),
             status_callback=_save_index_status,
         )
+    except asyncio.CancelledError:
+        cancelled_state = dict(latest_state)
+        cancelled_state.update(
+            {
+                "phase": "cancelled",
+                "stage": "cancelled",
+                "payload": payload,
+                "error": "Cancelled by user",
+            }
+        )
+        await store.save("index:last", cancelled_state)
+        await _edit_status_message(
+            status,
+            _format_index_status(cancelled_state),
+            reply_markup=_job_status_reply_markup("index", "cancelled"),
+        )
+        return
     except Exception as exc:
         failed_state = dict(latest_state)
         failed_state.update({"phase": "failed", "stage": "failed", "payload": payload, "error": str(exc)})
         await store.save("index:last", failed_state)
-        await _edit_status_message(status, _format_index_status(failed_state))
+        await _edit_status_message(
+            status,
+            _format_index_status(failed_state),
+            reply_markup=_job_status_reply_markup("index", "failed"),
+        )
         raise
     else:
         completed_state = dict(latest_state)
@@ -1638,7 +1763,14 @@ async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStor
             }
         )
         await store.save("index:last", completed_state)
-        await _edit_status_message(status, _format_index_status(completed_state))
+        await _edit_status_message(
+            status,
+            _format_index_status(completed_state),
+            reply_markup=_job_status_reply_markup("index", "completed"),
+        )
+    finally:
+        if ACTIVE_INDEX_TASK is asyncio.current_task():
+            ACTIVE_INDEX_TASK = None
 
 
 async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
@@ -1774,10 +1906,9 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     last_persisted_success = 0
     last_persisted_failed = 0
     last_persisted_skipped = 0
-    status = await message.reply_text(
+    status = await _reply_status_message(
+        message,
         _format_status_text(queued_state),
-        parse_mode=enums.ParseMode.HTML,
-        disable_web_page_preview=True,
         reply_markup=_clone_status_reply_markup("main"),
     )
     try:
@@ -2602,6 +2733,24 @@ async def run_bot() -> None:
 
         await callback_query.answer()
 
+    @bot.on_callback_query(filters.regex(r"^job_cancel:(export|index)$"))
+    async def job_cancel_callback_handler(client, callback_query) -> None:
+        user = getattr(callback_query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in admin_ids:
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        data = str(getattr(callback_query, "data", "") or "")
+        kind = data.split(":", 1)[-1]
+        task = ACTIVE_EXPORT_TASK if kind == "export" else ACTIVE_INDEX_TASK
+        if task is None or task.done():
+            await callback_query.answer(f"No active {kind} task.", show_alert=True)
+            return
+
+        task.cancel()
+        await callback_query.answer(f"{kind.title()} cancellation requested.")
+
     @bot.on_message(filters.private & filters.command("log", prefixes="/"))
     async def log_handler(client, message) -> None:
         if not await _authorized(message):
@@ -2622,8 +2771,49 @@ async def run_bot() -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
+
+        parts = (message.text or "").split(maxsplit=1)
+        target = parts[1].strip().lower() if len(parts) > 1 else ""
+        if target and target not in {"clone", "export", "index"}:
+            await message.reply_text("Use /cancel clone, /cancel export, or /cancel index.")
+            return
+
+        if target == "export":
+            if ACTIVE_EXPORT_TASK is None or ACTIVE_EXPORT_TASK.done():
+                await message.reply_text("No active export task to cancel.")
+                return
+            ACTIVE_EXPORT_TASK.cancel()
+            await message.reply_text("Export cancellation requested.")
+            return
+
+        if target == "index":
+            if ACTIVE_INDEX_TASK is None or ACTIVE_INDEX_TASK.done():
+                await message.reply_text("No active index task to cancel.")
+                return
+            ACTIVE_INDEX_TASK.cancel()
+            await message.reply_text("Index cancellation requested.")
+            return
+
+        if target == "clone":
+            if ACTIVE_CLONE_CANCEL_EVENT is None or ACTIVE_CLONE_CANCEL_EVENT.is_set():
+                await message.reply_text("No active clone task to cancel.")
+                return
+            ACTIVE_CLONE_CANCEL_EVENT.set()
+            if ACTIVE_CLONE_TASK is not None and not ACTIVE_CLONE_TASK.done():
+                ACTIVE_CLONE_TASK.cancel()
+            await message.reply_text("Clone cancellation requested.")
+            return
+
+        if ACTIVE_EXPORT_TASK is not None and not ACTIVE_EXPORT_TASK.done():
+            ACTIVE_EXPORT_TASK.cancel()
+            await message.reply_text("Export cancellation requested.")
+            return
+        if ACTIVE_INDEX_TASK is not None and not ACTIVE_INDEX_TASK.done():
+            ACTIVE_INDEX_TASK.cancel()
+            await message.reply_text("Index cancellation requested.")
+            return
         if ACTIVE_CLONE_CANCEL_EVENT is None or ACTIVE_CLONE_CANCEL_EVENT.is_set():
-            await message.reply_text("No active clone task to cancel.")
+            await message.reply_text("No active task to cancel.")
             return
         ACTIVE_CLONE_CANCEL_EVENT.set()
         if ACTIVE_CLONE_TASK is not None and not ACTIVE_CLONE_TASK.done():
