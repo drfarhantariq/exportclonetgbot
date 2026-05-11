@@ -320,7 +320,7 @@ def _bundle_help_text() -> str:
         "/start - Show the command guide\n"
         "/help - Show all available commands and examples\n"
         "/status - Show the latest clone/export/index status\n"
-        "/settings - View bot runtime settings\n"
+        "/settings - Open settings (Export / Index / Clone / Other)\n"
         "/settings set <key> <value> - Change a runtime setting\n"
         "/settings reset <key>|all - Reset one or all settings\n"
         "/login - Generate and save a Telegram user session string\n"
@@ -419,7 +419,97 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "clone_auto_resume_enabled": True,
     "export_default_batch_size": 20,
     "export_default_batch_delay_sec": 2.0,
+    "export_default_caption_file_names": True,
+    "export_default_onwards": False,
+    "index_default_onwards": False,
 }
+
+SETTINGS_CATEGORY_ORDER = ("export", "index", "clone", "other")
+
+SETTINGS_CATEGORY_TITLES = {
+    "export": "Export",
+    "index": "Index",
+    "clone": "Clone",
+    "other": "Other",
+}
+
+SETTINGS_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "export": (
+        "export_default_batch_size",
+        "export_default_batch_delay_sec",
+        "export_default_caption_file_names",
+        "export_default_onwards",
+    ),
+    "index": ("index_default_onwards",),
+    "clone": (
+        "clone_status_update_interval_sec",
+        "clone_status_success_update_interval_sec",
+        "clone_status_keepalive_interval_sec",
+        "clone_default_delay_sec",
+        "clone_default_batch_size",
+        "clone_continue_on_error_default",
+        "clone_hide_sender_name_default",
+        "clone_auto_resume_enabled",
+    ),
+    "other": (
+        "tg_api_id",
+        "tg_api_hash",
+        "mongodb_database",
+        "owner_id",
+        "tg_session_string",
+        "status_command_update_interval_sec",
+    ),
+}
+
+BOT_TOGGLE_SETTING_KEYS: frozenset[str] = frozenset(
+    {
+        "clone_continue_on_error_default",
+        "clone_hide_sender_name_default",
+        "clone_auto_resume_enabled",
+        "export_default_caption_file_names",
+        "export_default_onwards",
+        "index_default_onwards",
+    }
+)
+
+SETTINGS_KEY_LABELS: dict[str, str] = {
+    "export_default_batch_size": "Batch size",
+    "export_default_batch_delay_sec": "Batch delay (sec)",
+    "export_default_caption_file_names": "Caption → filenames",
+    "export_default_onwards": "Onwards",
+    "index_default_onwards": "Onwards",
+    "clone_status_update_interval_sec": "Status interval (sec)",
+    "clone_status_success_update_interval_sec": "Success status interval",
+    "clone_status_keepalive_interval_sec": "Keepalive interval (sec)",
+    "clone_default_delay_sec": "Default delay (sec)",
+    "clone_default_batch_size": "Default batch size",
+    "clone_continue_on_error_default": "Continue on error",
+    "clone_hide_sender_name_default": "Hide sender name",
+    "clone_auto_resume_enabled": "Auto-resume clone",
+    "tg_api_id": "API ID",
+    "tg_api_hash": "API hash",
+    "mongodb_database": "MongoDB database",
+    "owner_id": "Owner user IDs",
+    "tg_session_string": "Session string",
+    "status_command_update_interval_sec": "/status refresh (sec)",
+}
+
+
+def _settings_key_label(key: str) -> str:
+    return SETTINGS_KEY_LABELS.get(key, key)
+
+
+def _assert_settings_categories_complete() -> None:
+    ordered: list[str] = []
+    for category in SETTINGS_CATEGORY_ORDER:
+        ordered.extend(SETTINGS_CATEGORIES[category])
+    if set(ordered) != set(BOT_SETTINGS_DEFAULTS):
+        missing = set(BOT_SETTINGS_DEFAULTS) - set(ordered)
+        extra = set(ordered) - set(BOT_SETTINGS_DEFAULTS)
+        raise RuntimeError(f"SETTINGS_CATEGORIES out of sync: missing={missing!r} extra={extra!r}")
+
+
+_assert_settings_categories_complete()
 
 MIN_CLONE_AUTO_EDIT_INTERVAL_SEC = 5.0
 MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC = 20.0
@@ -445,6 +535,9 @@ BOT_SETTINGS_HELP = (
     "- clone_auto_resume_enabled\n"
     "- export_default_batch_size\n"
     "- export_default_batch_delay_sec\n"
+    "- export_default_caption_file_names\n"
+    "- export_default_onwards\n"
+    "- index_default_onwards\n"
     "- tg_api_id\n"
     "- tg_api_hash\n"
     "- mongodb_database\n"
@@ -488,11 +581,7 @@ def _normalize_setting_value(key: str, value: Any) -> Any:
             raise ValueError(f"{key} must be > 0")
         return number
 
-    if key in {
-        "clone_continue_on_error_default",
-        "clone_hide_sender_name_default",
-        "clone_auto_resume_enabled",
-    }:
+    if key in BOT_TOGGLE_SETTING_KEYS:
         if isinstance(value, bool):
             return value
         return _coerce_bool(str(value))
@@ -740,68 +829,124 @@ def _display_name(user) -> str:
     return full_name or username or "Admin"
 
 
-def _settings_page_count() -> int:
-    return max((len(BOT_SETTINGS_DEFAULTS) + SETTINGS_PAGE_SIZE - 1) // SETTINGS_PAGE_SIZE, 1)
+def _category_page_count(category: str) -> int:
+    keys = SETTINGS_CATEGORIES.get(category, ())
+    return max((len(keys) + SETTINGS_PAGE_SIZE - 1) // SETTINGS_PAGE_SIZE, 1)
 
 
-def _settings_page_keys(page: int) -> list[str]:
-    keys = sorted(BOT_SETTINGS_DEFAULTS)
-    bounded_page = min(max(page, 0), _settings_page_count() - 1)
+def _category_page_keys(category: str, page: int) -> list[str]:
+    keys = list(SETTINGS_CATEGORIES.get(category, ()))
+    if not keys:
+        return []
+    page_count = _category_page_count(category)
+    bounded_page = min(max(page, 0), page_count - 1)
     start = bounded_page * SETTINGS_PAGE_SIZE
     return keys[start : start + SETTINGS_PAGE_SIZE]
 
 
-def _format_settings_panel(settings: dict[str, Any], page: int, state: str, user) -> str:
-    page = min(max(page, 0), _settings_page_count() - 1)
-    state = state if state in {"view", "edit"} else "view"
+def _format_settings_root(user) -> str:
     return (
         f"<b>{_html(_display_name(user))}</b>\n"
-        "/settings\n\n"
-        f"Config Variables | Page: {page} | State: {state}"
+        "<b>Settings</b>\n\n"
+        "Choose <b>Export</b>, <b>Index</b>, <b>Clone</b>, or <b>Other</b> to open defaults for that feature."
     )
 
 
-def _settings_markup(page: int = 0, state: str = "view") -> InlineKeyboardMarkup:
-    page = min(max(page, 0), _settings_page_count() - 1)
-    state = state if state in {"view", "edit"} else "view"
-    rows: list[list[InlineKeyboardButton]] = []
-    key_buttons = [
-        InlineKeyboardButton(key, callback_data=f"settings:key:{page}:{state}:{key}")
-        for key in _settings_page_keys(page)
-    ]
-    rows.extend(key_buttons[index : index + 2] for index in range(0, len(key_buttons), 2))
-
-    toggle_label = "View" if state == "edit" else "Edit"
-    toggle_state = "view" if state == "edit" else "edit"
-    rows.append(
+def _settings_root_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(toggle_label, callback_data=f"settings:page:{page}:{toggle_state}"),
-            InlineKeyboardButton("Back", callback_data=f"settings:page:{page}:view"),
+            [
+                InlineKeyboardButton("Export", callback_data="settings:cat:export:0"),
+                InlineKeyboardButton("Index", callback_data="settings:cat:index:0"),
+            ],
+            [
+                InlineKeyboardButton("Clone", callback_data="settings:cat:clone:0"),
+                InlineKeyboardButton("Other", callback_data="settings:cat:other:0"),
+            ],
+            [InlineKeyboardButton("Close", callback_data="settings:close")],
         ]
     )
-    rows.append([InlineKeyboardButton("Close", callback_data="settings:close")])
-
-    page_buttons = [
-        InlineKeyboardButton(str(index), callback_data=f"settings:page:{index}:{state}")
-        for index in range(_settings_page_count())
-    ]
-    rows.extend(page_buttons[index : index + 8] for index in range(0, len(page_buttons), 8))
-    return InlineKeyboardMarkup(rows)
 
 
-def _format_setting_detail(settings: dict[str, Any], key: str, page: int, state: str, user) -> str:
-    current = settings.get(key, _setting_default(key))
-    default = _setting_default(key)
+def _format_category_panel(settings: dict[str, Any], category: str, page: int, user) -> str:
+    if category not in SETTINGS_CATEGORIES:
+        category = "export"
+    title = SETTINGS_CATEGORY_TITLES.get(category, category.title())
+    page_count = _category_page_count(category)
+    page = min(max(page, 0), page_count - 1)
     lines = [
         f"<b>{_html(_display_name(user))}</b>",
         "/settings",
         "",
-        f"Config Variable | Page: {page} | State: {state}",
+        f"<b>{_html(title)}</b> defaults",
+        f"Page {_html(page + 1)} of {_html(page_count)}",
         "",
-        f"<b>{_html(key)}</b>",
+        "Tap a button below. On/off options can be toggled on the next screen.",
+    ]
+    if category == "index":
+        lines.append("")
+        lines.append("<i>Batch size and delay still follow Export defaults unless you pass flags in /index.</i>")
+    return "\n".join(lines)
+
+
+def _category_settings_markup(category: str, page: int) -> InlineKeyboardMarkup:
+    if category not in SETTINGS_CATEGORIES:
+        category = "export"
+    page_count = _category_page_count(category)
+    page = min(max(page, 0), page_count - 1)
+    rows: list[list[InlineKeyboardButton]] = []
+    keys = _category_page_keys(category, page)
+    key_buttons = [
+        InlineKeyboardButton(
+            _settings_key_label(setting_key),
+            callback_data=f"settings:item:{category}:{page}:view:{setting_key}",
+        )
+        for setting_key in keys
+    ]
+    rows.extend(key_buttons[index : index + 2] for index in range(0, len(key_buttons), 2))
+    rows.append(
+        [
+            InlineKeyboardButton("Home", callback_data="settings:home"),
+            InlineKeyboardButton("Close", callback_data="settings:close"),
+        ]
+    )
+    if page_count > 1:
+        page_buttons = [
+            InlineKeyboardButton(
+                str(index),
+                callback_data=f"settings:cat:{category}:{index}",
+            )
+            for index in range(page_count)
+        ]
+        rows.extend(page_buttons[index : index + 8] for index in range(0, len(page_buttons), 8))
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_setting_detail(
+    settings: dict[str, Any],
+    key: str,
+    category: str,
+    page: int,
+    state: str,
+    user,
+) -> str:
+    current = settings.get(key, _setting_default(key))
+    default = _setting_default(key)
+    state = state if state in {"view", "edit"} else "view"
+    cat_title = SETTINGS_CATEGORY_TITLES.get(category, category)
+    label = _settings_key_label(key)
+    lines = [
+        f"<b>{_html(_display_name(user))}</b>",
+        "/settings",
+        "",
+        f"<b>{_html(cat_title)}</b> · {_html(label)}",
+        f"<code>{_html(key)}</code>",
+        "",
         f"┠ <b>Current</b> → <code>{_html(_masked_setting_value(key, current))}</code>",
         f"┠ <b>Default</b> → <code>{_html(_masked_setting_value(key, default))}</code>",
     ]
+    if key in BOT_TOGGLE_SETTING_KEYS:
+        lines.append("┠ Use the toggle button below for on/off.")
     if state == "edit":
         lines.extend(
             [
@@ -811,24 +956,52 @@ def _format_setting_detail(settings: dict[str, Any], key: str, page: int, state:
             ]
         )
     else:
-        lines.append("┖ Tap Edit for the set command.")
+        lines.append("┖ Tap <b>Edit</b> to show the set command.")
     return "\n".join(lines)
 
 
-def _setting_detail_markup(key: str, page: int, state: str = "view") -> InlineKeyboardMarkup:
+def _setting_detail_markup(
+    key: str,
+    category: str,
+    page: int,
+    state: str,
+    settings: dict[str, Any],
+) -> InlineKeyboardMarkup:
     state = state if state in {"view", "edit"} else "view"
     toggle_label = "View" if state == "edit" else "Edit"
     toggle_state = "view" if state == "edit" else "edit"
-    return InlineKeyboardMarkup(
-        [
+    rows: list[list[InlineKeyboardButton]] = []
+    if key in BOT_TOGGLE_SETTING_KEYS:
+        current = bool(settings.get(key, _setting_default(key)))
+        flip_label = "Turn off" if current else "Turn on"
+        rows.append(
             [
-                InlineKeyboardButton(toggle_label, callback_data=f"settings:key:{page}:{toggle_state}:{key}"),
-                InlineKeyboardButton("Reset", callback_data=f"settings:reset:{page}:{state}:{key}"),
-            ],
-            [InlineKeyboardButton("Back", callback_data=f"settings:page:{page}:{state}")],
-            [InlineKeyboardButton("Close", callback_data="settings:close")],
+                InlineKeyboardButton(
+                    flip_label,
+                    callback_data=f"settings:toggle:{category}:{page}:{state}:{key}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                toggle_label,
+                callback_data=f"settings:item:{category}:{page}:{toggle_state}:{key}",
+            ),
+            InlineKeyboardButton(
+                "Reset",
+                callback_data=f"settings:reset:{category}:{page}:{state}:{key}",
+            ),
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton("Back", callback_data=f"settings:cat:{category}:{page}"),
+            InlineKeyboardButton("Home", callback_data="settings:home"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("Close", callback_data="settings:close")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _html(value: Any) -> str:
@@ -2588,9 +2761,9 @@ async def run_bot() -> None:
 
         if not tokens or tokens[0].lower() in {"show", "list"}:
             await message.reply_text(
-                _format_settings_panel(current_settings, 0, "view", getattr(message, "from_user", None)),
+                _format_settings_root(getattr(message, "from_user", None)),
                 parse_mode=enums.ParseMode.HTML,
-                reply_markup=_settings_markup(0, "view"),
+                reply_markup=_settings_root_markup(),
             )
             return
 
@@ -2657,7 +2830,7 @@ async def run_bot() -> None:
             return
 
         data = str(getattr(callback_query, "data", "") or "")
-        parts = data.split(":", 4)
+        parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
 
         if action == "close":
@@ -2673,43 +2846,96 @@ async def run_bot() -> None:
 
         current_settings = await _load_bot_settings(store)
 
-        if action == "page" and len(parts) >= 4:
-            page = _safe_int(parts[2])
-            state = parts[3] if parts[3] in {"view", "edit"} else "view"
+        if action == "home":
             await callback_query.answer()
             try:
                 await settings_message.edit_text(
-                    _format_settings_panel(current_settings, page, state, user),
+                    _format_settings_root(user),
                     parse_mode=enums.ParseMode.HTML,
-                    reply_markup=_settings_markup(page, state),
+                    reply_markup=_settings_root_markup(),
                 )
             except Exception:
                 pass
             return
 
-        if action == "key" and len(parts) >= 5:
-            page = _safe_int(parts[2])
-            state = parts[3] if parts[3] in {"view", "edit"} else "view"
-            key = parts[4]
-            if key not in BOT_SETTINGS_DEFAULTS:
-                await callback_query.answer("Unknown setting.", show_alert=True)
+        if action == "cat" and len(parts) >= 4:
+            category = parts[2]
+            page = _safe_int(parts[3])
+            if category not in SETTINGS_CATEGORIES:
+                await callback_query.answer("Unknown category.", show_alert=True)
                 return
             await callback_query.answer()
             try:
                 await settings_message.edit_text(
-                    _format_setting_detail(current_settings, key, page, state, user),
+                    _format_category_panel(current_settings, category, page, user),
                     parse_mode=enums.ParseMode.HTML,
-                    reply_markup=_setting_detail_markup(key, page, state),
+                    reply_markup=_category_settings_markup(category, page),
                 )
             except Exception:
                 pass
             return
 
-        if action == "reset" and len(parts) >= 5:
-            page = _safe_int(parts[2])
-            state = parts[3] if parts[3] in {"view", "edit"} else "view"
-            key = parts[4]
+        if action == "item" and len(parts) >= 6:
+            category = parts[2]
+            page = _safe_int(parts[3])
+            state = parts[4] if parts[4] in {"view", "edit"} else "view"
+            key = ":".join(parts[5:])
+            if category not in SETTINGS_CATEGORIES or key not in BOT_SETTINGS_DEFAULTS:
+                await callback_query.answer("Unknown setting.", show_alert=True)
+                return
+            if key not in SETTINGS_CATEGORIES[category]:
+                await callback_query.answer("Wrong category for this key.", show_alert=True)
+                return
+            await callback_query.answer()
+            try:
+                await settings_message.edit_text(
+                    _format_setting_detail(current_settings, key, category, page, state, user),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=_setting_detail_markup(key, category, page, state, current_settings),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "toggle" and len(parts) >= 6:
+            category = parts[2]
+            page = _safe_int(parts[3])
+            state = parts[4] if parts[4] in {"view", "edit"} else "view"
+            key = ":".join(parts[5:])
+            if key not in BOT_TOGGLE_SETTING_KEYS or key not in BOT_SETTINGS_DEFAULTS:
+                await callback_query.answer("Not a toggle setting.", show_alert=True)
+                return
+            if category not in SETTINGS_CATEGORIES or key not in SETTINGS_CATEGORIES[category]:
+                await callback_query.answer("Unknown setting.", show_alert=True)
+                return
+            previous = bool(current_settings.get(key, _setting_default(key)))
+            current_settings[key] = not previous
+            try:
+                await _save_bot_settings(store, current_settings)
+            except Exception as exc:
+                current_settings[key] = previous
+                await callback_query.answer(f"Could not save: {exc}", show_alert=True)
+                return
+            await callback_query.answer("Updated.")
+            try:
+                await settings_message.edit_text(
+                    _format_setting_detail(current_settings, key, category, page, state, user),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=_setting_detail_markup(key, category, page, state, current_settings),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "reset" and len(parts) >= 6:
+            category = parts[2]
+            page = _safe_int(parts[3])
+            state = parts[4] if parts[4] in {"view", "edit"} else "view"
+            key = ":".join(parts[5:])
             if key not in BOT_SETTINGS_DEFAULTS:
+                await callback_query.answer("Unknown setting.", show_alert=True)
+                return
+            if category not in SETTINGS_CATEGORIES or key not in SETTINGS_CATEGORIES[category]:
                 await callback_query.answer("Unknown setting.", show_alert=True)
                 return
             current_settings[key] = _setting_default(key)
@@ -2723,9 +2949,9 @@ async def run_bot() -> None:
             await callback_query.answer("Reset.")
             try:
                 await settings_message.edit_text(
-                    _format_setting_detail(current_settings, key, page, state, user),
+                    _format_setting_detail(current_settings, key, category, page, state, user),
                     parse_mode=enums.ParseMode.HTML,
-                    reply_markup=_setting_detail_markup(key, page, state),
+                    reply_markup=_setting_detail_markup(key, category, page, state, current_settings),
                 )
             except Exception:
                 pass
@@ -2917,6 +3143,12 @@ async def run_bot() -> None:
             if not isinstance(payload, dict):
                 await message.reply_text("Saved export profile is invalid.")
                 return
+            payload = dict(payload)
+            payload.setdefault(
+                "caption_file_names",
+                bool(bot_settings["export_default_caption_file_names"]),
+            )
+            payload.setdefault("onwards", bool(bot_settings["export_default_onwards"]))
         else:
             normalized = _normalize_export_command(command_text)
             try:
@@ -2935,8 +3167,12 @@ async def run_bot() -> None:
                 if "--batch-delay-sec" in normalized
                 else float(bot_settings["export_default_batch_delay_sec"]),
                 "upload_topic_link": parsed.upload_topic_link,
-                "caption_file_names": parsed.caption_file_names,
-                "onwards": parsed.onwards,
+                "caption_file_names": parsed.caption_file_names
+                if "--caption-file-names" in normalized
+                else bool(bot_settings["export_default_caption_file_names"]),
+                "onwards": parsed.onwards
+                if "--onwards" in normalized
+                else bool(bot_settings["export_default_onwards"]),
             }
 
         await _run_export_job(message, payload, store)
@@ -2970,6 +3206,8 @@ async def run_bot() -> None:
             if not isinstance(payload, dict):
                 await message.reply_text("Saved index profile is invalid.")
                 return
+            payload = dict(payload)
+            payload.setdefault("onwards", bool(bot_settings["index_default_onwards"]))
         else:
             normalized = _normalize_index_command(command_text)
             try:
@@ -2989,7 +3227,9 @@ async def run_bot() -> None:
                 "batch_delay_sec": parsed.batch_delay_sec
                 if "--batch-delay-sec" in normalized
                 else float(bot_settings["export_default_batch_delay_sec"]),
-                "onwards": parsed.onwards,
+                "onwards": parsed.onwards
+                if "--onwards" in normalized
+                else bool(bot_settings["index_default_onwards"]),
                 "header": parsed.header,
             }
 
