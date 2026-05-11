@@ -58,6 +58,9 @@ EXCLUDED_NAMES = {
     "runtime",
 }
 
+# Resolved argv prefix to run Heroku (e.g. ["heroku.exe"] or ["node.exe", "run.js"]).
+_HEROKU_PREFIX: list[str] | None = None
+
 
 def parse_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -85,24 +88,198 @@ def run(
     display: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(display or command))
-    return subprocess.run(command, cwd=cwd, text=True, check=check)
+    resolved_command = command.copy()
+    first = resolved_command[0]
+    first_path = Path(first)
+    if not (first_path.is_absolute() and first_path.is_file()):
+        executable = command_path(first)
+        if executable is not None:
+            resolved_command[0] = executable
+    return subprocess.run(resolved_command, cwd=cwd, text=True, check=check)
 
 
 def require_tool(name: str) -> None:
-    if shutil.which(name) is None:
+    if command_path(name) is None:
         raise RuntimeError(f"Missing required command: {name}")
 
 
+def command_path(name: str) -> str | None:
+    if os.name == "nt":
+        suffixes = (".cmd", ".exe", ".bat")
+        path = Path(name)
+        if path.suffix.lower() not in suffixes:
+            for suffix in suffixes:
+                found = shutil.which(f"{name}{suffix}")
+                if found is not None:
+                    return found
+    return shutil.which(name)
+
+
+def _invalidate_heroku_prefix() -> None:
+    global _HEROKU_PREFIX
+    _HEROKU_PREFIX = None
+
+
+def _windows_standalone_heroku() -> list[str] | None:
+    if os.name != "nt":
+        return None
+    for name in ("heroku.exe", "heroku.cmd"):
+        for base in (
+            Path(os.environ.get("ProgramFiles", "")) / "Heroku" / "bin",
+            Path(os.environ.get("ProgramFiles(x86)", "")) / "Heroku" / "bin",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "heroku" / "bin",
+        ):
+            candidate = base / name
+            if candidate.is_file():
+                return [str(candidate)]
+    return None
+
+
+def _npm_global_root() -> Path | None:
+    npm = command_path("npm")
+    if npm is None:
+        return None
+    proc = subprocess.run([npm, "root", "-g"], capture_output=True, text=True, check=False, timeout=120)
+    if proc.returncode != 0:
+        return None
+    root = (proc.stdout or "").strip()
+    if not root:
+        return None
+    return Path(root)
+
+
+def _npm_global_heroku_via_node() -> list[str] | None:
+    root = _npm_global_root()
+    if root is None:
+        return None
+    run_js = root / "heroku" / "bin" / "run.js"
+    if not run_js.is_file():
+        return None
+    node = command_path("node")
+    if node is None:
+        return None
+    return [node, str(run_js)]
+
+
+def _is_npm_heroku_shim(path: str) -> bool:
+    normalized = path.replace("/", "\\").lower()
+    return "\\appdata\\roaming\\npm\\" in normalized or normalized.endswith("\\npm\\heroku.cmd")
+
+
+def _resolve_heroku_prefix(*, use_cache: bool) -> list[str] | None:
+    global _HEROKU_PREFIX
+    if use_cache and _HEROKU_PREFIX is not None:
+        return _HEROKU_PREFIX
+
+    if os.name == "nt":
+        standalone = _windows_standalone_heroku()
+        if standalone is not None:
+            _HEROKU_PREFIX = standalone
+            return standalone
+        via_node = _npm_global_heroku_via_node()
+        if via_node is not None:
+            _HEROKU_PREFIX = via_node
+            return via_node
+
+    heroku = command_path("heroku")
+    if heroku is None:
+        _HEROKU_PREFIX = None
+        return None
+    if os.name == "nt" and heroku.lower().endswith(".cmd") and _is_npm_heroku_shim(heroku):
+        via_node = _npm_global_heroku_via_node()
+        if via_node is not None:
+            _HEROKU_PREFIX = via_node
+            return via_node
+    _HEROKU_PREFIX = [heroku]
+    return _HEROKU_PREFIX
+
+
+def get_heroku_prefix() -> list[str]:
+    prefix = _resolve_heroku_prefix(use_cache=True)
+    if prefix is None:
+        raise RuntimeError(
+            "Heroku CLI is not available in PATH.\n"
+            "On Windows, install the standalone CLI (recommended): winget install --id Heroku.HerokuCLI -e\n"
+            "Or see https://devcenter.heroku.com/articles/heroku-cli"
+        )
+    return prefix
+
+
+def run_heroku(
+    heroku_args: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    display: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    prefix = get_heroku_prefix()
+    command = prefix + heroku_args
+    disp = display if display is not None else ["heroku", *heroku_args]
+    return run(command, cwd=cwd, check=check, display=disp)
+
+
+def install_heroku_cli() -> None:
+    if os.name == "nt":
+        winget = command_path("winget")
+        if winget is not None:
+            run(
+                [
+                    winget,
+                    "install",
+                    "--id",
+                    "Heroku.HerokuCLI",
+                    "-e",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ]
+            )
+            return
+
+        npm = command_path("npm")
+        if npm is not None:
+            run([npm, "install", "-g", "heroku"])
+            return
+
+        raise RuntimeError(
+            "Heroku CLI is missing and automatic install is not available on this Windows machine.\n"
+            "Install it with one of these commands, restart PowerShell, then try again:\n"
+            "  winget install --id Heroku.HerokuCLI -e\n"
+            "  npm install -g heroku\n"
+            "Or download it from https://devcenter.heroku.com/articles/heroku-cli"
+        )
+
+    bash = command_path("bash")
+    curl = command_path("curl")
+    if bash is not None and curl is not None:
+        run([bash, "-lc", "curl -s https://cli-assets.heroku.com/install.sh | sh"])
+        return
+
+    npm = command_path("npm")
+    if npm is not None:
+        run([npm, "install", "-g", "heroku"])
+        return
+
+    raise RuntimeError(
+        "Heroku CLI is missing and automatic install is not available.\n"
+        "Install it manually, then try again:\n"
+        "  curl https://cli-assets.heroku.com/install.sh | sh\n"
+        "Or see https://devcenter.heroku.com/articles/heroku-cli"
+    )
+
+
 def ensure_heroku_cli() -> None:
-    if shutil.which("heroku") is not None:
+    _invalidate_heroku_prefix()
+    if _resolve_heroku_prefix(use_cache=False) is not None:
         return
     print("Heroku CLI is missing; installing it now...")
-    run(["bash", "-lc", "curl -s https://cli-assets.heroku.com/install.sh | sh"])
-    if shutil.which("heroku") is not None:
+    install_heroku_cli()
+    _invalidate_heroku_prefix()
+    if _resolve_heroku_prefix(use_cache=False) is not None:
         return
     raise RuntimeError(
         "Heroku CLI installation finished, but the heroku command is still not available.\n"
-        "Install it manually or restart the shell, then try again:\n"
+        "Restart the shell, then try again. If it still fails, install it manually:\n"
+        "  winget install --id Heroku.HerokuCLI -e\n"
         "  curl https://cli-assets.heroku.com/install.sh | sh\n"
         "Then authenticate with either:\n"
         "  heroku login\n"
@@ -215,7 +392,7 @@ def ensure_netrc(email: str, api_key: str) -> None:
 
 
 def heroku_app_exists(app: str) -> bool:
-    result = run(["heroku", "apps:info", "-a", app], check=False)
+    result = run_heroku(["apps:info", "-a", app], check=False)
     return result.returncode == 0
 
 
@@ -223,7 +400,7 @@ def destroy_heroku_app(app: str) -> None:
     if not heroku_app_exists(app):
         print(f"Heroku app does not exist yet, skipping destroy: {app}")
         return
-    run(["heroku", "apps:destroy", "-a", app, "--confirm", app])
+    run_heroku(["apps:destroy", "-a", app, "--confirm", app])
 
 
 def ensure_heroku_app(app: str, *, create: bool, region: str, team: str) -> None:
@@ -232,34 +409,35 @@ def ensure_heroku_app(app: str, *, create: bool, region: str, team: str) -> None
     if not create:
         raise RuntimeError(f"Heroku app not found or inaccessible: {app}. Use --create-app to create it.")
 
-    command = ["heroku", "create", "--stack", "heroku-24", "--region", region]
+    command = ["create", "--stack", "heroku-24", "--region", region]
     if team:
         command.extend(["--team", team])
     command.append(app)
-    run(command)
+    run_heroku(command)
 
 
 def set_config(app: str, config: dict[str, str]) -> None:
     if not config:
         print("No config vars to set.")
         return
-    command = ["heroku", "config:set", "-a", app]
+    command = ["config:set", "-a", app]
     command.extend(f"{key}={value}" for key, value in config.items())
     display = ["heroku", "config:set", "-a", app]
     display.extend(f"{key}=***" for key in config)
-    run(command, display=display)
+    run_heroku(command, display=display)
 
 
 def add_apt_buildpack(app: str) -> None:
+    prefix = get_heroku_prefix()
     result = subprocess.run(
-        ["heroku", "buildpacks", "-a", app],
+        prefix + ["buildpacks", "-a", app],
         text=True,
         check=False,
         capture_output=True,
     )
     if "heroku-community/apt" in (result.stdout or ""):
         return
-    run(["heroku", "buildpacks:add", "--index", "1", "heroku-community/apt", "-a", app])
+    run_heroku(["buildpacks:add", "--index", "1", "heroku-community/apt", "-a", app])
 
 
 def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
@@ -269,9 +447,9 @@ def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
     run(["git", "config", "user.name", "Local Heroku Deployer"], cwd=deploy_dir)
     run(["git", "add", ".", "-f"], cwd=deploy_dir)
     run(["git", "commit", "-m", "Heroku deploy bundle"], cwd=deploy_dir)
-    run(["heroku", "git:remote", "-a", app], cwd=deploy_dir)
+    run_heroku(["git:remote", "-a", app], cwd=deploy_dir)
     run(["git", "push", "heroku", "main", "-f"], cwd=deploy_dir)
-    run(["heroku", "ps:scale", f"worker={worker_count}", "-a", app])
+    run_heroku(["ps:scale", f"worker={worker_count}", "-a", app])
 
 
 def parse_args() -> argparse.Namespace:
@@ -347,7 +525,7 @@ def main() -> int:
             or args.config
         )
         if logs_only:
-            run(["heroku", "logs", "--tail", "-a", args.app], check=False)
+            run_heroku(["logs", "--tail", "-a", args.app], check=False)
             print("Done.")
             return 0
 
@@ -374,7 +552,7 @@ def main() -> int:
         if not args.skip_deploy:
             deploy_bundle(args.app, args.deploy_dir.resolve(), args.worker_count)
         if args.logs:
-            run(["heroku", "logs", "--tail", "-a", args.app], check=False)
+            run_heroku(["logs", "--tail", "-a", args.app], check=False)
 
         print("Done.")
         return 0

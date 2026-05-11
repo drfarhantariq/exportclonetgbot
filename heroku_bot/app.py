@@ -844,6 +844,27 @@ def _category_page_keys(category: str, page: int) -> list[str]:
     return keys[start : start + SETTINGS_PAGE_SIZE]
 
 
+def _settings_category_index(category: str) -> int:
+    return SETTINGS_CATEGORY_ORDER.index(category)
+
+
+def _settings_category_by_index(index: int) -> str | None:
+    if index < 0 or index >= len(SETTINGS_CATEGORY_ORDER):
+        return None
+    return SETTINGS_CATEGORY_ORDER[index]
+
+
+def _settings_key_index(category: str, key: str) -> int:
+    return SETTINGS_CATEGORIES[category].index(key)
+
+
+def _settings_key_by_index(category: str, key_index: int) -> str | None:
+    keys = SETTINGS_CATEGORIES[category]
+    if key_index < 0 or key_index >= len(keys):
+        return None
+    return keys[key_index]
+
+
 def _format_settings_root(user) -> str:
     return (
         f"<b>{_html(_display_name(user))}</b>\n"
@@ -856,12 +877,12 @@ def _settings_root_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Export", callback_data="settings:cat:export:0"),
-                InlineKeyboardButton("Index", callback_data="settings:cat:index:0"),
+                InlineKeyboardButton("Export", callback_data="settings:cat:0:0"),
+                InlineKeyboardButton("Index", callback_data="settings:cat:1:0"),
             ],
             [
-                InlineKeyboardButton("Clone", callback_data="settings:cat:clone:0"),
-                InlineKeyboardButton("Other", callback_data="settings:cat:other:0"),
+                InlineKeyboardButton("Clone", callback_data="settings:cat:2:0"),
+                InlineKeyboardButton("Other", callback_data="settings:cat:3:0"),
             ],
             [InlineKeyboardButton("Close", callback_data="settings:close")],
         ]
@@ -896,12 +917,14 @@ def _category_settings_markup(category: str, page: int) -> InlineKeyboardMarkup:
     page = min(max(page, 0), page_count - 1)
     rows: list[list[InlineKeyboardButton]] = []
     keys = _category_page_keys(category, page)
+    category_index = _settings_category_index(category)
+    start = page * SETTINGS_PAGE_SIZE
     key_buttons = [
         InlineKeyboardButton(
             _settings_key_label(setting_key),
-            callback_data=f"settings:item:{category}:{page}:view:{setting_key}",
+            callback_data=f"settings:item:{category_index}:{page}:view:{start + offset}",
         )
-        for setting_key in keys
+        for offset, setting_key in enumerate(keys)
     ]
     rows.extend(key_buttons[index : index + 2] for index in range(0, len(key_buttons), 2))
     rows.append(
@@ -911,10 +934,11 @@ def _category_settings_markup(category: str, page: int) -> InlineKeyboardMarkup:
         ]
     )
     if page_count > 1:
+        category_index = _settings_category_index(category)
         page_buttons = [
             InlineKeyboardButton(
                 str(index),
-                callback_data=f"settings:cat:{category}:{index}",
+                callback_data=f"settings:cat:{category_index}:{index}",
             )
             for index in range(page_count)
         ]
@@ -970,6 +994,8 @@ def _setting_detail_markup(
     state = state if state in {"view", "edit"} else "view"
     toggle_label = "View" if state == "edit" else "Edit"
     toggle_state = "view" if state == "edit" else "edit"
+    category_index = _settings_category_index(category)
+    key_index = _settings_key_index(category, key)
     rows: list[list[InlineKeyboardButton]] = []
     if key in BOT_TOGGLE_SETTING_KEYS:
         current = bool(settings.get(key, _setting_default(key)))
@@ -978,7 +1004,7 @@ def _setting_detail_markup(
             [
                 InlineKeyboardButton(
                     flip_label,
-                    callback_data=f"settings:toggle:{category}:{page}:{state}:{key}",
+                    callback_data=f"settings:toggle:{category_index}:{page}:{state}:{key_index}",
                 )
             ]
         )
@@ -986,17 +1012,20 @@ def _setting_detail_markup(
         [
             InlineKeyboardButton(
                 toggle_label,
-                callback_data=f"settings:item:{category}:{page}:{toggle_state}:{key}",
+                callback_data=f"settings:item:{category_index}:{page}:{toggle_state}:{key_index}",
             ),
             InlineKeyboardButton(
                 "Reset",
-                callback_data=f"settings:reset:{category}:{page}:{state}:{key}",
+                callback_data=f"settings:reset:{category_index}:{page}:{state}:{key_index}",
             ),
         ]
     )
     rows.append(
         [
-            InlineKeyboardButton("Back", callback_data=f"settings:cat:{category}:{page}"),
+            InlineKeyboardButton(
+                "Back",
+                callback_data=f"settings:cat:{category_index}:{page}",
+            ),
             InlineKeyboardButton("Home", callback_data="settings:home"),
         ]
     )
@@ -2859,9 +2888,13 @@ async def run_bot() -> None:
             return
 
         if action == "cat" and len(parts) >= 4:
-            category = parts[2]
+            raw_category = parts[2]
             page = _safe_int(parts[3])
-            if category not in SETTINGS_CATEGORIES:
+            if raw_category.isdigit():
+                category = _settings_category_by_index(int(raw_category))
+            else:
+                category = raw_category if raw_category in SETTINGS_CATEGORIES else None
+            if category is None:
                 await callback_query.answer("Unknown category.", show_alert=True)
                 return
             await callback_query.answer()
@@ -2876,11 +2909,25 @@ async def run_bot() -> None:
             return
 
         if action == "item" and len(parts) >= 6:
-            category = parts[2]
+            raw_category = parts[2]
             page = _safe_int(parts[3])
             state = parts[4] if parts[4] in {"view", "edit"} else "view"
-            key = ":".join(parts[5:])
-            if category not in SETTINGS_CATEGORIES or key not in BOT_SETTINGS_DEFAULTS:
+            if raw_category.isdigit():
+                category = _settings_category_by_index(int(raw_category))
+                key_index = _safe_int(parts[5])
+                if category is None:
+                    await callback_query.answer("Unknown category.", show_alert=True)
+                    return
+                key = _settings_key_by_index(category, key_index)
+            else:
+                category = raw_category
+                key = ":".join(parts[5:])
+            if (
+                category is None
+                or category not in SETTINGS_CATEGORIES
+                or key is None
+                or key not in BOT_SETTINGS_DEFAULTS
+            ):
                 await callback_query.answer("Unknown setting.", show_alert=True)
                 return
             if key not in SETTINGS_CATEGORIES[category]:
@@ -2898,14 +2945,23 @@ async def run_bot() -> None:
             return
 
         if action == "toggle" and len(parts) >= 6:
-            category = parts[2]
+            raw_category = parts[2]
             page = _safe_int(parts[3])
             state = parts[4] if parts[4] in {"view", "edit"} else "view"
-            key = ":".join(parts[5:])
-            if key not in BOT_TOGGLE_SETTING_KEYS or key not in BOT_SETTINGS_DEFAULTS:
+            if raw_category.isdigit():
+                category = _settings_category_by_index(int(raw_category))
+                key_index = _safe_int(parts[5])
+                if category is None:
+                    await callback_query.answer("Unknown category.", show_alert=True)
+                    return
+                key = _settings_key_by_index(category, key_index)
+            else:
+                category = raw_category
+                key = ":".join(parts[5:])
+            if key is None or key not in BOT_TOGGLE_SETTING_KEYS or key not in BOT_SETTINGS_DEFAULTS:
                 await callback_query.answer("Not a toggle setting.", show_alert=True)
                 return
-            if category not in SETTINGS_CATEGORIES or key not in SETTINGS_CATEGORIES[category]:
+            if category is None or category not in SETTINGS_CATEGORIES or key not in SETTINGS_CATEGORIES[category]:
                 await callback_query.answer("Unknown setting.", show_alert=True)
                 return
             previous = bool(current_settings.get(key, _setting_default(key)))
@@ -2928,14 +2984,23 @@ async def run_bot() -> None:
             return
 
         if action == "reset" and len(parts) >= 6:
-            category = parts[2]
+            raw_category = parts[2]
             page = _safe_int(parts[3])
             state = parts[4] if parts[4] in {"view", "edit"} else "view"
-            key = ":".join(parts[5:])
-            if key not in BOT_SETTINGS_DEFAULTS:
+            if raw_category.isdigit():
+                category = _settings_category_by_index(int(raw_category))
+                key_index = _safe_int(parts[5])
+                if category is None:
+                    await callback_query.answer("Unknown category.", show_alert=True)
+                    return
+                key = _settings_key_by_index(category, key_index)
+            else:
+                category = raw_category
+                key = ":".join(parts[5:])
+            if key is None or key not in BOT_SETTINGS_DEFAULTS:
                 await callback_query.answer("Unknown setting.", show_alert=True)
                 return
-            if category not in SETTINGS_CATEGORIES or key not in SETTINGS_CATEGORIES[category]:
+            if category is None or category not in SETTINGS_CATEGORIES or key not in SETTINGS_CATEGORIES[category]:
                 await callback_query.answer("Unknown setting.", show_alert=True)
                 return
             current_settings[key] = _setting_default(key)
