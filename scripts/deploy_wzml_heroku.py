@@ -12,55 +12,56 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SOURCE_DIR = ROOT / "heroku_bot"
-DEFAULT_ENV_FILE = DEFAULT_SOURCE_DIR / ".env"
-DEFAULT_DEPLOY_DIR = ROOT / ".heroku_deploy" / "topic_ops_heroku_deploy"
+DEFAULT_SOURCE_DIR = ROOT / "WZML-X-wzv3"
+DEFAULT_ENV_FILE = DEFAULT_SOURCE_DIR / ".env.wzml"
+DEFAULT_DEPLOY_DIR = ROOT / ".heroku_deploy" / "wzml_heroku_deploy"
 
 REQUIRED_CONFIG_KEYS = (
-    "TG_API_ID",
-    "TG_API_HASH",
-    "TG_SESSION_STRING",
-    "HEROKU_BOT_TOKEN",
-    "BOT_ADMIN_USER_IDS",
+    "BOT_TOKEN",
+    "OWNER_ID",
+    "TELEGRAM_API",
+    "TELEGRAM_HASH",
+    "DATABASE_URL",
 )
 
 CONFIG_KEYS = (
-    "TG_API_ID",
-    "TG_API_HASH",
-    "TG_SESSION_STRING",
-    "HEROKU_BOT_TOKEN",
-    "BOT_ADMIN_USER_IDS",
-    "MONGODB_URI",
-    "MONGODB_DATABASE",
-    "MONGODB_COLLECTION",
-    "MONGODB_DATA_API_URL",
-    "MONGODB_DATA_API_KEY",
-    "MONGODB_DATA_SOURCE",
-    "ALLOW_EMPTY_MAPPINGS",
-    "HEROKU_CONFIG_PATH",
-    "HEROKU_RUNTIME_DIR",
-    "LEECH_BOT_USERNAME",
-    "LEECH_BOT_ID",
-    "RESTRICTED_MEDIA_COOLDOWN_SEC",
-    "HELPER_TOKENS",
-    "HYPER_THREADS",
-    "HYPER_DUMP_CHAT",
+    "BOT_TOKEN",
+    "OWNER_ID",
+    "TELEGRAM_API",
+    "TELEGRAM_HASH",
+    "DATABASE_URL",
+    "USER_SESSION_STRING",
+    "AUTHORIZED_CHATS",
+    "SUDO_USERS",
     "LEECH_DUMP_CHAT",
-    "HYPER_MAX_FLOOD_WAIT",
-    "GENERATE_VIDEO_THUMBNAILS",
-    "FFMPEG_BINARY",
-    "FFPROBE_BINARY",
-    "LOG_FILE_PATH",
+    "QUEUE_DOWNLOAD",
+    "QUEUE_UPLOAD",
+    "DEFAULT_UPLOAD",
+    "STATUS_UPDATE_INTERVAL",
+    "STATUS_LIMIT",
+    "BOT_PM",
+    "TIMEZONE",
+    "DISABLE_BULK",
+    "DISABLE_LEECH",
+    "DISABLE_MULTI",
+    "DISABLE_SEED",
+    "DISABLE_FF_MODE",
+    "HYBRID_LEECH",
+    "USER_TRANSMISSION",
+    "CMD_SUFFIX",
+    "UPSTREAM_REPO",
+    "UPSTREAM_BRANCH",
+    "UPDATE_PKGS",
 )
 
 EXCLUDED_NAMES = {
     ".env",
+    ".env.wzml",
     ".venv",
     "__pycache__",
     "runtime",
 }
 
-# Resolved argv prefix to run Heroku (e.g. ["heroku.exe"] or ["node.exe", "run.js"]).
 _HEROKU_PREFIX: list[str] | None = None
 
 
@@ -68,7 +69,6 @@ def parse_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
         return values
-
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -80,6 +80,18 @@ def parse_env_file(path: Path) -> dict[str, str]:
             value = value[1:-1]
         values[key] = value
     return values
+
+
+def command_path(name: str) -> str | None:
+    if os.name == "nt":
+        suffixes = (".cmd", ".exe", ".bat")
+        path = Path(name)
+        if path.suffix.lower() not in suffixes:
+            for suffix in suffixes:
+                found = shutil.which(f"{name}{suffix}")
+                if found is not None:
+                    return found
+    return shutil.which(name)
 
 
 def run(
@@ -103,18 +115,6 @@ def run(
 def require_tool(name: str) -> None:
     if command_path(name) is None:
         raise RuntimeError(f"Missing required command: {name}")
-
-
-def command_path(name: str) -> str | None:
-    if os.name == "nt":
-        suffixes = (".cmd", ".exe", ".bat")
-        path = Path(name)
-        if path.suffix.lower() not in suffixes:
-            for suffix in suffixes:
-                found = shutil.which(f"{name}{suffix}")
-                if found is not None:
-                    return found
-    return shutil.which(name)
 
 
 def _invalidate_heroku_prefix() -> None:
@@ -172,7 +172,6 @@ def _resolve_heroku_prefix(*, use_cache: bool) -> list[str] | None:
     global _HEROKU_PREFIX
     if use_cache and _HEROKU_PREFIX is not None:
         return _HEROKU_PREFIX
-
     if os.name == "nt":
         standalone = _windows_standalone_heroku()
         if standalone is not None:
@@ -182,7 +181,6 @@ def _resolve_heroku_prefix(*, use_cache: bool) -> list[str] | None:
         if via_node is not None:
             _HEROKU_PREFIX = via_node
             return via_node
-
     heroku = command_path("heroku")
     if heroku is None:
         _HEROKU_PREFIX = None
@@ -236,12 +234,10 @@ def install_heroku_cli() -> None:
                 ]
             )
             return
-
         npm = command_path("npm")
         if npm is not None:
             run([npm, "install", "-g", "heroku"])
             return
-
         raise RuntimeError(
             "Heroku CLI is missing and automatic install is not available on this Windows machine.\n"
             "Install it with one of these commands, restart PowerShell, then try again:\n"
@@ -249,18 +245,15 @@ def install_heroku_cli() -> None:
             "  npm install -g heroku\n"
             "Or download it from https://devcenter.heroku.com/articles/heroku-cli"
         )
-
     bash = command_path("bash")
     curl = command_path("curl")
     if bash is not None and curl is not None:
         run([bash, "-lc", "curl -s https://cli-assets.heroku.com/install.sh | sh"])
         return
-
     npm = command_path("npm")
     if npm is not None:
         run([npm, "install", "-g", "heroku"])
         return
-
     raise RuntimeError(
         "Heroku CLI is missing and automatic install is not available.\n"
         "Install it manually, then try again:\n"
@@ -280,12 +273,7 @@ def ensure_heroku_cli() -> None:
         return
     raise RuntimeError(
         "Heroku CLI installation finished, but the heroku command is still not available.\n"
-        "Restart the shell, then try again. If it still fails, install it manually:\n"
-        "  winget install --id Heroku.HerokuCLI -e\n"
-        "  curl https://cli-assets.heroku.com/install.sh | sh\n"
-        "Then authenticate with either:\n"
-        "  heroku login\n"
-        "or add HEROKU_EMAIL and HEROKU_API_KEY to heroku_bot/.env and run with --write-netrc."
+        "Restart the shell, then try again."
     )
 
 
@@ -312,7 +300,6 @@ def _rmtree_onerror(func, path: str, exc_info: tuple[type[BaseException], BaseEx
 def remove_deploy_dir(deploy_dir: Path) -> None:
     if not deploy_dir.exists():
         return
-
     last_error: OSError | None = None
     for attempt in range(3):
         try:
@@ -321,21 +308,14 @@ def remove_deploy_dir(deploy_dir: Path) -> None:
         except OSError as exc:
             last_error = exc
             time.sleep(0.25 * (attempt + 1))
-
-    raise RuntimeError(
-        "Failed to clean deploy directory. A file is likely locked by another process.\n"
-        f"Path: {deploy_dir}\n"
-        "Close terminals/editor windows that may use this folder, then retry."
-    ) from last_error
+    raise RuntimeError(f"Failed to clean deploy directory: {deploy_dir}") from last_error
 
 
 def prepare_deploy_dir(source_dir: Path, deploy_dir: Path) -> None:
     if not source_dir.exists():
-        raise FileNotFoundError(f"Heroku source folder not found: {source_dir}")
-
+        raise FileNotFoundError(f"WZML source folder not found: {source_dir}")
     remove_deploy_dir(deploy_dir)
     deploy_dir.mkdir(parents=True)
-
     for item in source_dir.iterdir():
         if not should_copy(item):
             continue
@@ -348,29 +328,12 @@ def prepare_deploy_dir(source_dir: Path, deploy_dir: Path) -> None:
             )
         else:
             shutil.copy2(item, target)
-
     procfile = deploy_dir / "Procfile"
     if not procfile.exists():
-        procfile.write_text("worker: python app.py\n", encoding="utf-8")
-
+        procfile.write_text("worker: bash start.sh\n", encoding="utf-8")
     runtime_file = deploy_dir / "runtime.txt"
     if not runtime_file.exists():
         runtime_file.write_text("python-3.12.0\n", encoding="utf-8")
-
-    aptfile = deploy_dir / "Aptfile"
-    existing_packages = set()
-    if aptfile.exists():
-        existing_packages = {
-            line.strip()
-            for line in aptfile.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        }
-    if "ffmpeg" not in existing_packages:
-        with aptfile.open("a", encoding="utf-8") as handle:
-            if aptfile.exists() and aptfile.stat().st_size > 0:
-                handle.write("\n")
-            handle.write("ffmpeg\n")
-
     print(f"Prepared deploy workspace: {deploy_dir}")
 
 
@@ -387,20 +350,12 @@ def build_config(env_values: dict[str, str], extra_pairs: list[str]) -> dict[str
 def validate_config(config: dict[str, str], *, skip_config: bool) -> None:
     if skip_config:
         return
-
     missing = [key for key in REQUIRED_CONFIG_KEYS if not config.get(key)]
     if missing:
         raise RuntimeError(
             "Missing required config values: "
             + ", ".join(missing)
-            + ". Fill them in heroku_bot/.env or pass --config KEY=VALUE."
-        )
-
-    has_mongo_uri = bool(config.get("MONGODB_URI"))
-    has_data_api = all(config.get(key) for key in ("MONGODB_DATA_API_URL", "MONGODB_DATA_API_KEY", "MONGODB_DATA_SOURCE"))
-    if not has_mongo_uri and not has_data_api:
-        raise RuntimeError(
-            "Missing MongoDB persistence config. Set MONGODB_URI or all MongoDB Data API values."
+            + ". Fill them in WZML-X-wzv3/.env.wzml or pass --config KEY=VALUE."
         )
 
 
@@ -441,7 +396,6 @@ def ensure_heroku_app(app: str, *, create: bool, region: str, team: str) -> None
         return
     if not create:
         raise RuntimeError(f"Heroku app not found or inaccessible: {app}. Use --create-app to create it.")
-
     command = ["create", "--stack", "heroku-24", "--region", region]
     if team:
         command.extend(["--team", team])
@@ -460,26 +414,13 @@ def set_config(app: str, config: dict[str, str]) -> None:
     run_heroku(command, display=display)
 
 
-def add_apt_buildpack(app: str) -> None:
-    prefix = get_heroku_prefix()
-    result = subprocess.run(
-        prefix + ["buildpacks", "-a", app],
-        text=True,
-        check=False,
-        capture_output=True,
-    )
-    if "heroku-community/apt" in (result.stdout or ""):
-        return
-    run_heroku(["buildpacks:add", "--index", "1", "heroku-community/apt", "-a", app])
-
-
 def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
     run(["git", "init"], cwd=deploy_dir)
     run(["git", "branch", "-M", "main"], cwd=deploy_dir)
     run(["git", "config", "user.email", "deploy@example.local"], cwd=deploy_dir)
     run(["git", "config", "user.name", "Local Heroku Deployer"], cwd=deploy_dir)
     run(["git", "add", ".", "-f"], cwd=deploy_dir)
-    run(["git", "commit", "-m", "Heroku deploy bundle"], cwd=deploy_dir)
+    run(["git", "commit", "-m", "WZML Heroku deploy bundle"], cwd=deploy_dir)
     run_heroku(["git:remote", "-a", app], cwd=deploy_dir)
     run(["git", "push", "heroku", "main", "-f"], cwd=deploy_dir)
     run_heroku(["ps:scale", f"worker={worker_count}", "-a", app])
@@ -487,7 +428,7 @@ def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Deploy the heroku_bot bundle to Heroku from this workspace."
+        description="Deploy the WZML-X-wzv3 bundle to Heroku from this workspace."
     )
     parser.add_argument("-a", "--app", required=True, help="Heroku app name")
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR, help="Folder to bundle for Heroku")
@@ -518,10 +459,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--team", default="", help="Heroku team for --create-app")
     parser.add_argument("--skip-config", action="store_true", help="Do not set Heroku config vars")
     parser.add_argument("--skip-deploy", action="store_true", help="Prepare bundle/config only, do not push")
-    parser.add_argument("--skip-apt-buildpack", action="store_true", help="Do not add heroku-community/apt buildpack")
     parser.add_argument("--worker-count", type=int, default=1, help="Worker dyno count after deploy")
     parser.add_argument("--logs", action="store_true", help="Tail logs after deploy")
-    parser.add_argument("--install-heroku-cli", action="store_true", help="Compatibility option; Heroku CLI is installed automatically when missing")
     parser.add_argument("--write-netrc", action="store_true", help="Compatibility option; ~/.netrc is written automatically when Heroku credentials are available")
     parser.add_argument("--no-write-netrc", action="store_true", help="Do not write ~/.netrc even if Heroku credentials are available")
     parser.add_argument("--heroku-email", default="", help="Heroku email for --write-netrc")
@@ -534,18 +473,16 @@ def main() -> int:
     try:
         require_tool("git")
         env_values = parse_env_file(args.env_file)
-
         heroku_email = args.heroku_email or env_values.get("HEROKU_EMAIL", "") or os.getenv("HEROKU_EMAIL", "")
         heroku_api_key = args.heroku_api_key or env_values.get("HEROKU_API_KEY", "") or os.getenv("HEROKU_API_KEY", "")
         should_write_netrc = not args.no_write_netrc and bool(heroku_email and heroku_api_key)
         if args.write_netrc and not should_write_netrc:
             raise RuntimeError(
-                "--write-netrc requires HEROKU_EMAIL and HEROKU_API_KEY in heroku_bot/.env "
+                "--write-netrc requires HEROKU_EMAIL and HEROKU_API_KEY in WZML-X-wzv3/.env.wzml "
                 "or --heroku-email/--heroku-api-key"
             )
         if should_write_netrc:
             ensure_netrc(heroku_email, heroku_api_key)
-
         ensure_heroku_cli()
 
         logs_only = args.logs and not (
@@ -554,7 +491,6 @@ def main() -> int:
             or args.create_app
             or args.skip_deploy
             or args.skip_config
-            or args.skip_apt_buildpack
             or args.config
         )
         if logs_only:
@@ -577,16 +513,12 @@ def main() -> int:
             team=args.team,
         )
         prepare_deploy_dir(args.source_dir.resolve(), args.deploy_dir.resolve())
-
-        if not args.skip_apt_buildpack:
-            add_apt_buildpack(args.app)
         if not args.skip_config:
             set_config(args.app, config)
         if not args.skip_deploy:
             deploy_bundle(args.app, args.deploy_dir.resolve(), args.worker_count)
         if args.logs:
             run_heroku(["logs", "--tail", "-a", args.app], check=False)
-
         print("Done.")
         return 0
     except Exception as exc:

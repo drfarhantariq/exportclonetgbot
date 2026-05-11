@@ -366,6 +366,13 @@ def add_handlers():
     )
     TgClient.bot.add_handler(
         MessageHandler(
+            topic_clone_json,
+            filters=command(BotCommands.TopicCloneJsonCommand, case_sensitive=True)
+            & CustomFilters.authorized,
+        )
+    )
+    TgClient.bot.add_handler(
+        MessageHandler(
             hydra_search,
             filters=command(BotCommands.NzbSearchCommand, case_sensitive=True)
             & CustomFilters.authorized,

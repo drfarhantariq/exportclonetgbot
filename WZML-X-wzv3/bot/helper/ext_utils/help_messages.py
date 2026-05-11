@@ -391,6 +391,7 @@ def get_bot_commands():
         "Leech": "[link/file] Leech files to Upload to Telegram",
         "QbLeech": "[magnet/torrent] Leech files to Upload to Telegram using qbit",
         "YtdlLeech": "[link] Leech YouTube, m3u8, Social Media and yt-dlp supported urls",
+        "TopicCloneJson": "[reply json] Replay export JSON into topic with leech",
         "Clone": "[link] Clone files/folders to GDrive",
         "UserSet": "User personal settings",
         "ForceStart": "[gid/reply] Force start from queued task",
@@ -457,6 +458,10 @@ def get_help_string():
             help_lines.append(f"{cmd_str}: Start Mirroring to cloud using Sabnzbd.")
         elif key == "Ytdl":
             help_lines.append(f"{cmd_str}: Mirror yt-dlp supported link.")
+        elif key == "TopicCloneJson":
+            help_lines.append(
+                f"{cmd_str}: Reply to export JSON and replay text+links into destination topic."
+            )
         elif key == "UpHoster":
             help_lines.append(f"{cmd_str}: Upload to DDL Servers.")
         elif key == "Leech":

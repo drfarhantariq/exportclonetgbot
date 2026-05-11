@@ -139,6 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Also write a sidecar JSON export file next to the txt output",
+    )
+    parser.add_argument(
         "--header",
         default="INDEX 👆",
         help="Header text for /index output (default: INDEX 👆)",
@@ -680,6 +685,7 @@ async def run_export(
     upload_topic_link: str,
     caption_file_names: bool,
     onwards: bool,
+    json_output: bool = False,
     status_callback: ExportStatusCallback | None = None,
 ) -> Path:
     try:
@@ -789,6 +795,7 @@ async def run_export(
                 await asyncio.sleep(batch_delay_sec)
 
         entries: list[tuple[str, str]] = []
+        json_entries: list[dict[str, Any]] = []
         media_links = 0
         text_entries = 0
         await _notify_export_status(
@@ -813,7 +820,17 @@ async def run_export(
                 if caption_file_names and _is_video_message(message):
                     caption = _normalize_text_line(_message_caption(message))
                     if caption:
-                        entries.append(("link", f"{link} -n {caption}"))
+                        line = f"{link} -n {caption}"
+                        entries.append(("link", line))
+                        json_entries.append(
+                            {
+                                "type": "link",
+                                "message_id": message.id,
+                                "value": line,
+                                "url": link,
+                                "caption": caption,
+                            }
+                        )
                         media_links += 1
                         await _notify_export_status(
                             status_callback,
@@ -831,6 +848,15 @@ async def run_export(
                         continue
 
                 entries.append(("link", link))
+                json_entries.append(
+                    {
+                        "type": "link",
+                        "message_id": message.id,
+                        "value": link,
+                        "url": link,
+                        "caption": "",
+                    }
+                )
                 media_links += 1
                 await _notify_export_status(
                     status_callback,
@@ -850,6 +876,13 @@ async def run_export(
             text = _message_text(message)
             if text:
                 entries.append(("text", text))
+                json_entries.append(
+                    {
+                        "type": "text",
+                        "message_id": message.id,
+                        "value": text,
+                    }
+                )
                 text_entries += 1
 
             await _notify_export_status(
@@ -881,6 +914,36 @@ async def run_export(
             },
         )
         output.write_text(_format_entries(entries), encoding="utf-8")
+        json_path: Path | None = None
+        if json_output:
+            json_path = output.with_suffix(".json")
+            json_payload: dict[str, Any] = {
+                "version": 1,
+                "generated_by": "export_topic_list.py",
+                "source": {
+                    "chat_id": parsed.chat_id,
+                    "topic_id": parsed.topic_id,
+                    "start_message_id": start_message_id,
+                    "is_topic": parsed.is_topic,
+                    "onwards": onwards,
+                },
+                "output": {
+                    "txt_path": str(output),
+                    "json_path": str(json_path),
+                },
+                "stats": {
+                    "total_messages": total_messages,
+                    "fetched_messages": len(messages),
+                    "media_links": media_links,
+                    "text_entries": text_entries,
+                    "entry_count": len(json_entries),
+                },
+                "entries": json_entries,
+            }
+            json_path.write_text(
+                json.dumps(json_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
         await _notify_export_status(
             status_callback,
@@ -893,6 +956,7 @@ async def run_export(
                 "media_links": media_links,
                 "text_entries": text_entries,
                 "output": str(output),
+                "json_output": str(json_path) if json_path is not None else "",
             },
         )
         await telegram.send_document_to_topic(
@@ -1162,6 +1226,7 @@ def _build_export_payload(args: argparse.Namespace) -> dict[str, Any]:
         "upload_topic_link": args.upload_topic_link,
         "caption_file_names": args.caption_file_names,
         "onwards": args.onwards,
+        "json_output": bool(args.json),
     }
 
 
@@ -1190,7 +1255,7 @@ def _export_bot_help_text() -> str:
     return (
         "Available commands:\n\n"
         "/export --topic-link <link> [--out <file>] [--batch-size N] "
-        "[--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards]\n"
+        "[--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards] [--json]\n"
         "/export last or /export resume\n\n"
         f"{_index_usage_text()}\n\n"
         "/status - Show the saved export profile"
@@ -1259,6 +1324,7 @@ async def _run_export_bot(args: argparse.Namespace) -> int:
                 upload_topic_link=payload["upload_topic_link"],
                 caption_file_names=bool(payload["caption_file_names"]),
                 onwards=bool(payload["onwards"]),
+                json_output=bool(payload.get("json_output")),
             )
         except Exception as exc:
             await status.edit_text(f"Export failed: {exc}")
@@ -1315,7 +1381,7 @@ async def _run_export_bot(args: argparse.Namespace) -> int:
                 parsed = build_parser().parse_args(shlex.split(command_text))
             except SystemExit:
                 await message.reply_text(
-                    "Usage: /export --topic-link <link> [--out <file>] [--batch-size N] [--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards]"
+                    "Usage: /export --topic-link <link> [--out <file>] [--batch-size N] [--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards] [--json]"
                 )
                 return
             payload = _build_export_payload(parsed)
@@ -1391,6 +1457,7 @@ def main() -> int:
                 args.upload_topic_link,
                 args.caption_file_names,
                 args.onwards,
+                bool(args.json),
             )
         )
     except KeyboardInterrupt:
