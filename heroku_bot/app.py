@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -294,7 +295,7 @@ def _build_index_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--batch-delay-sec", type=float, default=2.0)
     parser.add_argument("--onwards", action="store_true")
-    parser.add_argument("--header", default="INDEX 👆")
+    parser.add_argument("--header", default="")
     return parser
 
 
@@ -304,13 +305,17 @@ def _build_clone_parser() -> argparse.ArgumentParser:
     parser.add_argument("--destination-link", default="")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--start-id", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=10000)
     parser.add_argument("--delay-sec", type=float, default=0.35)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--message-ids", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--hide-sender-name", action="store_true")
+    parser.add_argument("--filename-prefix", default="")
+    parser.add_argument("--filename-suffix", default="")
+    parser.add_argument("--text-prefix", default="")
+    parser.add_argument("--text-suffix", default="")
     return parser
 
 
@@ -326,26 +331,74 @@ def _bundle_help_text() -> str:
         "/login - Generate and save a Telegram user session string\n"
         "/log - Upload the current bot log file\n"
         "/cancel [clone|export|index] - Cancel a running job\n"
+        "/cancel clone queued <job_id_prefix> - Remove a pending queued clone\n"
         "/restart - Restart the bot process\n\n"
         "Clone:\n"
         "/clone --source-link <link> --destination-link <link> [--config <path>] [--start-id N] "
         "[--limit N] [--delay-sec S] [--batch-size N] [--message-ids 1,2,3] [--dry-run] "
-        "[--continue-on-error] [--hide-sender-name]\n"
+        "[--continue-on-error] [--hide-sender-name] [--filename-prefix TEXT] [--filename-suffix TEXT] "
+        "[--text-prefix TEXT] [--text-suffix TEXT]\n"
         "/clone <source_link> <destination_link>\n"
         "/clone status\n"
+        "/clone queue - List pending clone jobs (FIFO)\n"
         "/clone last or /clone resume\n\n"
         "Export:\n"
         "/export --topic-link <link> [--config <path>] [--out <file>] [--batch-size N] "
         "[--batch-delay-sec S] [--upload-topic-link <link>] [--caption-file-names] [--onwards]\n"
-        "/export <topic_link>\n"
+        "/export <topic_link> [--out <file name with spaces allowed>]\n"
         "/export last or /export resume\n\n"
         "Index:\n"
         "/index --topic-link <link> [--config <path>] [--batch-size N] [--batch-delay-sec S] "
-        "[--onwards] [--header \"INDEX\"]\n"
+        "[--onwards] [--header \"Custom Header\"]\n"
         "/index <topic_link>\n"
-        "/index last or /index resume\n"
+        "/index last or /index resume\n\n"
+        "Functionality:\n"
+        "- Clone: copies source topic messages to destination topic in order "
+        "(one active clone; extras wait in a persisted FIFO queue).\n"
+        "- Export: creates a txt list of topic/channel content and uploads it.\n"
+        "- Index: posts clickable text-message links back into the same topic.\n"
+        "- Index default header is the source topic title (override with --header).\n"
+        "- Export --out accepts natural names (spaces) and auto-adds .txt if missing.\n\n"
         "Scans the topic for text messages only, uses each text as a clickable HTML link, "
         "and sends the index back into the same topic. Use --onwards to start from the linked message."
+    )
+
+
+def _botfather_commands_text() -> str:
+    return (
+        "start - Show command guide\n"
+        "help - Show all commands and examples\n"
+        "status - Show latest clone/export/index status\n"
+        "settings - Open runtime settings menu\n"
+        "clone - Clone messages from source topic to destination topic\n"
+        "export - Export topic/channel content to txt file\n"
+        "index - Generate clickable text index for a topic\n"
+        "cancel - Cancel running task or remove a queued clone\n"
+        "restart - Restart bot process\n"
+        "log - Send latest bot log file\n"
+        "login - Generate Telegram session string (admin only)"
+    )
+
+
+def _start_help_markup(bot_username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚙️ Add Commands in BotFather", callback_data="botfather:add")],
+            [InlineKeyboardButton("📋 Show BotFather Commands", callback_data="botfather:commands")],
+        ]
+    )
+
+
+def _botfather_add_steps(bot_username: str) -> str:
+    username = (bot_username or "").lstrip("@").strip()
+    bot_display = f"@{username}" if username else "<your_bot_username>"
+    return (
+        "<b>BotFather Setup Steps</b>\n\n"
+        "1) Open @BotFather\n"
+        "2) Send <code>/setcommands</code>\n"
+        f"3) Select your bot: <code>{_html(bot_display)}</code>\n"
+        "4) Send the command list from the <b>Show BotFather Commands</b> button\n"
+        "5) BotFather will confirm after saving."
     )
 
 
@@ -353,9 +406,36 @@ def _normalize_export_command(command_text: str) -> str:
     stripped = command_text.strip()
     if not stripped:
         return ""
-    if stripped.lower() in {"last", "resume"} or stripped.startswith("-"):
-        return stripped
-    return f"--topic-link {stripped}"
+
+    tokens = shlex.split(stripped)
+    if not tokens:
+        return ""
+    if len(tokens) == 1 and tokens[0].lower() in {"last", "resume"}:
+        return tokens[0]
+
+    normalized: list[str] = []
+    index = 0
+
+    first_token = tokens[0]
+    if not first_token.startswith("-"):
+        normalized.extend(["--topic-link", first_token])
+        index = 1
+
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--out":
+            index += 1
+            out_tokens: list[str] = []
+            while index < len(tokens) and not tokens[index].startswith("--"):
+                out_tokens.append(tokens[index])
+                index += 1
+            normalized.extend(["--out", " ".join(out_tokens).strip()])
+            continue
+
+        normalized.append(token)
+        index += 1
+
+    return " ".join(shlex.quote(token) for token in normalized)
 
 
 def _normalize_index_command(command_text: str) -> str:
@@ -387,6 +467,10 @@ ACTIVE_CLONE_CANCEL_EVENT: asyncio.Event | None = None
 ACTIVE_CLONE_LATEST_STATE: dict[str, Any] | None = None
 ACTIVE_EXPORT_TASK: asyncio.Task | None = None
 ACTIVE_INDEX_TASK: asyncio.Task | None = None
+CLONE_QUEUE_DOC_ID = "clone:queue"
+_clone_pending_jobs: list[dict[str, Any]] = []
+_clone_queue_cv = asyncio.Condition()
+CLONE_QUEUE_WORKER_TASK: asyncio.Task | None = None
 ACTIVE_STATUS_WATCH_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
 ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
@@ -414,6 +498,10 @@ BOT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "status_command_update_interval_sec": 5.0,
     "clone_default_delay_sec": 0.2,
     "clone_default_batch_size": 50,
+    "clone_filename_prefix_default": "",
+    "clone_filename_suffix_default": "",
+    "clone_text_prefix_default": "",
+    "clone_text_suffix_default": "",
     "clone_continue_on_error_default": False,
     "clone_hide_sender_name_default": False,
     "clone_auto_resume_enabled": True,
@@ -447,6 +535,10 @@ SETTINGS_CATEGORIES: dict[str, tuple[str, ...]] = {
         "clone_status_keepalive_interval_sec",
         "clone_default_delay_sec",
         "clone_default_batch_size",
+        "clone_filename_prefix_default",
+        "clone_filename_suffix_default",
+        "clone_text_prefix_default",
+        "clone_text_suffix_default",
         "clone_continue_on_error_default",
         "clone_hide_sender_name_default",
         "clone_auto_resume_enabled",
@@ -483,6 +575,10 @@ SETTINGS_KEY_LABELS: dict[str, str] = {
     "clone_status_keepalive_interval_sec": "Keepalive interval (sec)",
     "clone_default_delay_sec": "Default delay (sec)",
     "clone_default_batch_size": "Default batch size",
+    "clone_filename_prefix_default": "Filename prefix",
+    "clone_filename_suffix_default": "Filename suffix",
+    "clone_text_prefix_default": "Text prefix",
+    "clone_text_suffix_default": "Text suffix",
     "clone_continue_on_error_default": "Continue on error",
     "clone_hide_sender_name_default": "Hide sender name",
     "clone_auto_resume_enabled": "Auto-resume clone",
@@ -530,6 +626,10 @@ BOT_SETTINGS_HELP = (
     "- status_command_update_interval_sec\n"
     "- clone_default_delay_sec\n"
     "- clone_default_batch_size\n"
+    "- clone_filename_prefix_default\n"
+    "- clone_filename_suffix_default\n"
+    "- clone_text_prefix_default\n"
+    "- clone_text_suffix_default\n"
     "- clone_continue_on_error_default\n"
     "- clone_hide_sender_name_default\n"
     "- clone_auto_resume_enabled\n"
@@ -600,7 +700,15 @@ def _normalize_setting_value(key: str, value: Any) -> Any:
             _parse_admin_ids(raw)
         return raw
 
-    if key in {"tg_api_hash", "mongodb_database", "tg_session_string"}:
+    if key in {
+        "tg_api_hash",
+        "mongodb_database",
+        "tg_session_string",
+        "clone_filename_prefix_default",
+        "clone_filename_suffix_default",
+        "clone_text_prefix_default",
+        "clone_text_suffix_default",
+    }:
         return str(value).strip()
 
     return value
@@ -1200,6 +1308,161 @@ async def _reply_status_message(
         return None
 
 
+async def _send_clone_status_message(
+    bot: Client,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Any | None:
+    send_kw: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": enums.ParseMode.HTML,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        send_kw["reply_markup"] = reply_markup
+    if reply_to_message_id:
+        send_kw["reply_to_message_id"] = reply_to_message_id
+    try:
+        return await bot.send_message(**send_kw)
+    except FloodWait as exc:
+        wait_seconds = int(getattr(exc, "value", 0) or 0)
+        if wait_seconds <= MAX_STATUS_FLOOD_SLEEP_SEC:
+            await asyncio.sleep(wait_seconds + 1)
+            try:
+                return await bot.send_message(**send_kw)
+            except Exception:
+                logging.getLogger("heroku_bot").debug("clone status send retry failed", exc_info=True)
+                return None
+        logging.getLogger("heroku_bot").warning(
+            "skipping clone status send because Telegram requested a flood wait",
+            extra={"event": "clone_status_send_flood_wait_skipped", "wait_seconds": wait_seconds},
+        )
+        return None
+    except Exception:
+        logging.getLogger("heroku_bot").debug("clone status send failed", exc_info=True)
+        return None
+
+
+async def _save_clone_queue_snapshot(store: MongoStateStore, jobs: list[dict[str, Any]]) -> None:
+    body = {"jobs": jobs, "updated_at": time.time()}
+    try:
+        await store.save(CLONE_QUEUE_DOC_ID, body)
+    except Exception:
+        pass
+    _write_json_file(_snapshot_path("clone_queue"), body)
+
+
+async def _load_clone_queue_jobs_from_store(store: MongoStateStore) -> list[dict[str, Any]]:
+    try:
+        raw = await store.load(CLONE_QUEUE_DOC_ID)
+    except Exception:
+        raw = None
+    if raw is None:
+        snapshot = _read_json_file(_snapshot_path("clone_queue"))
+        raw = snapshot if isinstance(snapshot, dict) else None
+    jobs = raw.get("jobs") if isinstance(raw, dict) else None
+    if not isinstance(jobs, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for entry in jobs:
+        if isinstance(entry, dict) and entry.get("job_id") and isinstance(entry.get("payload"), dict):
+            cleaned.append(dict(entry))
+    return cleaned
+
+
+async def _hydrate_clone_queue_from_storage(store: MongoStateStore) -> None:
+    loaded = await _load_clone_queue_jobs_from_store(store)
+    async with _clone_queue_cv:
+        _clone_pending_jobs[:] = loaded
+
+
+async def _enqueue_clone_request(
+    *,
+    store: MongoStateStore,
+    bot: Client,
+    chat_id: int,
+    command_message_id: int | None,
+    payload: dict[str, Any],
+) -> tuple[str, int]:
+    job_id = str(uuid.uuid4())
+    job: dict[str, Any] = {
+        "job_id": job_id,
+        "payload": dict(payload),
+        "requested_chat_id": chat_id,
+        "requested_message_id": command_message_id,
+        "enqueued_at": time.time(),
+    }
+    async with _clone_queue_cv:
+        _clone_pending_jobs.append(job)
+        await _save_clone_queue_snapshot(store, list(_clone_pending_jobs))
+        position = len(_clone_pending_jobs)
+
+    short_id = job_id.split("-")[0]
+    notice_lines = [
+        "<b>Clone queued</b>",
+        "",
+        f"Position in queue: <b>{position}</b>",
+        f"Job id: <code>{_html(short_id)}</code>",
+        "",
+        "<i>You will receive the live progress panel when this job starts.</i>",
+    ]
+    notice_text = "\n".join(notice_lines)
+    sent = await _send_clone_status_message(
+        bot,
+        chat_id,
+        command_message_id,
+        notice_text,
+    )
+    async with _clone_queue_cv:
+        for entry in _clone_pending_jobs:
+            if entry.get("job_id") == job_id:
+                entry["notice_message_id"] = getattr(sent, "id", None) if sent is not None else None
+                break
+        await _save_clone_queue_snapshot(store, list(_clone_pending_jobs))
+        _clone_queue_cv.notify_all()
+
+    return job_id, position
+
+
+def _format_clone_queue_listing(jobs_snapshot: list[dict[str, Any]] | None = None) -> str:
+    jobs = jobs_snapshot if jobs_snapshot is not None else list(_clone_pending_jobs)
+    lines: list[str] = ["<b>Pending clone jobs</b>", ""]
+    if not jobs:
+        lines.append("No jobs are waiting in the queue.")
+        return "\n".join(lines)
+    for idx, job in enumerate(jobs, start=1):
+        jid = str(job.get("job_id", ""))
+        short = jid[:8] if jid else "?"
+        pl = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        src = str(pl.get("source_link") or "").strip() or "n/a"
+        if len(src) > 48:
+            src = src[:45] + "…"
+        lines.append(f"{idx}. <code>{_html(short)}</code> · {_html(src)}")
+    lines.append("")
+    lines.append("Remove with <code>/cancel clone queued &lt;job_id&gt;</code>")
+    return "\n".join(lines)
+
+
+async def _cancel_queued_clone_job_by_token(store: MongoStateStore, token: str) -> dict[str, Any] | None:
+    needle = token.strip().lower().replace("-", "")
+    if not needle:
+        return None
+    async with _clone_queue_cv:
+        for index, job in enumerate(_clone_pending_jobs):
+            jid = str(job.get("job_id", ""))
+            compact = jid.lower().replace("-", "")
+            if compact == needle or (len(needle) <= len(compact) and compact.startswith(needle)):
+                removed = _clone_pending_jobs.pop(index)
+                await _save_clone_queue_snapshot(store, list(_clone_pending_jobs))
+                _clone_queue_cv.notify_all()
+                return removed
+    return None
+
+
 def _status_task_title(state: dict[str, Any]) -> str:
     payload = state.get("payload") if isinstance(state.get("payload"), dict) else {}
     current = _safe_int(state.get("current_index"))
@@ -1306,10 +1569,12 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
     message_type = str(state.get("current_message_type") or "").strip()
     file_name = str(state.get("current_file_name") or "").strip()
 
+    title = "MSZ CLONE BOT BY ABDULLAH"
+    title_separator = "━" * len(title)
     lines = [
-        "━━━━━━━━━━━━━━━━",
-        "<b>MSZ CLONE BOT</b>",
-        "━━━━━━━━━━━━━━━━",
+        title_separator,
+        f"<b>{title}</b>",
+        title_separator,
         "",
         f"<b>1.</b> <b><i>{_html(_status_task_title(state))}</i></b>",
         "",
@@ -1365,6 +1630,70 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
 
 def _format_clone_status_with_stats(state: dict[str, Any]) -> str:
     return f"{_format_clone_status_panel(state)}\n\n{_format_bot_stats()}"
+
+
+def _clone_job_callback_token(job_id: str) -> str:
+    if not job_id:
+        return ""
+    return str(job_id).replace("-", "").lower()[:8]
+
+
+def _format_clone_queued_section(jobs: list[dict[str, Any]]) -> str:
+    if not jobs:
+        return ""
+    lines: list[str] = [
+        "☷ <b>Queued clone tasks</b>",
+        "",
+    ]
+    for idx, job in enumerate(jobs, start=1):
+        jid = str(job.get("job_id", ""))
+        short = _clone_job_callback_token(jid) or "?"
+        pl = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        src = str(pl.get("source_link") or "").strip() or "n/a"
+        if len(src) > 56:
+            src = src[:53] + "…"
+        req_name = str(pl.get("requested_by_name") or "").strip() or "Admin"
+        req_id = pl.get("requested_by_id")
+        who = (
+            f"<a href=\"tg://user?id={_html(req_id)}\">{_html(req_name)}</a>"
+            if req_id
+            else _html(req_name)
+        )
+        dst = str(pl.get("destination_link") or "").strip()
+        if len(dst) > 40:
+            dst = dst[:37] + "…"
+        dst_part = f"\n   ┠ <b>To</b> → <i>{_html(dst)}</i>" if dst else ""
+        lines.append(f"<b>{idx}.</b> <code>{_html(short)}</code> · <i>{_html(src)}</i>{dst_part}")
+        lines.append(f"   ┖ <b>By</b> {who}")
+    lines.extend(["", "<i>Use the Cancel buttons below or /cancel clone queued &lt;id&gt;</i>"])
+    return "\n".join(lines)
+
+
+def _format_clone_status_display(
+    clone_state: dict[str, Any] | None,
+    queue_jobs: list[dict[str, Any]],
+) -> str:
+    parts: list[str] = []
+    if clone_state:
+        parts.append(_format_clone_status_panel(clone_state))
+    elif queue_jobs:
+        title = "MSZ CLONE BOT BY ABDULLAH"
+        sep = "━" * len(title)
+        parts.extend(
+            [
+                sep,
+                f"<b>{title}</b>",
+                sep,
+                "",
+                "<i>No checkpoint on file; clone jobs below are waiting in the FIFO queue.</i>",
+            ]
+        )
+    else:
+        parts.append("<i>No saved clone state.</i>")
+    if queue_jobs:
+        parts.append(_format_clone_queued_section(queue_jobs))
+    parts.append(_format_bot_stats())
+    return "\n\n".join(parts)
 
 
 def _format_clone_completion_message(state: dict[str, Any]) -> str:
@@ -1596,23 +1925,43 @@ def _status_reply_markup(view: str = "main") -> InlineKeyboardMarkup:
     )
 
 
-def _clone_status_reply_markup(view: str = "main") -> InlineKeyboardMarkup:
-    if view == "overview":
-        return InlineKeyboardMarkup(
+def _clone_status_reply_markup(
+    view: str = "main",
+    queue_jobs: list[dict[str, Any]] | None = None,
+) -> InlineKeyboardMarkup:
+    q = queue_jobs or []
+    cancel_rows: list[list[InlineKeyboardButton]] = []
+    for idx, job in enumerate(q, start=1):
+        jid = str(job.get("job_id", "") or "")
+        token = _clone_job_callback_token(jid)
+        if not token:
+            continue
+        cancel_rows.append(
             [
-                [InlineKeyboardButton("Back", callback_data="clone_status:back")],
-                [InlineKeyboardButton("Close", callback_data="clone_status:close")],
+                InlineKeyboardButton(
+                    f"❌ Cancel queued {idx} · {token}",
+                    callback_data=f"clone_qc:{token}",
+                )
             ]
         )
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📜 TStats", callback_data="clone_status:tstats"),
-                InlineKeyboardButton("♻️ Refresh", callback_data="clone_status:refresh"),
-            ],
-            [InlineKeyboardButton("Close", callback_data="clone_status:close")],
+
+    if view == "overview":
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton("Back", callback_data="clone_status:back")],
         ]
-    )
+        rows.extend(cancel_rows)
+        rows.append([InlineKeyboardButton("Close", callback_data="clone_status:close")])
+        return InlineKeyboardMarkup(rows)
+
+    rows = [
+        [
+            InlineKeyboardButton("📜 TStats", callback_data="clone_status:tstats"),
+            InlineKeyboardButton("♻️ Refresh", callback_data="clone_status:refresh"),
+        ],
+    ]
+    rows.extend(cancel_rows)
+    rows.append([InlineKeyboardButton("Close", callback_data="clone_status:close")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _job_status_reply_markup(kind: str, phase: str) -> InlineKeyboardMarkup | None:
@@ -1623,7 +1972,7 @@ def _job_status_reply_markup(kind: str, phase: str) -> InlineKeyboardMarkup | No
     )
 
 
-def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
+def _format_tasks_overview(clone_state: dict[str, Any] | None, *, queued_clone_count: int = 0) -> str:
     phase = str((clone_state or {}).get("phase", "")).lower()
     transfer_stage = str((clone_state or {}).get("transfer_stage") or "").lower()
     is_running = phase == "running"
@@ -1633,6 +1982,7 @@ def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
     upload_count = 1 if is_running and transfer_stage == "upload" else 0
     clone_count = 1 if is_running and transfer_stage not in {"download", "upload"} else 0
     queued_dl_count = 1 if is_queued else 0
+    q_clone = max(int(queued_clone_count), 0)
 
     download_speed = "0B/s"
     upload_speed = "0B/s"
@@ -1649,7 +1999,7 @@ def _format_tasks_overview(clone_state: dict[str, Any] | None) -> str:
             f"┏ <b>Download</b>: {download_count} | <b>Upload</b>: {upload_count}",
             "┣ <b>Seed</b>: 0 | <b>Archive</b>: 0",
             "┣ <b>Extract</b>: 0 | <b>Split</b>: 0",
-            f"┣ <b>QueueDL</b>: {queued_dl_count} | <b>QueueUP</b>: 0",
+            f"┣ <b>QueueDL</b>: {queued_dl_count} | <b>QueueUP</b>: 0 | <b>CloneQ</b>: {q_clone}",
             "┣ <b>Clone</b>: "
             f"{clone_count} | <b>CheckUp</b>: 0",
             "┣ <b>Paused</b>: 0 | <b>SamVideo</b>: 0",
@@ -1703,13 +2053,20 @@ async def _load_status_view_text(store: MongoStateStore, view: str) -> tuple[str
     return _format_combined_status_text(clone_state, export_state, index_state), clone_state
 
 
-async def _load_clone_status_view_text(store: MongoStateStore, view: str) -> tuple[str, dict[str, Any] | None]:
+async def _load_clone_status_view_text(
+    store: MongoStateStore, view: str
+) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]]]:
     clone_state = await _load_state(store, "clone:last")
+    async with _clone_queue_cv:
+        queue_snap = list(_clone_pending_jobs)
     if view == "overview":
-        return _format_tasks_overview(clone_state), clone_state
-    if clone_state:
-        return _format_clone_status_with_stats(clone_state), clone_state
-    return f"No saved clone state.\n\n{_format_bot_stats()}", None
+        return (
+            _format_tasks_overview(clone_state, queued_clone_count=len(queue_snap)),
+            clone_state,
+            queue_snap,
+        )
+    text = _format_clone_status_display(clone_state, queue_snap)
+    return text, clone_state, queue_snap
 
 
 async def _run_export_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
@@ -1975,7 +2332,14 @@ async def _run_index_job(message, payload: dict[str, Any], store: MongoStateStor
             ACTIVE_INDEX_TASK = None
 
 
-async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStore) -> None:
+async def _run_clone_job(
+    *,
+    bot: Client,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    payload: dict[str, Any],
+    store: MongoStateStore,
+) -> None:
     global ACTIVE_CLONE_TASK, ACTIVE_CLONE_CANCEL_EVENT, ACTIVE_CLONE_LATEST_STATE
 
     ACTIVE_CLONE_CANCEL_EVENT = asyncio.Event()
@@ -1997,8 +2361,10 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     status_update_lock = asyncio.Lock()
     state_persist_lock = asyncio.Lock()
 
-    def _format_status_text(state: dict[str, Any]) -> str:
-        return _format_clone_status_with_stats(state)
+    async def _status_view_for_state(state: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
+        async with _clone_queue_cv:
+            q = list(_clone_pending_jobs)
+        return _format_clone_status_display(state, q), _clone_status_reply_markup("main", q)
 
     async def _save_state_inner(state: dict[str, Any]) -> None:
         global ACTIVE_CLONE_LATEST_STATE
@@ -2071,10 +2437,11 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         )
         if should_edit:
             async with status_update_lock:
+                body_text, markup = await _status_view_for_state(wrapper)
                 edited = await _edit_status_message(
                     status,
-                    _format_status_text(wrapper),
-                    reply_markup=_clone_status_reply_markup("main"),
+                    body_text,
+                    reply_markup=markup,
                     sleep_on_flood=False,
                 )
                 if edited:
@@ -2108,10 +2475,13 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
     last_persisted_success = 0
     last_persisted_failed = 0
     last_persisted_skipped = 0
-    status = await _reply_status_message(
-        message,
-        _format_status_text(queued_state),
-        reply_markup=_clone_status_reply_markup("main"),
+    queued_body, queued_markup = await _status_view_for_state(queued_state)
+    status = await _send_clone_status_message(
+        bot,
+        chat_id,
+        reply_to_message_id,
+        queued_body,
+        reply_markup=queued_markup,
     )
     try:
         success, failed = await run_clone(
@@ -2126,6 +2496,10 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             dry_run=bool(payload["dry_run"]),
             continue_on_error=bool(payload["continue_on_error"]),
             hide_sender_name=bool(payload["hide_sender_name"]),
+            filename_prefix=str(payload.get("filename_prefix", "") or ""),
+            filename_suffix=str(payload.get("filename_suffix", "") or ""),
+            text_prefix=str(payload.get("text_prefix", "") or ""),
+            text_suffix=str(payload.get("text_suffix", "") or ""),
             status_callback=_save_state_inner,
             cancel_event=ACTIVE_CLONE_CANCEL_EVENT,
         )
@@ -2163,10 +2537,11 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             cancelled_state,
         )
         ACTIVE_CLONE_LATEST_STATE = dict(cancelled_state)
+        cx_body, cx_markup = await _status_view_for_state(cancelled_state)
         await _edit_status_message(
             status,
-            _format_status_text(cancelled_state),
-            reply_markup=_clone_status_reply_markup("main"),
+            cx_body,
+            reply_markup=cx_markup,
         )
         raise
     except Exception as exc:
@@ -2203,10 +2578,11 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
             failed_state,
         )
         ACTIVE_CLONE_LATEST_STATE = dict(failed_state)
+        fx_body, fx_markup = await _status_view_for_state(failed_state)
         await _edit_status_message(
             status,
-            _format_status_text(failed_state),
-            reply_markup=_clone_status_reply_markup("main"),
+            fx_body,
+            reply_markup=fx_markup,
         )
         raise
     else:
@@ -2231,22 +2607,111 @@ async def _run_clone_job(message, payload: dict[str, Any], store: MongoStateStor
         await _save_clone_state(store, "last", result)
         ACTIVE_CLONE_LATEST_STATE = dict(result)
         latest_runtime_state = dict(result)
+        rx_body, rx_markup = await _status_view_for_state(result)
         await _edit_status_message(
             status,
-            _format_status_text(result),
-            reply_markup=_clone_status_reply_markup("main"),
+            rx_body,
+            reply_markup=rx_markup,
         )
         try:
-            await message.reply_text(
-                _format_clone_completion_message(result),
-                parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            completion_kw: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": _format_clone_completion_message(result),
+                "parse_mode": enums.ParseMode.HTML,
+                "disable_web_page_preview": True,
+            }
+            if reply_to_message_id:
+                completion_kw["reply_to_message_id"] = reply_to_message_id
+            await bot.send_message(**completion_kw)
         except Exception:
             logging.getLogger("heroku_bot").debug("clone completion notification failed", exc_info=True)
     finally:
         ACTIVE_CLONE_TASK = None
         ACTIVE_CLONE_CANCEL_EVENT = None
+
+
+async def _run_auto_resume_clone_if_needed(bot: Client, store: MongoStateStore, admin_ids: set[int]) -> None:
+    if ACTIVE_CLONE_TASK is not None and not ACTIVE_CLONE_TASK.done():
+        return
+
+    bot_settings = await _load_bot_settings(store)
+    if not bool(bot_settings.get("clone_auto_resume_enabled", True)):
+        return
+
+    state = await _load_state(store, "clone:last")
+    if not isinstance(state, dict):
+        return
+
+    payload = _resume_clone_payload_from_state(state)
+    if payload is None:
+        return
+
+    requested_by_id = _safe_int(payload.get("requested_by_id"))
+    target_chat_id = requested_by_id if requested_by_id in admin_ids else sorted(admin_ids)[0]
+    try:
+        await bot.send_message(
+            target_chat_id,
+            "Heroku restart detected an unfinished clone. Auto-resuming from the last saved checkpoint.",
+        )
+        await _run_clone_job(
+            bot=bot,
+            chat_id=target_chat_id,
+            reply_to_message_id=None,
+            payload=payload,
+            store=store,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.getLogger("heroku_bot").exception("auto resume clone failed")
+
+
+async def _clone_queue_worker(bot: Client, store: MongoStateStore, admin_ids: set[int]) -> None:
+    global CLONE_QUEUE_WORKER_TASK
+    CLONE_QUEUE_WORKER_TASK = asyncio.current_task()
+    try:
+        await _run_auto_resume_clone_if_needed(bot, store, admin_ids)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.getLogger("heroku_bot").exception("clone queue auto-resume failed")
+
+    while True:
+        async with _clone_queue_cv:
+            while not _clone_pending_jobs:
+                await _clone_queue_cv.wait()
+            job = _clone_pending_jobs.pop(0)
+            await _save_clone_queue_snapshot(store, list(_clone_pending_jobs))
+
+        chat_id = _safe_int(job.get("requested_chat_id"))
+        notice_mid = _safe_int(job.get("notice_message_id"))
+        payload = job.get("payload")
+        if chat_id <= 0 or not isinstance(payload, dict):
+            continue
+
+        if notice_mid > 0:
+            try:
+                await bot.edit_message_text(
+                    chat_id,
+                    notice_mid,
+                    "<i>Starting clone…</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        try:
+            await _run_clone_job(
+                bot=bot,
+                chat_id=chat_id,
+                reply_to_message_id=_safe_int(job.get("requested_message_id")) or None,
+                payload=payload,
+                store=store,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger("heroku_bot").exception("clone queue job failed")
 
 
 async def run_bot() -> None:
@@ -2283,47 +2748,13 @@ async def run_bot() -> None:
         in_memory=True,
     )
 
-    class StartupMessage:
-        def __init__(self, chat_id: int) -> None:
-            self.chat = type("ChatRef", (), {"id": chat_id})()
-
-        async def reply_text(self, text: str, **kwargs):
-            return await bot.send_message(self.chat.id, text, **kwargs)
-
     async def _authorized(message) -> bool:
         user = getattr(message, "from_user", None)
         user_id = getattr(user, "id", None)
         return isinstance(user_id, int) and user_id in admin_ids
 
-    async def _auto_resume_clone_after_start() -> None:
-        if ACTIVE_CLONE_TASK is not None and not ACTIVE_CLONE_TASK.done():
-            return
-
-        bot_settings = await _load_bot_settings(store)
-        if not bool(bot_settings.get("clone_auto_resume_enabled", True)):
-            return
-
-        state = await _load_state(store, "clone:last")
-        if not isinstance(state, dict):
-            return
-
-        payload = _resume_clone_payload_from_state(state)
-        if payload is None:
-            return
-
-        requested_by_id = _safe_int(payload.get("requested_by_id"))
-        target_chat_id = requested_by_id if requested_by_id in admin_ids else sorted(admin_ids)[0]
-        message = StartupMessage(target_chat_id)
-        try:
-            await bot.send_message(
-                target_chat_id,
-                "Heroku restart detected an unfinished clone. Auto-resuming from the last saved checkpoint.",
-            )
-            await _run_clone_job(message, payload, store)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logging.getLogger("heroku_bot").exception("auto resume clone failed")
+    def _authorized_user_id(user_id: Any) -> bool:
+        return isinstance(user_id, int) and user_id in admin_ids
 
     async def _send_restart_notification() -> None:
         payload = _read_json_file(RESTART_MESSAGE_FILE)
@@ -2368,8 +2799,8 @@ async def run_bot() -> None:
                 await asyncio.sleep(max(interval_sec, MIN_WATCHED_STATUS_INTERVAL_SEC))
                 view = ACTIVE_STATUS_VIEWS.get(key, "main")
                 if status_kind == "clone_status":
-                    text, clone_state = await _load_clone_status_view_text(store, view)
-                    reply_markup = _clone_status_reply_markup(view)
+                    text, clone_state, queue_snap = await _load_clone_status_view_text(store, view)
+                    reply_markup = _clone_status_reply_markup(view, queue_snap)
                 else:
                     text, clone_state = await _load_status_view_text(store, view)
                     reply_markup = _status_reply_markup(view)
@@ -2419,7 +2850,7 @@ async def run_bot() -> None:
 
         view = ACTIVE_STATUS_VIEWS.get(key, "main")
         if status_kind == "clone_status":
-            _, clone_state = await _load_clone_status_view_text(store, view)
+            _, clone_state, _ = await _load_clone_status_view_text(store, view)
         else:
             _, clone_state = await _load_status_view_text(store, view)
 
@@ -2447,14 +2878,70 @@ async def run_bot() -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
-        await message.reply_text(_bundle_help_text())
+        me = await client.get_me()
+        await message.reply_text(
+            f"{_bundle_help_text()}\n\n"
+            "<b>BotFather Setup</b>\n"
+            "Use the buttons below for BotFather steps and command file.",
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=_start_help_markup(getattr(me, "username", "") or ""),
+        )
 
     @bot.on_message(filters.private & filters.command("help", prefixes="/"))
     async def help_handler(client, message) -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
-        await message.reply_text(_bundle_help_text())
+        me = await client.get_me()
+        await message.reply_text(
+            f"{_bundle_help_text()}\n\n"
+            "<b>BotFather Setup</b>\n"
+            "Use the buttons below for BotFather steps and command file.",
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=_start_help_markup(getattr(me, "username", "") or ""),
+        )
+
+    @bot.on_callback_query(filters.regex(r"^botfather:add$"))
+    async def botfather_add_handler(client, callback_query) -> None:
+        message = callback_query.message
+        user_id = getattr(getattr(callback_query, "from_user", None), "id", None)
+        if message is None:
+            await callback_query.answer("Message not available.", show_alert=True)
+            return
+        if not _authorized_user_id(user_id):
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        me = await client.get_me()
+        await callback_query.answer("Sending BotFather steps...")
+        await message.reply_text(
+            _botfather_add_steps(getattr(me, "username", "") or ""),
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    @bot.on_callback_query(filters.regex(r"^botfather:commands$"))
+    async def botfather_commands_handler(client, callback_query) -> None:
+        message = callback_query.message
+        user_id = getattr(getattr(callback_query, "from_user", None), "id", None)
+        if message is None:
+            await callback_query.answer("Message not available.", show_alert=True)
+            return
+        if not _authorized_user_id(user_id):
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        _ensure_runtime_dirs()
+        commands_file = EXPORTS_DIR / "botfather_commands.txt"
+        commands_file.write_text(_botfather_commands_text() + "\n", encoding="utf-8")
+
+        await callback_query.answer("Sending BotFather commands file...")
+        await message.reply_document(
+            document=str(commands_file),
+            caption="BotFather commands txt file",
+        )
 
     @bot.on_message(filters.private & filters.command("status", prefixes="/"))
     async def status_handler(client, message) -> None:
@@ -2574,18 +3061,64 @@ async def run_bot() -> None:
 
         await callback_query.answer()
         ACTIVE_STATUS_VIEWS[key] = view
-        text, _ = await _load_clone_status_view_text(store, view)
+        text, _, queue_snap = await _load_clone_status_view_text(store, view)
         ACTIVE_STATUS_LAST_TEXTS[key] = text
         try:
             await _edit_status_message(
                 status_message,
                 text,
-                reply_markup=_clone_status_reply_markup(view),
+                reply_markup=_clone_status_reply_markup(view, queue_snap),
                 sleep_on_flood=False,
             )
         except Exception:
             pass
         await _ensure_status_watcher(status_message, text, "clone_status")
+
+    @bot.on_callback_query(filters.regex(r"^clone_qc:[0-9a-fA-F]+$"))
+    async def clone_queue_cancel_callback_handler(client, callback_query) -> None:
+        user = getattr(callback_query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int) or user_id not in admin_ids:
+            await callback_query.answer("Not authorized.", show_alert=True)
+            return
+
+        data = str(getattr(callback_query, "data", "") or "")
+        token = data.split(":", 1)[-1].strip()
+        removed = await _cancel_queued_clone_job_by_token(store, token)
+        if removed is None:
+            await callback_query.answer("Job not found or already started.", show_alert=True)
+            return
+
+        notice_mid = _safe_int(removed.get("notice_message_id"))
+        ch = _safe_int(removed.get("requested_chat_id"))
+        if ch and notice_mid:
+            try:
+                await client.edit_message_text(
+                    ch,
+                    notice_mid,
+                    "<i>This queued clone job was cancelled.</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        status_message = getattr(callback_query, "message", None)
+        if status_message is not None:
+            key = (status_message.chat.id, status_message.id)
+            view = ACTIVE_STATUS_VIEWS.get(key, "main")
+            text, _, queue_snap = await _load_clone_status_view_text(store, view)
+            ACTIVE_STATUS_LAST_TEXTS[key] = text
+            try:
+                await _edit_status_message(
+                    status_message,
+                    text,
+                    reply_markup=_clone_status_reply_markup(view, queue_snap),
+                    sleep_on_flood=False,
+                )
+            except Exception:
+                pass
+
+        await callback_query.answer("Removed from queue.")
 
     async def _finish_login_flow(user_id: int, login_client: Client, current_settings: dict[str, Any], message) -> None:
         session_string = await login_client.export_session_string()
@@ -3064,12 +3597,45 @@ async def run_bot() -> None:
             return
 
         parts = (message.text or "").split(maxsplit=1)
-        target = parts[1].strip().lower() if len(parts) > 1 else ""
-        if target and target not in {"clone", "export", "index"}:
-            await message.reply_text("Use /cancel clone, /cancel export, or /cancel index.")
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        tokens = rest.split()
+        kind = tokens[0].lower() if tokens else ""
+
+        if tokens and kind not in {"clone", "export", "index"}:
+            await message.reply_text(
+                "Use <code>/cancel clone</code>, <code>/cancel clone queued &lt;job_id&gt;</code>, "
+                "<code>/cancel export</code>, or <code>/cancel index</code>.",
+                parse_mode=enums.ParseMode.HTML,
+            )
             return
 
-        if target == "export":
+        if kind == "clone" and len(tokens) >= 3 and tokens[1].lower() == "queued":
+            job_token = tokens[2].strip()
+            removed = await _cancel_queued_clone_job_by_token(store, job_token)
+            if removed is None:
+                await message.reply_text("No matching queued clone job (check <code>/clone queue</code>).", parse_mode=enums.ParseMode.HTML)
+                return
+            jid = str(removed.get("job_id", ""))
+            short = jid[:8] if jid else "?"
+            await message.reply_text(
+                f"Removed queued clone job <code>{_html(short)}</code> from the queue.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            notice_mid = _safe_int(removed.get("notice_message_id"))
+            ch = _safe_int(removed.get("requested_chat_id"))
+            if ch and notice_mid:
+                try:
+                    await client.edit_message_text(
+                        ch,
+                        notice_mid,
+                        "<i>This queued clone job was cancelled.</i>",
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            return
+
+        if kind == "export":
             if ACTIVE_EXPORT_TASK is None or ACTIVE_EXPORT_TASK.done():
                 await message.reply_text("No active export task to cancel.")
                 return
@@ -3077,7 +3643,7 @@ async def run_bot() -> None:
             await message.reply_text("Export cancellation requested.")
             return
 
-        if target == "index":
+        if kind == "index":
             if ACTIVE_INDEX_TASK is None or ACTIVE_INDEX_TASK.done():
                 await message.reply_text("No active index task to cancel.")
                 return
@@ -3085,7 +3651,7 @@ async def run_bot() -> None:
             await message.reply_text("Index cancellation requested.")
             return
 
-        if target == "clone":
+        if kind == "clone":
             if ACTIVE_CLONE_CANCEL_EVENT is None or ACTIVE_CLONE_CANCEL_EVENT.is_set():
                 await message.reply_text("No active clone task to cancel.")
                 return
@@ -3311,17 +3877,27 @@ async def run_bot() -> None:
         command_text = parts[1].strip() if len(parts) > 1 else ""
 
         if command_text.lower() == "status":
-            text, _ = await _load_clone_status_view_text(store, "main")
+            text, _, queue_snap = await _load_clone_status_view_text(store, "main")
             sent = await message.reply_text(
                 text,
                 parse_mode=enums.ParseMode.HTML,
                 disable_web_page_preview=True,
-                reply_markup=_clone_status_reply_markup("main"),
+                reply_markup=_clone_status_reply_markup("main", queue_snap),
             )
             key = (sent.chat.id, sent.id)
             ACTIVE_STATUS_VIEWS[key] = "main"
             ACTIVE_STATUS_LAST_TEXTS[key] = text
             await _ensure_status_watcher(sent, text, "clone_status")
+            return
+
+        if command_text.lower() == "queue":
+            async with _clone_queue_cv:
+                snap = list(_clone_pending_jobs)
+            await message.reply_text(
+                _format_clone_queue_listing(snap),
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
             return
 
         bot_settings = await _load_bot_settings(store)
@@ -3372,6 +3948,18 @@ async def run_bot() -> None:
                 "hide_sender_name": parsed.hide_sender_name
                 if "--hide-sender-name" in normalized
                 else bool(bot_settings["clone_hide_sender_name_default"]),
+                "filename_prefix": parsed.filename_prefix
+                if "--filename-prefix" in normalized
+                else str(bot_settings["clone_filename_prefix_default"]),
+                "filename_suffix": parsed.filename_suffix
+                if "--filename-suffix" in normalized
+                else str(bot_settings["clone_filename_suffix_default"]),
+                "text_prefix": parsed.text_prefix
+                if "--text-prefix" in normalized
+                else str(bot_settings["clone_text_prefix_default"]),
+                "text_suffix": parsed.text_suffix
+                if "--text-suffix" in normalized
+                else str(bot_settings["clone_text_suffix_default"]),
             }
 
         user = getattr(message, "from_user", None)
@@ -3382,12 +3970,19 @@ async def run_bot() -> None:
             or getattr(user, "username", None)
             or "Admin"
         )
-        await _run_clone_job(message, payload, store)
+        await _enqueue_clone_request(
+            store=store,
+            bot=client,
+            chat_id=message.chat.id,
+            command_message_id=getattr(message, "id", None),
+            payload=payload,
+        )
 
     await bot.start()
     print("Heroku topic bot is running.")
+    await _hydrate_clone_queue_from_storage(store)
+    asyncio.create_task(_clone_queue_worker(bot, store, admin_ids))
     asyncio.create_task(_send_restart_notification())
-    asyncio.create_task(_auto_resume_clone_after_start())
     try:
         await asyncio.Event().wait()
     finally:
