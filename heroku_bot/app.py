@@ -613,6 +613,10 @@ MIN_CLONE_AUTO_EDIT_INTERVAL_SEC = 5.0
 MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC = 20.0
 MIN_WATCHED_STATUS_INTERVAL_SEC = 5.0
 MAX_STATUS_FLOOD_SLEEP_SEC = 30
+# Clone status panel includes queued jobs + cancel rows; Telegram text limit is 4096.
+MAX_CLONE_STATUS_QUEUE_ITEMS = 12
+# /clone queue text-only listing can also grow without bound.
+MAX_CLONE_QUEUE_LIST_ITEMS = 40
 
 BOT_SETTINGS_HELP = (
     "Settings commands:\n"
@@ -1507,7 +1511,10 @@ def _format_clone_queue_listing(jobs_snapshot: list[dict[str, Any]] | None = Non
     if not jobs:
         lines.append("No jobs are waiting in the queue.")
         return "\n".join(lines)
-    for idx, job in enumerate(jobs, start=1):
+    total = len(jobs)
+    cap = min(total, MAX_CLONE_QUEUE_LIST_ITEMS)
+    shown = jobs[:cap]
+    for idx, job in enumerate(shown, start=1):
         jid = str(job.get("job_id", ""))
         short = jid[:8] if jid else "?"
         pl = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -1519,6 +1526,8 @@ def _format_clone_queue_listing(jobs_snapshot: list[dict[str, Any]] | None = Non
             lines.append(f"   ┖ <b>Destination</b> → <i>{_html(dst)}</i>")
         else:
             lines.append("   ┖ <b>Destination</b> → <i>n/a</i>")
+    if total > cap:
+        lines.append(f"<i>… showing {cap} of {total} jobs.</i>")
     lines.append("")
     lines.append("Remove with <code>/cancel clone queued &lt;job_id&gt;</code>")
     return "\n".join(lines)
@@ -1718,11 +1727,14 @@ def _clone_job_callback_token(job_id: str) -> str:
 def _format_clone_queued_section(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return ""
+    total = len(jobs)
+    cap = min(total, MAX_CLONE_STATUS_QUEUE_ITEMS)
+    visible = jobs[:cap]
     lines: list[str] = [
         "☷ <b>Queued clone tasks</b>",
         "",
     ]
-    for idx, job in enumerate(jobs, start=1):
+    for idx, job in enumerate(visible, start=1):
         jid = str(job.get("job_id", ""))
         short = _clone_job_callback_token(jid) or "?"
         pl = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -1743,6 +1755,10 @@ def _format_clone_queued_section(jobs: list[dict[str, Any]]) -> str:
         )
         lines.append(f"<b>{idx}.</b> <code>{_html(short)}</code> · <i>{_html(src)}</i>{dst_part}")
         lines.append(f"   ┖ <b>By</b> {who}")
+    if total > cap:
+        lines.append(
+            f"<i>… and {total - cap} more in queue (full list: <code>/clone queue</code>)</i>"
+        )
     lines.extend(["", "<i>Use the Cancel buttons below or /cancel clone queued &lt;id&gt;</i>"])
     return "\n".join(lines)
 
@@ -2007,7 +2023,7 @@ def _clone_status_reply_markup(
     view: str = "main",
     queue_jobs: list[dict[str, Any]] | None = None,
 ) -> InlineKeyboardMarkup:
-    q = queue_jobs or []
+    q = (queue_jobs or [])[:MAX_CLONE_STATUS_QUEUE_ITEMS]
     cancel_rows: list[list[InlineKeyboardButton]] = []
     for idx, job in enumerate(q, start=1):
         jid = str(job.get("job_id", "") or "")
@@ -4007,16 +4023,57 @@ async def run_bot() -> None:
 
         if command_text.lower() == "status":
             text, _, queue_snap = await _load_clone_status_view_text(store, "main")
-            sent = await message.reply_text(
-                text,
-                parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=_clone_status_reply_markup("main", queue_snap),
-            )
+            markup = _clone_status_reply_markup("main", queue_snap)
+            try:
+                sent = await message.reply_text(
+                    text,
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=markup,
+                )
+            except FloodWait as exc:
+                wait_s = int(getattr(exc, "value", 0) or 0)
+                if wait_s <= MAX_STATUS_FLOOD_SLEEP_SEC:
+                    await asyncio.sleep(wait_s + 1)
+                    try:
+                        sent = await message.reply_text(
+                            text,
+                            parse_mode=enums.ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_markup=markup,
+                        )
+                    except Exception:
+                        sent = None
+                    if sent is None:
+                        sent = await message.reply_text(
+                            "<b>Clone status</b> could not be sent (still rate-limited). "
+                            "Use <code>/status</code> for the clone section.",
+                            parse_mode=enums.ParseMode.HTML,
+                        )
+                else:
+                    logging.getLogger("heroku_bot").warning(
+                        "clone status reply FloodWait %ss; sending short fallback",
+                        wait_s,
+                    )
+                    sent = await message.reply_text(
+                        "<b>Clone status</b> is temporarily rate-limited. "
+                        "Use <code>/status</code> for the clone section, or try again shortly.",
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+            except RPCError as exc:
+                logging.getLogger("heroku_bot").exception("clone status reply failed: %s", exc)
+                sent = await message.reply_text(
+                    "<b>Could not send clone status panel</b> (Telegram rejected the message). "
+                    "Use <code>/status</code> for the clone block, or <code>/clone queue</code> for pending jobs.",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+            if sent is None:
+                return
             key = (sent.chat.id, sent.id)
             ACTIVE_STATUS_VIEWS[key] = "main"
             ACTIVE_STATUS_LAST_TEXTS[key] = text
-            await _ensure_status_watcher(sent, text, "clone_status")
+            if getattr(sent, "reply_markup", None):
+                await _ensure_status_watcher(sent, text, "clone_status")
             return
 
         if command_text.lower() == "queue":
