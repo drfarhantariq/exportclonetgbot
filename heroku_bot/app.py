@@ -2749,6 +2749,20 @@ async def _run_auto_resume_clone_if_needed(bot: Client, store: MongoStateStore, 
             target_chat_id,
             "Heroku restart detected an unfinished clone. Auto-resuming from the last saved checkpoint.",
         )
+    except FloodWait as exc:
+        wait_s = int(getattr(exc, "value", 0) or 0)
+        logging.getLogger("heroku_bot").warning(
+            "auto-resume DM skipped (Telegram FloodWait %ss); resuming clone from checkpoint anyway",
+            wait_s,
+            extra={"event": "auto_resume_notify_flood_wait", "wait_seconds": wait_s},
+        )
+    except (RPCError, OSError, Exception):
+        logging.getLogger("heroku_bot").info(
+            "auto-resume DM failed; resuming clone from checkpoint anyway",
+            exc_info=True,
+        )
+
+    try:
         await _run_clone_job(
             bot=bot,
             chat_id=target_chat_id,
@@ -2759,7 +2773,7 @@ async def _run_auto_resume_clone_if_needed(bot: Client, store: MongoStateStore, 
     except asyncio.CancelledError:
         raise
     except Exception:
-        logging.getLogger("heroku_bot").exception("auto resume clone failed")
+        logging.getLogger("heroku_bot").exception("auto resume clone job failed")
 
 
 async def _clone_queue_worker(bot: Client, store: MongoStateStore, admin_ids: set[int]) -> None:
