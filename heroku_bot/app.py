@@ -45,8 +45,10 @@ from pyrogram.errors import (
 )
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from clone_topic_by_link import run_clone
+from clone_topic_by_link import _build_endpoint_labels, _resolve_endpoints, run_clone
+from config import ConfigError, load_settings
 from export_topic_list import run_export, run_index
+from telegram_client import TelegramService
 
 DEFAULT_UPLOAD_TOPIC_LINK = "https://t.me/c/3541699273/38603/38604"
 DEFAULT_CONFIG_PATH = BUNDLE_DIR / "config.yaml"
@@ -1308,6 +1310,71 @@ async def _reply_status_message(
         return None
 
 
+class _BotEditableMessage:
+    """Wrap a bot-owned DM message so _edit_status_message can drive it like a Pyrogram Message."""
+
+    __slots__ = ("_bot", "chat", "id")
+
+    def __init__(self, bot: Client, chat_id: int, message_id: int) -> None:
+        self._bot = bot
+        self.chat = type("_ChatRef", (), {"id": chat_id})()
+        self.id = message_id
+
+    async def edit_text(
+        self,
+        text: str,
+        *,
+        parse_mode: Any = None,
+        disable_web_page_preview: bool = True,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> Any:
+        return await self._bot.edit_message_text(
+            self.chat.id,
+            self.id,
+            text=text,
+            parse_mode=parse_mode or enums.ParseMode.HTML,
+            disable_web_page_preview=disable_web_page_preview,
+            reply_markup=reply_markup,
+        )
+
+
+async def _fetch_clone_topic_labels_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve forum chat/topic titles for queue display (best-effort, short-lived user session)."""
+    merged = dict(payload)
+    source_link = str(merged.get("source_link") or "").strip()
+    destination_link = str(merged.get("destination_link") or "").strip()
+    config_path = str(merged.get("config_path") or "").strip()
+    if not source_link or not destination_link or not config_path:
+        return merged
+    try:
+        settings, _ = load_settings(config_path)
+    except (ConfigError, OSError, ValueError, RuntimeError):
+        return merged
+    try:
+        endpoints = _resolve_endpoints(
+            source_link,
+            destination_link,
+            int(merged.get("start_id") or 0),
+        )
+    except (ValueError, TypeError):
+        return merged
+    telegram = TelegramService(settings, logger=logging.getLogger("topic_clone"), receive_updates=False)
+    try:
+        await telegram.start()
+        await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
+        await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
+        labels = await _build_endpoint_labels(telegram, endpoints)
+        merged.update(labels)
+    except Exception:
+        logging.getLogger("heroku_bot").debug("clone topic label prefetch failed", exc_info=True)
+    finally:
+        try:
+            await telegram.stop()
+        except Exception:
+            pass
+    return merged
+
+
 async def _send_clone_status_message(
     bot: Client,
     chat_id: int,
@@ -1388,10 +1455,11 @@ async def _enqueue_clone_request(
     command_message_id: int | None,
     payload: dict[str, Any],
 ) -> tuple[str, int]:
+    enriched = await _fetch_clone_topic_labels_for_payload(dict(payload))
     job_id = str(uuid.uuid4())
     job: dict[str, Any] = {
         "job_id": job_id,
-        "payload": dict(payload),
+        "payload": enriched,
         "requested_chat_id": chat_id,
         "requested_message_id": command_message_id,
         "enqueued_at": time.time(),
@@ -1402,13 +1470,18 @@ async def _enqueue_clone_request(
         position = len(_clone_pending_jobs)
 
     short_id = job_id.split("-")[0]
+    src_l = _format_clone_endpoint(enriched, "source") or str(enriched.get("source_link") or "").strip() or "n/a"
+    dst_l = _format_clone_endpoint(enriched, "destination") or str(enriched.get("destination_link") or "").strip() or "n/a"
     notice_lines = [
         "<b>Clone queued</b>",
         "",
         f"Position in queue: <b>{position}</b>",
         f"Job id: <code>{_html(short_id)}</code>",
         "",
-        "<i>You will receive the live progress panel when this job starts.</i>",
+        f"<b>Source</b> → <i>{_html(src_l)}</i>",
+        f"<b>Destination</b> → <i>{_html(dst_l)}</i>",
+        "",
+        "<i>This message will update with the live progress panel when your job is active.</i>",
     ]
     notice_text = "\n".join(notice_lines)
     sent = await _send_clone_status_message(
@@ -1438,10 +1511,14 @@ def _format_clone_queue_listing(jobs_snapshot: list[dict[str, Any]] | None = Non
         jid = str(job.get("job_id", ""))
         short = jid[:8] if jid else "?"
         pl = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-        src = str(pl.get("source_link") or "").strip() or "n/a"
-        if len(src) > 48:
-            src = src[:45] + "…"
-        lines.append(f"{idx}. <code>{_html(short)}</code> · {_html(src)}")
+        src = _format_clone_endpoint(pl, "source") or str(pl.get("source_link") or "").strip() or "n/a"
+        dst = _format_clone_endpoint(pl, "destination") or str(pl.get("destination_link") or "").strip() or ""
+        lines.append(f"{idx}. <code>{_html(short)}</code>")
+        lines.append(f"   ┠ <b>Source</b> → <i>{_html(src)}</i>")
+        if dst:
+            lines.append(f"   ┖ <b>Destination</b> → <i>{_html(dst)}</i>")
+        else:
+            lines.append("   ┖ <b>Destination</b> → <i>n/a</i>")
     lines.append("")
     lines.append("Remove with <code>/cancel clone queued &lt;job_id&gt;</code>")
     return "\n".join(lines)
@@ -1649,9 +1726,14 @@ def _format_clone_queued_section(jobs: list[dict[str, Any]]) -> str:
         jid = str(job.get("job_id", ""))
         short = _clone_job_callback_token(jid) or "?"
         pl = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-        src = str(pl.get("source_link") or "").strip() or "n/a"
+        src = _format_clone_endpoint(pl, "source") or str(pl.get("source_link") or "").strip() or "n/a"
+        dst = _format_clone_endpoint(pl, "destination") or str(pl.get("destination_link") or "").strip() or ""
         if len(src) > 56:
             src = src[:53] + "…"
+        dst_part = ""
+        if dst:
+            dshow = dst if len(dst) <= 48 else dst[:45] + "…"
+            dst_part = f"\n   ┠ <b>To</b> → <i>{_html(dshow)}</i>"
         req_name = str(pl.get("requested_by_name") or "").strip() or "Admin"
         req_id = pl.get("requested_by_id")
         who = (
@@ -1659,10 +1741,6 @@ def _format_clone_queued_section(jobs: list[dict[str, Any]]) -> str:
             if req_id
             else _html(req_name)
         )
-        dst = str(pl.get("destination_link") or "").strip()
-        if len(dst) > 40:
-            dst = dst[:37] + "…"
-        dst_part = f"\n   ┠ <b>To</b> → <i>{_html(dst)}</i>" if dst else ""
         lines.append(f"<b>{idx}.</b> <code>{_html(short)}</code> · <i>{_html(src)}</i>{dst_part}")
         lines.append(f"   ┖ <b>By</b> {who}")
     lines.extend(["", "<i>Use the Cancel buttons below or /cancel clone queued &lt;id&gt;</i>"])
@@ -2339,6 +2417,7 @@ async def _run_clone_job(
     reply_to_message_id: int | None,
     payload: dict[str, Any],
     store: MongoStateStore,
+    reuse_status_message_id: int | None = None,
 ) -> None:
     global ACTIVE_CLONE_TASK, ACTIVE_CLONE_CANCEL_EVENT, ACTIVE_CLONE_LATEST_STATE
 
@@ -2476,13 +2555,30 @@ async def _run_clone_job(
     last_persisted_failed = 0
     last_persisted_skipped = 0
     queued_body, queued_markup = await _status_view_for_state(queued_state)
-    status = await _send_clone_status_message(
-        bot,
-        chat_id,
-        reply_to_message_id,
-        queued_body,
-        reply_markup=queued_markup,
-    )
+    status: Any | None = None
+    reuse_mid = _safe_int(reuse_status_message_id)
+    if reuse_mid > 0:
+        ref = _BotEditableMessage(bot, chat_id, reuse_mid)
+        try:
+            await ref.edit_text(
+                queued_body,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=queued_markup,
+            )
+            status = ref
+        except Exception:
+            logging.getLogger("heroku_bot").debug(
+                "clone status reuse edit failed, sending new status message", exc_info=True
+            )
+    if status is None:
+        status = await _send_clone_status_message(
+            bot,
+            chat_id,
+            reply_to_message_id,
+            queued_body,
+            reply_markup=queued_markup,
+        )
     try:
         success, failed = await run_clone(
             source_link=payload["source_link"],
@@ -2689,17 +2785,6 @@ async def _clone_queue_worker(bot: Client, store: MongoStateStore, admin_ids: se
         if chat_id <= 0 or not isinstance(payload, dict):
             continue
 
-        if notice_mid > 0:
-            try:
-                await bot.edit_message_text(
-                    chat_id,
-                    notice_mid,
-                    "<i>Starting clone…</i>",
-                    parse_mode=enums.ParseMode.HTML,
-                )
-            except Exception:
-                pass
-
         try:
             await _run_clone_job(
                 bot=bot,
@@ -2707,6 +2792,7 @@ async def _clone_queue_worker(bot: Client, store: MongoStateStore, admin_ids: se
                 reply_to_message_id=_safe_int(job.get("requested_message_id")) or None,
                 payload=payload,
                 store=store,
+                reuse_status_message_id=notice_mid if notice_mid > 0 else None,
             )
         except asyncio.CancelledError:
             raise
