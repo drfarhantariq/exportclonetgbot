@@ -2450,6 +2450,7 @@ async def _run_clone_job(
         nonlocal last_status_edit_at, last_reported_success, last_reported_index, last_reported_flood_wait_until
         nonlocal last_persisted_at, last_persisted_success, last_persisted_failed, last_persisted_skipped, last_persisted_flood_wait_until
         nonlocal latest_state_payload, latest_runtime_state
+        nonlocal status, sticky_chat_id, sticky_message_id
         wrapper = dict(state)
         if isinstance(state.get("payload"), dict):
             wrapper["payload"] = state["payload"]
@@ -2507,8 +2508,16 @@ async def _run_clone_job(
             MIN_CLONE_KEEPALIVE_EDIT_INTERVAL_SEC,
         )
 
+        rebind_orphan_panel = (
+            status is None
+            and sticky_message_id
+            and sticky_chat_id
+            and now - last_status_edit_at >= 5.0
+        )
+
         should_edit = (
-            phase != "running"
+            rebind_orphan_panel
+            or phase != "running"
             or flood_wait_changed
             or (success_changed and now - last_status_edit_at >= success_interval)
             or (progress_changed and now - last_status_edit_at >= progress_interval)
@@ -2517,12 +2526,26 @@ async def _run_clone_job(
         if should_edit:
             async with status_update_lock:
                 body_text, markup = await _status_view_for_state(wrapper)
-                edited = await _edit_status_message(
-                    status,
-                    body_text,
-                    reply_markup=markup,
-                    sleep_on_flood=False,
-                )
+                edited = False
+                if status is not None:
+                    edited = await _edit_status_message(
+                        status,
+                        body_text,
+                        reply_markup=markup,
+                        sleep_on_flood=False,
+                    )
+                elif sticky_message_id and sticky_chat_id:
+                    ref = _BotEditableMessage(bot, sticky_chat_id, sticky_message_id)
+                    edited = await _edit_status_message(
+                        ref,
+                        body_text,
+                        reply_markup=markup,
+                        sleep_on_flood=True,
+                    )
+                    if edited:
+                        status = ref
+                        sticky_chat_id = None
+                        sticky_message_id = None
                 if edited:
                     last_status_edit_at = now
                     last_reported_success = success
@@ -2556,21 +2579,21 @@ async def _run_clone_job(
     last_persisted_skipped = 0
     queued_body, queued_markup = await _status_view_for_state(queued_state)
     status: Any | None = None
+    sticky_chat_id: int | None = None
+    sticky_message_id: int | None = None
     reuse_mid = _safe_int(reuse_status_message_id)
     if reuse_mid > 0:
         ref = _BotEditableMessage(bot, chat_id, reuse_mid)
-        try:
-            await ref.edit_text(
-                queued_body,
-                parse_mode=enums.ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=queued_markup,
-            )
+        if await _edit_status_message(
+            ref,
+            queued_body,
+            reply_markup=queued_markup,
+            sleep_on_flood=True,
+        ):
             status = ref
-        except Exception:
-            logging.getLogger("heroku_bot").debug(
-                "clone status reuse edit failed, sending new status message", exc_info=True
-            )
+        else:
+            sticky_chat_id = chat_id
+            sticky_message_id = reuse_mid
     if status is None:
         status = await _send_clone_status_message(
             bot,
@@ -2579,6 +2602,24 @@ async def _run_clone_job(
             queued_body,
             reply_markup=queued_markup,
         )
+        if status is not None:
+            sticky_chat_id = None
+            sticky_message_id = None
+
+    last_status_edit_at = time.time()
+
+    async def _paint_clone_status_terminal(body: str, markup: InlineKeyboardMarkup) -> None:
+        nonlocal status, sticky_chat_id, sticky_message_id
+        if status is not None:
+            await _edit_status_message(status, body, reply_markup=markup, sleep_on_flood=True)
+            return
+        if sticky_message_id and sticky_chat_id:
+            ref = _BotEditableMessage(bot, sticky_chat_id, sticky_message_id)
+            if await _edit_status_message(ref, body, reply_markup=markup, sleep_on_flood=True):
+                status = ref
+                sticky_chat_id = None
+                sticky_message_id = None
+
     try:
         success, failed = await run_clone(
             source_link=payload["source_link"],
@@ -2634,11 +2675,7 @@ async def _run_clone_job(
         )
         ACTIVE_CLONE_LATEST_STATE = dict(cancelled_state)
         cx_body, cx_markup = await _status_view_for_state(cancelled_state)
-        await _edit_status_message(
-            status,
-            cx_body,
-            reply_markup=cx_markup,
-        )
+        await _paint_clone_status_terminal(cx_body, cx_markup)
         raise
     except Exception as exc:
         failed_state = {
@@ -2675,11 +2712,7 @@ async def _run_clone_job(
         )
         ACTIVE_CLONE_LATEST_STATE = dict(failed_state)
         fx_body, fx_markup = await _status_view_for_state(failed_state)
-        await _edit_status_message(
-            status,
-            fx_body,
-            reply_markup=fx_markup,
-        )
+        await _paint_clone_status_terminal(fx_body, fx_markup)
         raise
     else:
         result = {
@@ -2704,11 +2737,7 @@ async def _run_clone_job(
         ACTIVE_CLONE_LATEST_STATE = dict(result)
         latest_runtime_state = dict(result)
         rx_body, rx_markup = await _status_view_for_state(result)
-        await _edit_status_message(
-            status,
-            rx_body,
-            reply_markup=rx_markup,
-        )
+        await _paint_clone_status_terminal(rx_body, rx_markup)
         try:
             completion_kw: dict[str, Any] = {
                 "chat_id": chat_id,
