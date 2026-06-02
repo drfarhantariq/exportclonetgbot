@@ -1,0 +1,29 @@
+# Telegram folder index
+# topic_link: https://t.me/c/3541699273/105135/105136
+# topic_title: Prepladder RR Version X
+# start_message_id: 105135
+# Syntax:
+# [x] <message_id> | <P/S/S1/S2> | <folder name>
+# P = parent, S = subfolder, S1/S2/etc = deeper subfolders
+# Disable a folder heading with [ ]
+
+[ ] 105136 | P | Prepladder RR Version X
+[x] 105148 | P | Anatomy 👆
+[x] 105158 | P | Physiology 👆
+[x] 105172 | P | Biochemistry 👆'
+[x] 105204 | P | Pathology 👆
+[x] 105221 | P | Pharmacology 👆
+[x] 105244 | P | Microbiology 👆
+[x] 105268 | P | FMT 👆
+[x] 105319 | P | PSM 👆
+[x] 105369 | P | Ophthalmology 👆
+[x] 105409 | P | OBG 👆
+[x] 105467 | P | Surgery 👆
+[x] 105499 | P | Paediatrics 👆
+[x] 105531 | P | Medicine 👆
+[x] 105552 | P | Radiology 👆
+[x] 105558 | P | Anaesthesia 👆
+[x] 105586 | P | Orthopaedics 👆
+[x] 105620 | P | Psychiatry 👆
+[x] 105648 | P | Dermatology 👆
+[ ] 105650 | P | DONE

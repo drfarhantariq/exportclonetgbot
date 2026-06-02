@@ -476,6 +476,17 @@ CLONE_QUEUE_WORKER_TASK: asyncio.Task | None = None
 ACTIVE_STATUS_WATCH_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 ACTIVE_STATUS_VIEWS: dict[tuple[int, int], str] = {}
 ACTIVE_STATUS_LAST_TEXTS: dict[tuple[int, int], str] = {}
+
+
+def _cancel_status_watcher_for_message(chat_id: int, message_id: int) -> None:
+    key = (chat_id, message_id)
+    task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
+    if task is not None and not task.done():
+        task.cancel()
+    ACTIVE_STATUS_VIEWS.pop(key, None)
+    ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
+
+
 ACTIVE_LOGIN_FLOWS: dict[int, dict[str, Any]] = {}
 SETTINGS_PAGE_SIZE = 10
 
@@ -1365,7 +1376,8 @@ async def _fetch_clone_topic_labels_for_payload(payload: dict[str, Any]) -> dict
     telegram = TelegramService(settings, logger=logging.getLogger("topic_clone"), receive_updates=False)
     try:
         await telegram.start()
-        await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
+        if endpoints.source_topic_id is not None:
+            await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
         await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
         labels = await _build_endpoint_labels(telegram, endpoints)
         merged.update(labels)
@@ -1416,6 +1428,31 @@ async def _send_clone_status_message(
     except Exception:
         logging.getLogger("heroku_bot").debug("clone status send failed", exc_info=True)
         return None
+
+
+async def _remove_clone_live_status_message(
+    bot: Client,
+    status: Any | None,
+    *,
+    sticky_chat_id: int | None = None,
+    sticky_message_id: int | None = None,
+) -> None:
+    """Delete the live clone progress panel so only the completion summary remains."""
+    targets: list[tuple[int, int]] = []
+    if status is not None:
+        targets.append((status.chat.id, status.id))
+    elif sticky_chat_id and sticky_message_id:
+        targets.append((sticky_chat_id, sticky_message_id))
+    for chat_id, message_id in targets:
+        _cancel_status_watcher_for_message(chat_id, message_id)
+        try:
+            await bot.delete_messages(chat_id, message_id)
+        except Exception:
+            logging.getLogger("heroku_bot").debug(
+                "clone live status delete failed",
+                exc_info=True,
+                extra={"event": "clone_live_status_delete_failed", "chat_id": chat_id, "message_id": message_id},
+            )
 
 
 async def _save_clone_queue_snapshot(store: MongoStateStore, jobs: list[dict[str, Any]]) -> None:
@@ -2752,8 +2789,15 @@ async def _run_clone_job(
         await _save_clone_state(store, "last", result)
         ACTIVE_CLONE_LATEST_STATE = dict(result)
         latest_runtime_state = dict(result)
-        rx_body, rx_markup = await _status_view_for_state(result)
-        await _paint_clone_status_terminal(rx_body, rx_markup)
+        await _remove_clone_live_status_message(
+            bot,
+            status,
+            sticky_chat_id=sticky_chat_id,
+            sticky_message_id=sticky_message_id,
+        )
+        status = None
+        sticky_chat_id = None
+        sticky_message_id = None
         try:
             completion_kw: dict[str, Any] = {
                 "chat_id": chat_id,
@@ -2984,9 +3028,7 @@ async def run_bot() -> None:
                 ACTIVE_STATUS_LAST_TEXTS.pop(key, None)
 
     def _cancel_status_watcher(key: tuple[int, int]) -> None:
-        task = ACTIVE_STATUS_WATCH_TASKS.pop(key, None)
-        if task is not None and not task.done():
-            task.cancel()
+        _cancel_status_watcher_for_message(key[0], key[1])
 
     async def _ensure_status_watcher(status_message, last_text: str, status_kind: str) -> None:
         key = (status_message.chat.id, status_message.id)

@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -26,7 +27,11 @@ from message_classifier import (
 )
 from models import MessageKind
 from telegram_client import TelegramService
-from topic_utils import build_private_topic_link, parse_private_topic_link
+from topic_utils import (
+    build_private_topic_link,
+    parse_private_chat_message_link,
+    parse_private_topic_link,
+)
 
 
 HEROKU_RUNTIME_DIR = Path(os.getenv("HEROKU_RUNTIME_DIR", "heroku_runtime")).expanduser().resolve()
@@ -41,7 +46,7 @@ MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "bot_state").strip()
 @dataclass(frozen=True)
 class CloneEndpoints:
     source_chat_id: int
-    source_topic_id: int
+    source_topic_id: int | None
     source_start_message_id: int
     destination_chat_id: int
     destination_topic_id: int
@@ -296,6 +301,65 @@ def _message_file_name(message: Any | None) -> str | None:
     return None
 
 
+def _sanitize_filename_component(value: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", str(value or ""))
+    cleaned = cleaned.replace("\x00", "")
+    return cleaned.strip().strip(".")
+
+
+def _split_name_and_extension(file_name: str) -> tuple[str, str]:
+    path = Path(file_name)
+    extension = "".join(path.suffixes)
+    if extension and file_name.endswith(extension):
+        stem = file_name[: -len(extension)]
+    else:
+        stem = file_name
+        extension = ""
+    return stem or "file", extension
+
+
+def _apply_filename_affixes_to_name(file_name: str, prefix: str, suffix: str) -> str:
+    safe_original = _sanitize_filename_component(file_name) or "file"
+    stem, extension = _split_name_and_extension(safe_original)
+    safe_prefix = _sanitize_filename_component(prefix)
+    safe_suffix = _sanitize_filename_component(suffix)
+    updated_stem = f"{safe_prefix}{stem}{safe_suffix}".strip() or stem
+    return f"{updated_stem}{extension}"
+
+
+def _build_upload_file_path(
+    downloaded_file: Path,
+    source_message: Any,
+    filename_prefix: str,
+    filename_suffix: str,
+) -> Path:
+    if not filename_prefix and not filename_suffix:
+        return downloaded_file
+
+    source_name = _message_file_name(source_message) or downloaded_file.name
+    target_name = _apply_filename_affixes_to_name(source_name, filename_prefix, filename_suffix)
+    target_path = downloaded_file.with_name(target_name)
+    if target_path == downloaded_file:
+        return downloaded_file
+
+    unique_target = target_path
+    counter = 1
+    while unique_target.exists():
+        stem, extension = _split_name_and_extension(target_name)
+        unique_target = downloaded_file.with_name(f"{stem}_{counter}{extension}")
+        counter += 1
+
+    downloaded_file.rename(unique_target)
+    return unique_target
+
+
+def _apply_text_affixes(text: str, prefix: str, suffix: str) -> str:
+    raw = str(text or "")
+    if not prefix and not suffix:
+        return raw
+    return f"{prefix}{raw}{suffix}"
+
+
 async def _save_clone_status(
     status_callback: Optional[StatusCallback],
     phase: str,
@@ -439,6 +503,23 @@ class MongoStateStore:
         return payload
 
 
+def _parse_source_link_or_fail(link: str):
+    stripped = link.strip()
+    if not stripped:
+        raise ValueError("source link is required")
+    try:
+        return parse_private_topic_link(stripped)
+    except ValueError:
+        pass
+    try:
+        return parse_private_chat_message_link(stripped)
+    except ValueError as exc:
+        raise ValueError(
+            "Invalid source link format. Expected: "
+            "https://t.me/c/<chat>/<topic>/<message> or https://t.me/c/<chat>/<message>"
+        ) from exc
+
+
 def _parse_topic_link_or_fail(label: str, link: str):
     stripped = link.strip()
     if not stripped:
@@ -456,14 +537,19 @@ def _prompt_topic_link(label: str, initial_value: str) -> str:
         return initial_value.strip()
 
     while True:
-        value = input(
-            f"Enter {label} topic link (https://t.me/c/<chat>/<topic>/<message>): "
-        ).strip()
+        expected = "https://t.me/c/<chat>/<topic>/<message>"
+        if label == "source":
+            expected += " or https://t.me/c/<chat>/<message>"
+        prompt_label = "source link" if label == "source" else f"{label} topic link"
+        value = input(f"Enter {prompt_label} ({expected}): ").strip()
         if not value:
-            print(f"{label} topic link is required.")
+            print(f"{prompt_label.capitalize()} is required.")
             continue
         try:
-            _parse_topic_link_or_fail(label, value)
+            if label == "source":
+                _parse_source_link_or_fail(value)
+            else:
+                _parse_topic_link_or_fail(label, value)
             return value
         except ValueError as exc:
             print(str(exc))
@@ -474,7 +560,7 @@ def _resolve_endpoints(
     destination_link: str,
     start_id_override: int,
 ) -> CloneEndpoints:
-    source = _parse_topic_link_or_fail("source", source_link)
+    source = _parse_source_link_or_fail(source_link)
     destination = _parse_topic_link_or_fail("destination", destination_link)
 
     start_message_id = start_id_override if start_id_override > 0 else source.message_id
@@ -483,7 +569,7 @@ def _resolve_endpoints(
 
     return CloneEndpoints(
         source_chat_id=source.chat_id,
-        source_topic_id=source.topic_id,
+        source_topic_id=getattr(source, "topic_id", None),
         source_start_message_id=start_message_id,
         destination_chat_id=destination.chat_id,
         destination_topic_id=destination.topic_id,
@@ -494,6 +580,8 @@ async def _clone_message_with_hidden_sender(
     telegram: TelegramService,
     endpoints: CloneEndpoints,
     source_message: Any,
+    text_prefix: str = "",
+    text_suffix: str = "",
     reporter: WzmlTransferReporter | None = None,
 ) -> Any | None:
     if source_message is None or getattr(source_message, "empty", False):
@@ -502,6 +590,7 @@ async def _clone_message_with_hidden_sender(
     classification = classify_message(source_message)
     if classification.kind == MessageKind.TEXT:
         text, entities, disable_preview = extract_text_payload(source_message)
+        text = _apply_text_affixes(text, text_prefix, text_suffix)
         return await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
@@ -520,6 +609,10 @@ async def _download_and_upload_message(
     telegram: TelegramService,
     source_message: Any,
     endpoints: CloneEndpoints,
+    filename_prefix: str = "",
+    filename_suffix: str = "",
+    text_prefix: str = "",
+    text_suffix: str = "",
     reporter: WzmlTransferReporter | None = None,
 ) -> Any:
     if source_message is None or getattr(source_message, "empty", False):
@@ -531,6 +624,7 @@ async def _download_and_upload_message(
     # Protected text-only messages cannot be downloaded; repost text directly.
     if classification.kind == MessageKind.TEXT:
         text, entities, disable_preview = extract_text_payload(source_message)
+        text = _apply_text_affixes(text, text_prefix, text_suffix)
         return await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
@@ -576,12 +670,18 @@ async def _download_and_upload_message(
             raise RuntimeError("Failed to download restricted media")
 
         downloaded_file = await _resolve_downloaded_media_file(download_result)
+        upload_file = _build_upload_file_path(
+            downloaded_file,
+            source_message,
+            filename_prefix=filename_prefix,
+            filename_suffix=filename_suffix,
+        )
 
         sent_message = await telegram.send_downloaded_media_to_topic(
             chat_id=endpoints.destination_chat_id,
             topic_id=endpoints.destination_topic_id,
             source_message=source_message,
-            file_path=downloaded_file,
+            file_path=upload_file,
             caption=caption,
             caption_entities=caption_entities,
             progress=reporter.on_upload_progress if reporter else None,
@@ -645,12 +745,17 @@ async def _clone_restricted_message(
     telegram: TelegramService,
     endpoints: CloneEndpoints,
     source_message: Any,
+    filename_prefix: str = "",
+    filename_suffix: str = "",
+    text_prefix: str = "",
+    text_suffix: str = "",
     reporter: WzmlTransferReporter | None = None,
 ) -> Any:
     classification = classify_message(source_message)
 
     if classification.kind == MessageKind.TEXT:
         text, entities, disable_preview = extract_text_payload(source_message)
+        text = _apply_text_affixes(text, text_prefix, text_suffix)
         return await telegram.send_text_to_topic(
             endpoints.destination_chat_id,
             endpoints.destination_topic_id,
@@ -659,7 +764,16 @@ async def _clone_restricted_message(
             disable_web_page_preview=disable_preview,
         )
 
-    return await _download_and_upload_message(telegram, source_message, endpoints, reporter=reporter)
+    return await _download_and_upload_message(
+        telegram,
+        source_message,
+        endpoints,
+        filename_prefix=filename_prefix,
+        filename_suffix=filename_suffix,
+        text_prefix=text_prefix,
+        text_suffix=text_suffix,
+        reporter=reporter,
+    )
 
 
 def _build_destination_message_link(endpoints: CloneEndpoints, destination_message_id: int | None) -> str | None:
@@ -675,14 +789,17 @@ def _build_destination_message_link(endpoints: CloneEndpoints, destination_messa
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Clone messages from a source Telegram topic to a destination topic using "
-            "private topic links."
+            "Clone messages from a source Telegram topic or channel to a destination "
+            "topic using private Telegram links."
         )
     )
     parser.add_argument(
         "--source-link",
         default="",
-        help="Source topic link: https://t.me/c/<chat>/<topic>/<message>",
+        help=(
+            "Source topic or channel message link: "
+            "https://t.me/c/<chat>/<topic>/<message> or https://t.me/c/<chat>/<message>"
+        ),
     )
     parser.add_argument(
         "--destination-link",
@@ -748,6 +865,26 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--filename-prefix",
+        default="",
+        help="Prefix added to uploaded media filenames (default: none)",
+    )
+    parser.add_argument(
+        "--filename-suffix",
+        default="",
+        help="Suffix added to uploaded media filenames (default: none)",
+    )
+    parser.add_argument(
+        "--text-prefix",
+        default="",
+        help="Prefix added to cloned text messages (default: none)",
+    )
+    parser.add_argument(
+        "--text-suffix",
+        default="",
+        help="Suffix added to cloned text messages (default: none)",
+    )
+    parser.add_argument(
         "--bot-mode",
         action="store_true",
         help="Run as a Telegram bot for Heroku control instead of the CLI flow",
@@ -780,6 +917,10 @@ async def _clone_topic_messages(
     dry_run: bool,
     continue_on_error: bool,
     hide_sender_name: bool,
+    filename_prefix: str,
+    filename_suffix: str,
+    text_prefix: str,
+    text_suffix: str,
     payload: dict[str, Any],
     status_callback: Optional[StatusCallback] = None,
     cancel_event: Optional[asyncio.Event] = None,
@@ -793,6 +934,15 @@ async def _clone_topic_messages(
 
     if explicit_message_ids:
         source_ids = explicit_message_ids
+    elif endpoints.source_topic_id is None:
+        source_ids = await telegram.list_chat_message_ids(
+            chat_id=endpoints.source_chat_id,
+            start_from_message_id=endpoints.source_start_message_id,
+            batch_size=batch_size,
+        )
+        source_ids = sorted(set(source_ids))
+        if limit > 0:
+            source_ids = source_ids[:limit]
     else:
         source_ids = await telegram.list_topic_message_ids(
             chat_id=endpoints.source_chat_id,
@@ -896,6 +1046,12 @@ async def _clone_topic_messages(
 
                 current_message_type = _message_media_type(source_message)
                 current_file_name = _message_file_name(source_message)
+                if current_file_name and (filename_prefix or filename_suffix):
+                    current_file_name = _apply_filename_affixes_to_name(
+                        current_file_name,
+                        filename_prefix,
+                        filename_suffix,
+                    )
                 progress_state.update(
                     {
                         "current_message_type": current_message_type,
@@ -932,6 +1088,12 @@ async def _clone_topic_messages(
                             )
                             current_message_type = _message_media_type(source_message)
                             current_file_name = _message_file_name(source_message)
+                            if current_file_name and (filename_prefix or filename_suffix):
+                                current_file_name = _apply_filename_affixes_to_name(
+                                    current_file_name,
+                                    filename_prefix,
+                                    filename_suffix,
+                                )
                         reporter = WzmlTransferReporter(
                             source_message_id=source_message_id,
                             index=index,
@@ -948,22 +1110,57 @@ async def _clone_topic_messages(
                             telegram,
                             endpoints,
                             source_message,
+                            text_prefix=text_prefix,
+                            text_suffix=text_suffix,
                             reporter=reporter,
                         )
 
                     if copied_with_hidden_sender is not None:
                         destination_message = copied_with_hidden_sender
                     else:
-                        try:
-                            destination_message = await telegram.copy_message_to_topic(
-                                chat_id=endpoints.destination_chat_id,
-                                from_chat_id=endpoints.source_chat_id,
-                                topic_id=endpoints.destination_topic_id,
-                                message_id=source_message_id,
+                        force_customization = bool(
+                            filename_prefix or filename_suffix or text_prefix or text_suffix
+                        )
+                        force_text_repost = bool(text_prefix or text_suffix) and current_message_type == "Text"
+                        if force_text_repost and source_message is None:
+                            source_message = await telegram.get_message(
+                                endpoints.source_chat_id,
+                                source_message_id,
                             )
-                        except Exception as exc:
-                            if not isinstance(exc, ChatForwardsRestricted) and not _is_uncopyable_message_error(exc):
-                                raise
+                            current_message_type = _message_media_type(source_message)
+                            current_file_name = _message_file_name(source_message)
+                            if current_file_name and (filename_prefix or filename_suffix):
+                                current_file_name = _apply_filename_affixes_to_name(
+                                    current_file_name,
+                                    filename_prefix,
+                                    filename_suffix,
+                                )
+                        if force_text_repost and _is_skippable_unsupported_message(source_message):
+                            raise SkippedMessageError(_unsupported_message_reason(source_message))
+                        if force_text_repost:
+                            reporter = WzmlTransferReporter(
+                                source_message_id=source_message_id,
+                                index=index,
+                                total_messages=total_messages,
+                                success=success,
+                                failed=failed,
+                                skipped=skipped,
+                                payload=payload,
+                                status_callback=status_callback,
+                                message_type=current_message_type,
+                                file_name=current_file_name,
+                            )
+                            destination_message = await _clone_restricted_message(
+                                telegram,
+                                endpoints,
+                                source_message,
+                                filename_prefix=filename_prefix,
+                                filename_suffix=filename_suffix,
+                                text_prefix=text_prefix,
+                                text_suffix=text_suffix,
+                                reporter=reporter,
+                            )
+                        elif force_customization:
                             used_restricted_media_fallback = True
                             if source_message is None:
                                 source_message = await telegram.get_message(
@@ -988,8 +1185,53 @@ async def _clone_topic_messages(
                                 telegram,
                                 endpoints,
                                 source_message,
+                                filename_prefix=filename_prefix,
+                                filename_suffix=filename_suffix,
+                                text_prefix=text_prefix,
+                                text_suffix=text_suffix,
                                 reporter=reporter,
                             )
+                        else:
+                            try:
+                                destination_message = await telegram.copy_message_to_topic(
+                                    chat_id=endpoints.destination_chat_id,
+                                    from_chat_id=endpoints.source_chat_id,
+                                    topic_id=endpoints.destination_topic_id,
+                                    message_id=source_message_id,
+                                )
+                            except Exception as exc:
+                                if not isinstance(exc, ChatForwardsRestricted) and not _is_uncopyable_message_error(exc):
+                                    raise
+                                used_restricted_media_fallback = True
+                                if source_message is None:
+                                    source_message = await telegram.get_message(
+                                        endpoints.source_chat_id,
+                                        source_message_id,
+                                    )
+                                if _is_skippable_unsupported_message(source_message):
+                                    raise SkippedMessageError(_unsupported_message_reason(source_message))
+                                reporter = WzmlTransferReporter(
+                                    source_message_id=source_message_id,
+                                    index=index,
+                                    total_messages=total_messages,
+                                    success=success,
+                                    failed=failed,
+                                    skipped=skipped,
+                                    payload=payload,
+                                    status_callback=status_callback,
+                                    message_type=current_message_type,
+                                    file_name=current_file_name,
+                                )
+                                destination_message = await _clone_restricted_message(
+                                    telegram,
+                                    endpoints,
+                                    source_message,
+                                    filename_prefix=filename_prefix,
+                                    filename_suffix=filename_suffix,
+                                    text_prefix=text_prefix,
+                                    text_suffix=text_suffix,
+                                    reporter=reporter,
+                                )
                     print(f"[{index}/{total_messages}] cloned source message {source_message_id}")
                 success += 1
                 destination_message_id = getattr(destination_message, "id", None)
@@ -1114,6 +1356,10 @@ def _build_clone_payload(args: argparse.Namespace) -> dict[str, Any]:
         "dry_run": args.dry_run,
         "continue_on_error": args.continue_on_error,
         "hide_sender_name": args.hide_sender_name,
+        "filename_prefix": args.filename_prefix,
+        "filename_suffix": args.filename_suffix,
+        "text_prefix": args.text_prefix,
+        "text_suffix": args.text_suffix,
     }
 
 
@@ -1133,16 +1379,24 @@ async def _build_endpoint_labels(
         telegram.get_chat(endpoints.source_chat_id),
         telegram.get_chat(endpoints.destination_chat_id),
     )
-    source_topic_title, destination_topic_title = await asyncio.gather(
-        telegram.get_forum_topic_title(endpoints.source_chat_id, endpoints.source_topic_id),
-        telegram.get_forum_topic_title(endpoints.destination_chat_id, endpoints.destination_topic_id),
-    )
+    if endpoints.source_topic_id is None:
+        source_topic_title = None
+        destination_topic_title = await telegram.get_forum_topic_title(
+            endpoints.destination_chat_id,
+            endpoints.destination_topic_id,
+        )
+    else:
+        source_topic_title, destination_topic_title = await asyncio.gather(
+            telegram.get_forum_topic_title(endpoints.source_chat_id, endpoints.source_topic_id),
+            telegram.get_forum_topic_title(endpoints.destination_chat_id, endpoints.destination_topic_id),
+        )
 
     return {
         "source_chat_id": endpoints.source_chat_id,
         "source_chat_title": _chat_display_name(source_chat),
         "source_topic_id": endpoints.source_topic_id,
-        "source_topic_title": source_topic_title or f"Topic {endpoints.source_topic_id}",
+        "source_topic_title": source_topic_title
+        or (f"Topic {endpoints.source_topic_id}" if endpoints.source_topic_id is not None else "Channel messages"),
         "destination_chat_id": endpoints.destination_chat_id,
         "destination_chat_title": _chat_display_name(destination_chat),
         "destination_topic_id": endpoints.destination_topic_id,
@@ -1162,6 +1416,10 @@ async def run_clone(
     dry_run: bool,
     continue_on_error: bool,
     hide_sender_name: bool,
+    filename_prefix: str = "",
+    filename_suffix: str = "",
+    text_prefix: str = "",
+    text_suffix: str = "",
     status_callback: Optional[StatusCallback] = None,
     cancel_event: Optional[asyncio.Event] = None,
 ) -> tuple[int, int]:
@@ -1179,7 +1437,8 @@ async def run_clone(
         await telegram.start()
 
         # Validate source and destination topics before the clone loop.
-        await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
+        if endpoints.source_topic_id is not None:
+            await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
         await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
         endpoint_labels = await _build_endpoint_labels(telegram, endpoints)
 
@@ -1193,6 +1452,10 @@ async def run_clone(
             dry_run=dry_run,
             continue_on_error=continue_on_error,
             hide_sender_name=hide_sender_name,
+            filename_prefix=filename_prefix,
+            filename_suffix=filename_suffix,
+            text_prefix=text_prefix,
+            text_suffix=text_suffix,
             payload={
                 "source_link": source_link,
                 "destination_link": destination_link,
@@ -1206,6 +1469,10 @@ async def run_clone(
                 "dry_run": dry_run,
                 "continue_on_error": continue_on_error,
                 "hide_sender_name": hide_sender_name,
+                "filename_prefix": filename_prefix,
+                "filename_suffix": filename_suffix,
+                "text_prefix": text_prefix,
+                "text_suffix": text_suffix,
             },
             status_callback=status_callback,
             cancel_event=cancel_event,
@@ -1292,6 +1559,10 @@ async def _run_clone_bot(args: argparse.Namespace) -> int:
                 dry_run=bool(payload["dry_run"]),
                 continue_on_error=bool(payload["continue_on_error"]),
                 hide_sender_name=bool(payload["hide_sender_name"]),
+                filename_prefix=str(payload.get("filename_prefix", "") or ""),
+                filename_suffix=str(payload.get("filename_suffix", "") or ""),
+                text_prefix=str(payload.get("text_prefix", "") or ""),
+                text_suffix=str(payload.get("text_suffix", "") or ""),
                 status_callback=lambda state: _save_state("running", state),
                 cancel_event=active_cancel_event,
             )
@@ -1332,7 +1603,7 @@ async def _run_clone_bot(args: argparse.Namespace) -> int:
                 parsed = _build_parser().parse_args(shlex.split(command_text))
             except SystemExit:
                 await message.reply_text(
-                    "Usage: /clone --source-link <link> --destination-link <link> [--start-id N] [--limit N] [--delay-sec S] [--batch-size N] [--message-ids 1,2,3] [--dry-run] [--continue-on-error] [--hide-sender-name]"
+                    "Usage: /clone --source-link <link> --destination-link <link> [--start-id N] [--limit N] [--delay-sec S] [--batch-size N] [--message-ids 1,2,3] [--dry-run] [--continue-on-error] [--hide-sender-name] [--filename-prefix TEXT] [--filename-suffix TEXT] [--text-prefix TEXT] [--text-suffix TEXT]"
                 )
                 return
             payload = _build_clone_payload(parsed)
@@ -1413,6 +1684,10 @@ def main() -> int:
                 dry_run=args.dry_run,
                 continue_on_error=args.continue_on_error,
                 hide_sender_name=args.hide_sender_name,
+                filename_prefix=args.filename_prefix,
+                filename_suffix=args.filename_suffix,
+                text_prefix=args.text_prefix,
+                text_suffix=args.text_suffix,
             )
         )
     except KeyboardInterrupt:

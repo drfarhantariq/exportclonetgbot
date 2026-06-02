@@ -146,6 +146,70 @@ Optional:
 - `HYPER_MAX_FLOOD_WAIT` to stop helper-client downloads and fall back when Telegram asks for a long wait
 - `LOG_FILE_PATH` for the file sent by `/log`
 
+## MSZ Hybrid Uploader
+
+The `MSZDRIVE_uploader` package uploads to `cloud.medicalstudyzone.com` with a hybrid route: files below `MSZ_API_MAX_BYTES` use the MSZ API, while larger files use Playwright/Chromium browser automation.
+
+Set these values in local `.env` or Heroku config vars:
+
+```bash
+MSZ_BASE_URL=https://cloud.medicalstudyzone.com
+MSZ_API_TOKEN=...
+MSZ_EMAIL=...
+MSZ_PASSWORD=...
+MSZ_API_MAX_BYTES=100000000
+PLAYWRIGHT_CHROMIUM_EXECUTABLE=/usr/bin/chromium
+```
+
+Examples:
+
+```bash
+python -m MSZDRIVE_uploader.msz_upload --source local --path /tmp/files --target-folder CoreBTR
+python -m MSZDRIVE_uploader.msz_upload --source gdrive --url "https://drive.google.com/drive/folders/..." --target-folder TestUpload
+python -m MSZDRIVE_uploader.msz_upload --source telegram-topic --topic-link "https://t.me/c/..." --target-folder TopicUpload
+```
+
+For large browser uploads, pass `--browser-folder-url` or set `MSZ_BROWSER_FOLDER_URL` when you want Playwright to open an existing MSZ folder URL before selecting the file.
+
+## MSZ to Google Drive Reverse Sync
+
+The reverse sync downloads from MSZ Drive and uploads to Google Drive with the same core approach used by WZML: Google Drive API v3, OAuth `token.pickle`, folder creation, and resumable `MediaFileUpload` chunks of `100 MB`.
+
+Set these values in local `.env` or Heroku config vars:
+
+```bash
+MSZ_BASE_URL=https://cloud.medicalstudyzone.com
+MSZ_API_TOKEN=...
+GDRIVE_TOKEN_PICKLE=/path/to/token.pickle
+GDRIVE_FOLDER_ID=...
+```
+
+Choose the MSZ source with one of:
+
+```bash
+MSZ_SOURCE_PATH=TestUpload
+MSZ_SOURCE_ID=
+MSZ_SOURCE_URL=
+```
+
+Short examples:
+
+```bash
+python -m MSZDRIVE_uploader.msz_to_gdrive "https://cloud.medicalstudyzone.com/drive/folders/ODQwMDl8cGFkZA"
+python -m MSZDRIVE_uploader.msz_to_gdrive "https://cloud.medicalstudyzone.com/drive/folders/ODQwMDl8cGFkZA" "<folder_id>"
+python -m MSZDRIVE_uploader.msz_to_gdrive TestUpload
+```
+
+Explicit examples:
+
+```bash
+python -m MSZDRIVE_uploader.msz_to_gdrive --msz-source-path "TestUpload" --gdrive-folder-id "<folder_id>"
+python -m MSZDRIVE_uploader.msz_to_gdrive --msz-source-id "<msz_folder_id>" --gdrive-folder-id "<folder_id>"
+python -m MSZDRIVE_uploader.msz_to_gdrive --msz-source-path "TestUpload" --gdrive-folder-id "<folder_id>" --retry-failed-only
+```
+
+The sync preserves MSZ folder structure under the Google Drive destination folder, processes one file at a time, keeps partial `.part` downloads for resume, and verifies Google Drive uploads by file size.
+
 ## WZML-Style Fast Telegram Transfers
 
 For the helper-client downloader to work reliably, create a dump chat and add:

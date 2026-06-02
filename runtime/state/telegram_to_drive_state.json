@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "files": {
+    "105137|gdrive|Prepladder RR Version X/2 - General Histology.mp4|57102142": {
+      "status": "uploaded",
+      "message_id": 105137,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/2 - General Histology.mp4",
+      "size": 57102142,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:22:57.816131Z",
+      "remote_id": "1W7f6Ze5lgQPJd3o575aE9kkWRCP6sLWe"
+    },
+    "105138|gdrive|Prepladder RR Version X/3 - Types of Joint and Epiphysis.mp4|68707283": {
+      "status": "uploading",
+      "message_id": 105138,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/3 - Types of Joint and Epiphysis.mp4",
+      "size": 68707283,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:23:16.828135Z",
+      "local_path": "/workspaces/exportclonetgbot/runtime/telegram_to_drive_staging/105138_3 - Types of Joint and Epiphysis"
+    },
+    "105137|gdrive|Prepladder RR Version X/Anatomy 👆/2 - General Histology.mp4|57102142": {
+      "status": "uploaded",
+      "message_id": 105137,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/2 - General Histology.mp4",
+      "size": 57102142,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:37:15.337821Z",
+      "remote_id": "1uLjtYLjG47j6cr5JVVOoDBitPqF0FhSj"
+    },
+    "105138|gdrive|Prepladder RR Version X/Anatomy 👆/3 - Types of Joint and Epiphysis.mp4|68707283": {
+      "status": "uploaded",
+      "message_id": 105138,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/3 - Types of Joint and Epiphysis.mp4",
+      "size": 68707283,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:37:44.811580Z",
+      "remote_id": "1JkDCHhSRhAHjJQjLXtJUwoiggGRGrW8i"
+    },
+    "105139|gdrive|Prepladder RR Version X/Anatomy 👆/1 - Embryology.mp4|319527316": {
+      "status": "uploaded",
+      "message_id": 105139,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/1 - Embryology.mp4",
+      "size": 319527316,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:38:33.268208Z",
+      "remote_id": "1y0oPeDc7R_Ft9p5KaLXh4Cvacf2Iq_7O"
+    },
+    "105140|gdrive|Prepladder RR Version X/Anatomy 👆/6 - Pelvis and Perineum.mp4|55389790": {
+      "status": "uploaded",
+      "message_id": 105140,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/6 - Pelvis and Perineum.mp4",
+      "size": 55389790,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:38:51.523684Z",
+      "remote_id": "1s5kAZRhumcHNZvETRykvZFF_R6PJhOdk"
+    },
+    "105141|gdrive|Prepladder RR Version X/Anatomy 👆/5 - Abdomen.mp4|139665182": {
+      "status": "uploaded",
+      "message_id": 105141,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/5 - Abdomen.mp4",
+      "size": 139665182,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:39:24.279116Z",
+      "remote_id": "1C6HR1UGPx5Enhf-LCMLE-hBjE0pCC5b8"
+    },
+    "105142|gdrive|Prepladder RR Version X/Anatomy 👆/4 - Upper Limb.mp4|230518221": {
+      "status": "uploaded",
+      "message_id": 105142,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/4 - Upper Limb.mp4",
+      "size": 230518221,
+      "attempts": 1,
+      "updated_at": "2026-05-27T12:39:54.979972Z",
+      "remote_id": "1Mmc56ewsOXKe15R8OKTZHBDNx9TS7_Ux"
+    },
+    "105143|gdrive|Prepladder RR Version X/Anatomy 👆/7 - Lower Limb|205757399": {
+      "status": "failed",
+      "message_id": 105143,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/7 - Lower Limb",
+      "size": 205757399,
+      "attempts": 0,
+      "updated_at": "2026-05-27T12:41:02.514657Z",
+      "error": "Hyper Telegram download returned no file."
+    },
+    "105138|gdrive|Prepladder RR Version X/Anatomy 👆/3 - Types of Joint and Epiphysis|68707283": {
+      "status": "failed",
+      "message_id": 105138,
+      "target": "gdrive",
+      "destination_path": "Prepladder RR Version X/Anatomy 👆/3 - Types of Joint and Epiphysis",
+      "size": 68707283,
+      "attempts": 0,
+      "updated_at": "2026-05-27T12:45:50.777270Z",
+      "error": "Hyper Telegram download returned no file."
+    }
+  },
+  "updated_at": "2026-05-27T12:45:50.777337Z"
+}

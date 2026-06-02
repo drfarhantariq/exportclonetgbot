@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "files": {
+    "TestUpload/1. Upper Limb.MP4": {
+      "status": "failed",
+      "size": 434983159,
+      "mtime": 1779728183,
+      "retries": 4,
+      "last_error": "Browser upload finished, but API verification did not find: TestUpload/1. Upper Limb.MP4. Set --browser-folder-url to the correct MSZ folder URL or use --no-verify-remote.",
+      "updated_at": "2026-05-26T09:49:24.312155Z"
+    },
+    "TestUpload/10. Video Lesson 10.MP4": {
+      "status": "failed",
+      "size": 234700192,
+      "mtime": 1779732321,
+      "retries": 2,
+      "last_error": "BrowserContext.close: Target page, context or browser has been closed",
+      "updated_at": "2026-05-26T09:35:39.263072Z"
+    }
+  },
+  "updated_at": "2026-05-26T09:49:24.312210Z"
+}

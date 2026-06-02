@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from asyncio import CancelledError, Event, TimeoutError as AsyncTimeoutError, create_task, gather, sleep, wait_for
+from asyncio import CancelledError, Event, Lock, TimeoutError as AsyncTimeoutError, create_task, gather, sleep, wait_for
 from contextlib import suppress
 from datetime import datetime
 from math import ceil, floor
@@ -41,10 +41,11 @@ class HyperTGDownload:
         self.dump_chat = None
         self.download_dir = "downloads/"
         self.directory = None
-        self.num_parts = hyper_threads or max(8, len(self.clients))
+        self.num_parts = hyper_threads or self._default_num_parts(len(self.clients))
         self.max_flood_wait = int(os.getenv("HYPER_MAX_FLOOD_WAIT", "120") or 120)
         self.cache_file_ref: dict[int, Any] = {}
         self.cache_last_access: dict[int, float] = {}
+        self.cache_locks: dict[int, Lock] = {}
         self.cache_max_size = 100
         self._processed_bytes = 0
         self.file_size = 0
@@ -52,7 +53,17 @@ class HyperTGDownload:
         self.file_name = ""
         self._cancel_event = Event()
         self.session_pool: dict[tuple[int, int], Session] = {}
+        self.session_locks: dict[tuple[int, int], Lock] = {}
         self._cache_task = create_task(self._clean_cache())
+
+    @staticmethod
+    def _default_num_parts(client_count: int) -> int:
+        # A single user session can download quickly, but 8 parallel media
+        # sessions tends to trigger connection resets and GetMessages flood
+        # waits. Scale up only when there are multiple helper clients.
+        if client_count <= 1:
+            return 2
+        return min(8, max(2, client_count * 2))
 
     async def aclose(self):
         self._cancel_event.set()
@@ -97,6 +108,13 @@ class HyperTGDownload:
             del self.cache_file_ref[oldest]
             del self.cache_last_access[oldest]
 
+    async def _current_message_file_id(self) -> FileId:
+        media = await self.get_media_type(self.message)
+        file_id_str = media if isinstance(media, str) else getattr(media, "file_id", "")
+        if not file_id_str:
+            raise ValueError("Media file id is unavailable")
+        return FileId.decode(file_id_str)
+
     async def get_specific_file_ref(self, mid, client, max_retries=3):
         retries = 0
         last_error = None
@@ -113,11 +131,20 @@ class HyperTGDownload:
         raise ValueError(f"Failed to get message {mid} from {self.dump_chat}. Error: {last_error}")
 
     async def get_file_id(self, client, index) -> FileId:
-        if index not in self.cache_file_ref:
-            file_ref = await self.get_specific_file_ref(self.message.id, client)
-            self._update_cache(index, file_ref)
-        else:
+        if index in self.cache_file_ref:
             self.cache_last_access[index] = time()
+            return self.cache_file_ref[index]
+
+        lock = self.cache_locks.setdefault(index, Lock())
+        async with lock:
+            if index in self.cache_file_ref:
+                self.cache_last_access[index] = time()
+                return self.cache_file_ref[index]
+            if client is self.main_client:
+                file_ref = await self._current_message_file_id()
+            else:
+                file_ref = await self.get_specific_file_ref(self.message.id, client)
+            self._update_cache(index, file_ref)
         return self.cache_file_ref[index]
 
     async def _clean_cache(self):
@@ -138,52 +165,57 @@ class HyperTGDownload:
         if session_key in self.session_pool:
             return self.session_pool[session_key]
 
-        retries = 0
-        while retries < max_retries:
-            try:
-                if file_id.dc_id != await client.storage.dc_id():
-                    media_session = Session(
-                        client,
-                        file_id.dc_id,
-                        await Auth(client, file_id.dc_id, await client.storage.test_mode()).create(),
-                        await client.storage.test_mode(),
-                        is_media=True,
-                    )
-                    await media_session.start()
+        lock = self.session_locks.setdefault(session_key, Lock())
+        async with lock:
+            if session_key in self.session_pool:
+                return self.session_pool[session_key]
 
-                    for _ in range(6):
-                        exported_auth = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id))
-                        try:
-                            await media_session.invoke(
-                                raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes)
-                            )
-                            break
-                        except AuthBytesInvalid:
-                            await sleep(1)
+            retries = 0
+            while retries < max_retries:
+                try:
+                    if file_id.dc_id != await client.storage.dc_id():
+                        media_session = Session(
+                            client,
+                            file_id.dc_id,
+                            await Auth(client, file_id.dc_id, await client.storage.test_mode()).create(),
+                            await client.storage.test_mode(),
+                            is_media=True,
+                        )
+                        await media_session.start()
+
+                        for _ in range(6):
+                            exported_auth = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id))
+                            try:
+                                await media_session.invoke(
+                                    raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes)
+                                )
+                                break
+                            except AuthBytesInvalid:
+                                await sleep(1)
+                        else:
+                            await media_session.stop()
+                            raise AuthBytesInvalid
                     else:
-                        await media_session.stop()
-                        raise AuthBytesInvalid
-                else:
-                    media_session = Session(
-                        client,
-                        file_id.dc_id,
-                        await client.storage.auth_key(),
-                        await client.storage.test_mode(),
-                        is_media=True,
-                    )
-                    await media_session.start()
+                        media_session = Session(
+                            client,
+                            file_id.dc_id,
+                            await client.storage.auth_key(),
+                            await client.storage.test_mode(),
+                            is_media=True,
+                        )
+                        await media_session.start()
 
-                self.session_pool[session_key] = media_session
-                return media_session
+                    self.session_pool[session_key] = media_session
+                    return media_session
 
-            except FloodWait as exc:
-                if exc.value > self.max_flood_wait:
-                    raise
-                retries += 1
-                await sleep(exc.value + 1)
-            except Exception:
-                retries += 1
-                await sleep(1)
+                except FloodWait as exc:
+                    if exc.value > self.max_flood_wait:
+                        raise
+                    retries += 1
+                    await sleep(exc.value + 1)
+                except Exception:
+                    retries += 1
+                    await sleep(1)
 
         raise ValueError(f"Failed to create media session after {max_retries} attempts")
 
@@ -224,7 +256,7 @@ class HyperTGDownload:
 
     async def get_file(self, offset_bytes: int, first_part_cut: int, last_part_cut: int, part_count: int, max_retries=5):
         if not self.clients:
-            raise RuntimeError("Hyper download requires helper bot clients")
+            raise RuntimeError("Hyper download requires helper clients")
 
         index = min(self.work_loads, key=self.work_loads.get)
         client = self.clients[index]
@@ -266,19 +298,22 @@ class HyperTGDownload:
                                 chunk = r.bytes
                                 if not chunk:
                                     break
+                                current_retry = 0
 
                                 if part_count == 1:
-                                    yield chunk[first_part_cut:last_part_cut]
+                                    output_chunk = chunk[first_part_cut:last_part_cut]
                                 elif current_part == 1:
-                                    yield chunk[first_part_cut:]
+                                    output_chunk = chunk[first_part_cut:]
                                 elif current_part == part_count:
-                                    yield chunk[:last_part_cut]
+                                    output_chunk = chunk[:last_part_cut]
                                 else:
-                                    yield chunk
+                                    output_chunk = chunk
+
+                                yield output_chunk
 
                                 current_part += 1
                                 current_offset += self.chunk_size
-                                self._processed_bytes += len(chunk)
+                                self._processed_bytes += len(output_chunk)
                             else:
                                 raise ValueError(f"Unexpected response: {r}")
 
@@ -288,7 +323,10 @@ class HyperTGDownload:
                                     raise
                                 await sleep(exc.value + 1)
                             else:
-                                await sleep(1)
+                                current_retry += 1
+                                if current_retry >= max_retries:
+                                    raise
+                                await sleep(current_retry * 2)
                             continue
 
                     if current_part <= part_count:
@@ -310,7 +348,7 @@ class HyperTGDownload:
         while not self._cancel_event.is_set():
             try:
                 if callable(progress):
-                    result = progress(self._processed_bytes, self.file_size, *progress_args)
+                    result = progress(min(self._processed_bytes, self.file_size), self.file_size, *progress_args)
                     if inspect.isawaitable(result):
                         await result
                 await sleep(0.35)
@@ -324,7 +362,7 @@ class HyperTGDownload:
         offset = from_bytes - (from_bytes % self.chunk_size)
         first_part_cut = from_bytes - offset
         last_part_cut = until_bytes % self.chunk_size + 1
-        part_count = ceil(until_bytes / self.chunk_size) - floor(offset / self.chunk_size)
+        part_count = floor(until_bytes / self.chunk_size) - floor(offset / self.chunk_size) + 1
         part_file_path = ospath.join(self.directory, f"{self.file_name}.temp.{part_index:02d}")
 
         for attempt in range(max_retries):
@@ -353,7 +391,13 @@ class HyperTGDownload:
             num_parts = 1
 
         part_size = self.file_size // num_parts if num_parts > 0 else self.file_size
-        ranges = [(i * part_size, min((i + 1) * part_size - 1, self.file_size - 1)) for i in range(num_parts)]
+        ranges = [
+            (
+                i * part_size,
+                self.file_size - 1 if i == num_parts - 1 else min((i + 1) * part_size - 1, self.file_size - 1),
+            )
+            for i in range(num_parts)
+        ]
         tasks = []
         prog_task = None
 

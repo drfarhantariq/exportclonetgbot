@@ -72,11 +72,11 @@ class TelegramService:
             os.getenv("HYPER_DUMP_CHAT", "").strip()
             or os.getenv("LEECH_DUMP_CHAT", "").strip()
         )
-        self.helper_tokens = [
-            token
-            for token in re.split(r"[\s,]+", os.getenv("HELPER_TOKENS", "").strip())
-            if token
-        ]
+        self.helper_tokens = self._parse_env_list("HELPER_TOKENS")
+        self.helper_session_strings = self._helper_session_strings()
+        self.use_main_session_as_helper = self._read_bool_env("TG_USE_MAIN_SESSION_AS_HELPER", True)
+        self.helper_client_kinds: dict[int, str] = {}
+        self._owned_helper_client_ids: set[int] = set()
         self.flood_wait_callback: Callable[[dict[str, object]], Awaitable[None]] | None = None
         self.app = Client(
             name="telegram-topic-cloner",
@@ -99,37 +99,95 @@ class TelegramService:
             await self.app.stop()
         except Exception:
             self.logger.exception("shutdown error", extra={"event": "shutdown_error"})
-        for client in self.helper_clients.values():
+        for index, client in list(self.helper_clients.items()):
+            if index not in self._owned_helper_client_ids:
+                continue
             try:
                 await client.stop()
             except Exception:
                 self.logger.exception("helper shutdown error", extra={"event": "shutdown_error"})
         self.helper_clients.clear()
         self.helper_loads.clear()
+        self.helper_client_kinds.clear()
+        self._owned_helper_client_ids.clear()
 
     async def _start_helper_clients(self) -> None:
-        if self.helper_clients or not self.helper_tokens:
+        if self.helper_clients:
             return
 
-        await asyncio.gather(
-            *(
-                self._start_helper_client(index, token)
-                for index, token in enumerate(self.helper_tokens, start=1)
-            )
-        )
+        next_index = 1
+        if self.use_main_session_as_helper:
+            self.helper_clients[next_index] = self.app
+            self.helper_loads[next_index] = 0
+            self.helper_client_kinds[next_index] = "main_user_session"
+            next_index += 1
+
+        helper_tasks = []
+        for session_string in self.helper_session_strings:
+            if session_string == self.settings.session_string and self.use_main_session_as_helper:
+                continue
+            helper_tasks.append(self._start_helper_user_session(next_index, session_string))
+            next_index += 1
+
+        for token in self.helper_tokens:
+            helper_tasks.append(self._start_helper_bot(next_index, token))
+            next_index += 1
+
+        if helper_tasks:
+            await asyncio.gather(*helper_tasks)
 
         if self.helper_clients:
             self.logger.info(
-                "helper bots started",
+                "telegram helper clients started",
                 extra={
-                    "event": "helper_bots_started",
+                    "event": "telegram_helper_clients_started",
                     "helper_count": len(self.helper_clients),
+                    "helper_user_sessions": self.helper_user_session_count,
+                    "helper_bots": self.helper_bot_count,
+                    "main_session_helper": self.main_session_helper_enabled,
                     "hyper_threads": self.hyper_threads,
                     "hyper_dump_chat": self.hyper_dump_chat,
                 },
             )
 
-    async def _start_helper_client(self, index: int, token: str) -> None:
+    @property
+    def helper_user_session_count(self) -> int:
+        return sum(1 for kind in self.helper_client_kinds.values() if kind in {"main_user_session", "user_session"})
+
+    @property
+    def helper_bot_count(self) -> int:
+        return sum(1 for kind in self.helper_client_kinds.values() if kind == "bot")
+
+    @property
+    def main_session_helper_enabled(self) -> bool:
+        return any(kind == "main_user_session" for kind in self.helper_client_kinds.values())
+
+    async def _start_helper_user_session(self, index: int, session_string: str) -> None:
+        client = Client(
+            name=f"telegram-topic-helper-user-{index}",
+            api_id=self.settings.api_id,
+            api_hash=self.settings.api_hash,
+            session_string=session_string,
+            in_memory=True,
+            no_updates=True,
+            sleep_threshold=86400,
+            **self._transmission_options(),
+        )
+        try:
+            await client.start()
+        except Exception:
+            self.logger.exception(
+                "failed to start helper user session",
+                extra={"event": "helper_user_session_start_failed", "helper_index": index},
+            )
+            return
+
+        self.helper_clients[index] = client
+        self.helper_loads[index] = 0
+        self.helper_client_kinds[index] = "user_session"
+        self._owned_helper_client_ids.add(index)
+
+    async def _start_helper_bot(self, index: int, token: str) -> None:
         client = Client(
             name=f"telegram-topic-helper-{index}",
             api_id=self.settings.api_id,
@@ -151,6 +209,35 @@ class TelegramService:
 
         self.helper_clients[index] = client
         self.helper_loads[index] = 0
+        self.helper_client_kinds[index] = "bot"
+        self._owned_helper_client_ids.add(index)
+
+    @staticmethod
+    def _parse_env_list(name: str) -> list[str]:
+        return [
+            value
+            for value in re.split(r"[\s,;]+", os.getenv(name, "").strip())
+            if value
+        ]
+
+    @classmethod
+    def _helper_session_strings(cls) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for name in ("TG_HELPER_SESSION_STRINGS", "HELPER_SESSION_STRINGS", "USER_SESSION_STRINGS"):
+            for session_string in cls._parse_env_list(name):
+                if session_string in seen:
+                    continue
+                seen.add(session_string)
+                values.append(session_string)
+        return values
+
+    @staticmethod
+    def _read_bool_env(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
     def _transmission_options() -> dict[str, int]:
@@ -337,9 +424,20 @@ class TelegramService:
         message: Message,
         target_path: Path | str,
         progress=None,
+        download_mode: str = "auto",
     ) -> str:
+        download_mode = (download_mode or "auto").strip().lower()
+        if download_mode not in {"hyper", "auto", "normal"}:
+            raise ValueError("download_mode must be one of: hyper, auto, normal")
+
         progress_handler = self._wrap_progress_callback(progress)
-        if self.helper_clients:
+        if download_mode == "hyper" and not self.helper_clients:
+            raise RuntimeError(
+                "Hyper Telegram download requested, but no helper clients are available. "
+                "Set TG_USE_MAIN_SESSION_AS_HELPER=true, TG_HELPER_SESSION_STRINGS, or HELPER_TOKENS in heroku_bot/.env."
+            )
+
+        if download_mode in {"hyper", "auto"} and self.helper_clients:
             hyper = HyperTGDownload(
                 self.app,
                 self.helper_clients,
@@ -354,7 +452,9 @@ class TelegramService:
                     progress=progress_handler,
                     dump_chat=self.hyper_dump_chat,
                 )
-            except Exception:
+            except Exception as exc:
+                if download_mode == "hyper":
+                    raise RuntimeError(f"Hyper Telegram download failed: {exc}") from exc
                 self.logger.warning(
                     "hyper download failed, falling back to main client",
                     exc_info=True,
@@ -363,6 +463,8 @@ class TelegramService:
             else:
                 if isinstance(result, str):
                     return self._resolve_downloaded_path(result)
+                if download_mode == "hyper":
+                    raise RuntimeError("Hyper Telegram download returned no file.")
                 self.logger.warning(
                     "hyper download returned no file, falling back to main client",
                     extra={"event": "hyper_download_empty"},
@@ -1024,14 +1126,39 @@ class TelegramService:
                 ),
             )
             for topic in getattr(result, "topics", []) or []:
-                if getattr(topic, "top_message", None) == topic_id:
-                    title = getattr(topic, "title", None)
-                    return str(title) if title else None
+                candidate_ids = {
+                    getattr(topic, "top_message", None),
+                    getattr(topic, "id", None),
+                    getattr(topic, "topic_id", None),
+                }
+                if topic_id not in candidate_ids:
+                    continue
+                title = getattr(topic, "title", None)
+                if title:
+                    return str(title)
         except Exception:
             self.logger.debug(
                 "forum topic title lookup failed",
                 exc_info=True,
                 extra={"event": "forum_topic_title_lookup_failed", "chat_id": chat_id, "topic_id": topic_id},
+            )
+        try:
+            anchor = await self.get_message(chat_id, topic_id)
+            for attr in ("forum_topic_created", "forum_topic_edited"):
+                event = getattr(anchor, attr, None) if anchor is not None else None
+                if event is None:
+                    continue
+                for title_attr in ("title", "name"):
+                    title = getattr(event, title_attr, None)
+                    if title:
+                        return str(title)
+            text = (getattr(anchor, "text", None) or getattr(anchor, "caption", None) or "").strip() if anchor else ""
+            return text or None
+        except Exception:
+            self.logger.debug(
+                "forum topic anchor title fallback failed",
+                exc_info=True,
+                extra={"event": "forum_topic_anchor_title_lookup_failed", "chat_id": chat_id, "topic_id": topic_id},
             )
         return None
 

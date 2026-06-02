@@ -8,3 +8,11 @@ psutil==7.0.0
 pymongo==4.11.1
 Pillow==10.4.0
 imageio-ffmpeg==0.5.1
+requests==2.32.3
+tqdm==4.66.5
+gdown==5.2.0
+playwright==1.49.1
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+tenacity
