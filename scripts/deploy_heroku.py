@@ -457,7 +457,23 @@ def set_config(app: str, config: dict[str, str]) -> None:
     command.extend(f"{key}={value}" for key, value in config.items())
     display = ["heroku", "config:set", "-a", app]
     display.extend(f"{key}=***" for key in config)
-    run_heroku(command, display=display)
+    print("+", " ".join(display))
+    proc = subprocess.run(
+        get_heroku_prefix() + command,
+        text=True,
+        check=False,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                redacted = stream
+                for value in config.values():
+                    if value:
+                        redacted = redacted.replace(value, "***")
+                print(redacted.rstrip())
+        raise RuntimeError("Heroku config:set failed")
+    print(f"Set {len(config)} Heroku config var(s) for {app}.")
 
 
 def add_apt_buildpack(app: str) -> None:
