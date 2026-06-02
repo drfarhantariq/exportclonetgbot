@@ -20,12 +20,22 @@ class SourceItem:
 
 
 def _safe_name(name: str) -> str:
-    return Path(str(name).replace("\x00", "")).name.strip()
+    cleaned = " ".join(str(name).replace("\x00", "").split())
+    return Path(cleaned).name.strip()
 
 
 def _has_extension(name: str) -> bool:
     suffix = Path(name).suffix
     return bool(suffix and "/" not in suffix and "\\" not in suffix and not any(char.isspace() for char in suffix))
+
+
+def _truncate_name(name: str, limit: int = 180) -> str:
+    if len(name) <= limit:
+        return name
+    suffix = Path(name).suffix
+    stem = Path(name).stem if suffix else name
+    stem_limit = max(1, limit - len(suffix))
+    return stem[:stem_limit].rstrip(" .") + suffix
 
 
 def _media_extension(message: object, media: object | None) -> str:
@@ -88,35 +98,57 @@ async def iter_gdrive(url: str, staging_dir: Path) -> AsyncIterator[SourceItem]:
     files = await list_gdrive_folder(url, staging_dir)
     for drive_file in files:
         rel_path = norm_rel(getattr(drive_file, "path", "") or Path(getattr(drive_file, "local_path")).name)
-        local_path = Path(getattr(drive_file, "local_path"))
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        if local_path.exists() and local_path.stat().st_size > 0:
-            print(f"Reusing existing download: {local_path}", flush=True)
-            downloaded_path = local_path
-        else:
-            download_output = str(local_path if local_path.suffix else local_path.parent)
-            downloaded = await asyncio.to_thread(
-                gdown.download,
-                url="https://drive.google.com/uc?id=" + str(getattr(drive_file, "id")),
-                output=download_output,
-                quiet=False,
-                use_cookies=False,
-            )
-            if not downloaded:
-                raise RuntimeError(f"Google Drive download failed: {rel_path}")
-            downloaded_path = Path(downloaded)
-        if not Path(rel_path).suffix and downloaded_path.suffix:
-            rel_path = norm_rel(str(Path(rel_path).with_suffix(downloaded_path.suffix)))
-        yield SourceItem(path=downloaded_path, rel_path=rel_path, cleanup=True)
+        yield await download_gdrive_file(drive_file, rel_path, staging_dir)
 
 
-def telegram_media_filename(message: object) -> str:
+async def download_gdrive_file(drive_file: object, rel_path: str, staging_dir: Path) -> SourceItem:
+    try:
+        import gdown
+    except ImportError as exc:
+        raise RuntimeError("gdown is required for --source gdrive. Install requirements first.") from exc
+
+    local_path = Path(getattr(drive_file, "local_path"))
+    if not local_path.is_absolute():
+        local_path = staging_dir / "gdrive" / rel_path
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists() and local_path.stat().st_size > 0:
+        print(f"Reusing existing download: {local_path}", flush=True)
+        downloaded_path = local_path
+    else:
+        download_output = str(local_path if local_path.suffix else local_path.parent)
+        downloaded = await asyncio.to_thread(
+            gdown.download,
+            url="https://drive.google.com/uc?id=" + str(getattr(drive_file, "id")),
+            output=download_output,
+            quiet=False,
+            use_cookies=False,
+        )
+        if not downloaded:
+            raise RuntimeError(f"Google Drive download failed: {rel_path}")
+        downloaded_path = Path(downloaded)
+    if not Path(rel_path).suffix and downloaded_path.suffix:
+        rel_path = norm_rel(str(Path(rel_path).with_suffix(downloaded_path.suffix)))
+    return SourceItem(path=downloaded_path, rel_path=rel_path, cleanup=True)
+
+
+def _caption_text(message: object) -> str:
+    caption = getattr(message, "caption", "") or ""
+    return _safe_name(caption)
+
+
+def telegram_media_filename(message: object, *, use_caption: bool = False) -> str:
     media = getattr(message, getattr(getattr(message, "media", None), "value", ""), None)
+    if use_caption:
+        caption_name = _caption_text(message)
+        if caption_name:
+            if not _has_extension(caption_name):
+                caption_name += _media_extension(message, media)
+            return _truncate_name(caption_name)
     file_name = _safe_name(getattr(media, "file_name", "") if media is not None else "")
     if file_name:
         if not _has_extension(file_name):
             file_name += _media_extension(message, media)
-        return file_name
+        return _truncate_name(file_name)
     message_id = getattr(message, "id", "message")
     if getattr(message, "photo", None):
         return f"{message_id}.jpg"

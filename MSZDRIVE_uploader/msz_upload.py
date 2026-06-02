@@ -6,8 +6,6 @@ import os
 import shutil
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 try:
     from tqdm.auto import tqdm
 except ImportError:
@@ -31,8 +29,9 @@ except ImportError:
             return None
 
 from .browser_upload import MszBrowserUploader
+from .env_utils import load_msz_env_files
 from .msz_api import MszApiClient, ensure_disk_space, infer_extension_from_signature, norm_rel
-from .sources import SourceItem, cleanup_item, iter_gdrive, iter_local, iter_telegram_topic
+from .sources import SourceItem, cleanup_item, download_gdrive_file, iter_gdrive, iter_local, iter_telegram_topic, list_gdrive_folder
 from .state import FailedUploadLog, UploadState
 
 
@@ -44,9 +43,7 @@ def _runtime_dir() -> Path:
 
 
 def _load_env_files() -> None:
-    for env_path in (Path("MSZDRIVE_uploader/.env"), Path(".env"), Path("heroku_bot/.env")):
-        if env_path.exists():
-            load_dotenv(env_path, override=False)
+    load_msz_env_files()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -91,8 +88,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only process files that are currently marked failed in state or listed in the failed upload log.",
     )
-    parser.add_argument("--no-resume", action="store_true", help="Do not skip files from state or remote index.")
-    parser.add_argument("--no-verify-remote", action="store_true")
+    parser.set_defaults(no_resume=True)
+    parser.add_argument("--no-resume", dest="no_resume", action="store_true", help="Do not skip files from state or remote index. Default.")
+    parser.add_argument("--resume", dest="no_resume", action="store_false", help="Skip files already uploaded in state or remote index.")
+    parser.set_defaults(no_verify_remote=True)
+    parser.add_argument("--no-verify-remote", dest="no_verify_remote", action="store_true", help="Skip slow remote API verification. Default.")
+    parser.add_argument("--verify-remote", dest="no_verify_remote", action="store_false", help="Verify uploads by scanning the remote MSZ API index.")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -176,7 +177,10 @@ async def _verify_remote_upload(client, target_rel: str, size: int, args: argpar
     last_index = {}
     attempts = max(1, int(args.verify_retries))
     for attempt in range(1, attempts + 1):
-        last_index = client.build_remote_index()
+        last_index = client.build_remote_index_for_folder(
+            args.target_folder,
+            log=lambda message: progress.write(f"Scoped verification: {message}"),
+        )
         remote, match_kind = _find_remote_match(last_index, target_rel, size)
         if remote is not None:
             return remote, match_kind, last_index
@@ -187,6 +191,35 @@ async def _verify_remote_upload(client, target_rel: str, size: int, args: argpar
             )
             await asyncio.sleep(max(0.0, float(args.verify_delay_sec)))
     return None, "", last_index
+
+
+def _state_uploaded_without_size(state: UploadState, target_rel: str) -> bool:
+    record = state.data.get("files", {}).get(norm_rel(target_rel))
+    return isinstance(record, dict) and record.get("status") == "uploaded"
+
+
+def _remote_exact_match_without_size(remote_index: dict[str, object], target_rel: str) -> object | None:
+    return remote_index.get(norm_rel(target_rel))
+
+
+def _pre_download_skip_reason(
+    *,
+    target_rel: str,
+    args: argparse.Namespace,
+    state: UploadState,
+    remote_index: dict[str, object],
+    resume_enabled: bool,
+    failed_targets: set[str],
+) -> str:
+    if args.retry_failed_only and target_rel not in failed_targets:
+        return "not-failed"
+    if not resume_enabled:
+        return ""
+    if remote_index and _remote_exact_match_without_size(remote_index, target_rel) is not None:
+        return "remote"
+    if _state_uploaded_without_size(state, target_rel):
+        return "state"
+    return ""
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -208,17 +241,63 @@ async def run(args: argparse.Namespace) -> int:
     if args.retry_failed_only:
         print(f"Retrying failed uploads only. Failed targets loaded: {len(failed_targets)}")
     resume_enabled = not args.no_resume
-    remote_index = {} if args.dry_run or args.no_verify_remote else client.build_remote_index()
+    if resume_enabled and not args.dry_run and not args.no_verify_remote:
+        print(f"Building scoped MSZ remote index for resume checks: {args.target_folder}", flush=True)
+        remote_index = client.build_remote_index_for_folder(args.target_folder)
+    else:
+        remote_index = {}
 
     browser: MszBrowserUploader | None = None
 
     total = uploaded = skipped = failed = 0
     progress = tqdm(desc="MSZ upload", unit="file")
     try:
-        async for item in _iter_source(args, staging_dir):
+        pre_counted_items: set[int] = set()
+
+        async def _source_items():
+            nonlocal total, skipped
+            if args.source != "gdrive":
+                async for source_item in _iter_source(args, staging_dir):
+                    yield source_item
+                return
+
+            if not args.url:
+                raise ValueError("--url is required for --source gdrive")
+            files = await list_gdrive_folder(args.url, staging_dir)
+            for drive_file in files:
+                rel_path = norm_rel(getattr(drive_file, "path", "") or Path(getattr(drive_file, "local_path")).name)
+                planned_item = SourceItem(path=Path(getattr(drive_file, "local_path", rel_path)), rel_path=rel_path, cleanup=True)
+                target_rel = _target_rel(args.target_folder, planned_item)
+                total += 1
+                progress.total = total
+                progress.refresh()
+                reason = _pre_download_skip_reason(
+                    target_rel=target_rel,
+                    args=args,
+                    state=state,
+                    remote_index=remote_index,
+                    resume_enabled=resume_enabled,
+                    failed_targets=failed_targets,
+                )
+                if reason:
+                    skipped += 1
+                    progress.set_postfix_str(f"skipped:{reason}:pre-download")
+                    progress.write(f"Skipping before Google Drive download ({reason}): {target_rel}")
+                    progress.update(1)
+                    continue
+                item = await download_gdrive_file(drive_file, rel_path, staging_dir)
+                # This item has already been counted above.
+                pre_counted_items.add(id(item))
+                yield item
+
+        async for item in _source_items():
+            pre_counted = id(item) in pre_counted_items
             total += 1
-            progress.total = total
-            progress.refresh()
+            if pre_counted:
+                total -= 1
+            else:
+                progress.total = total
+                progress.refresh()
             try:
                 uploaded_this_item = False
                 failed_this_item = False
@@ -291,7 +370,12 @@ async def run(args: argparse.Namespace) -> int:
 
                 state.mark_uploaded(target_rel, size, mtime, method, remote_id)
 
-                if not args.no_verify_remote:
+                should_verify_remote = (not args.no_verify_remote and method != "browser") or (
+                    method == "browser" and args.strict_browser_verify
+                )
+                if method == "browser" and not should_verify_remote:
+                    progress.write("Skipping API verification for browser upload; UI reported upload complete.")
+                if should_verify_remote:
                     if client is None:
                         raise RuntimeError("MSZ API client is unavailable.")
                     verified, match_kind, remote_index = await _verify_remote_upload(

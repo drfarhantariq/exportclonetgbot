@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
 import time
 import base64
 import binascii
@@ -15,6 +16,20 @@ import requests
 
 def norm_rel(path: str) -> str:
     return path.replace("\\", "/").lstrip("./").strip("/")
+
+
+def natural_sort_key(value: object) -> tuple[tuple[int, object], ...]:
+    text = norm_rel(str(value)).casefold()
+    parts = re.split(r"(\d+)", text)
+    key: list[tuple[int, object]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return tuple(key)
 
 
 def parse_entries(payload: Any) -> list[dict[str, Any]]:
@@ -268,6 +283,75 @@ class MszApiClient:
             if entry.is_file
         }
 
+    def build_remote_index_for_folder(
+        self,
+        folder_path: str,
+        *,
+        per_page: int = 200,
+        max_pages: int = 200,
+        log: Any = None,
+    ) -> dict[str, RemoteFile]:
+        folder_path = norm_rel(folder_path)
+        if not folder_path:
+            return self.build_remote_index(per_page=per_page, max_pages=max_pages)
+
+        root = self.resolve_folder_path(folder_path, per_page=per_page, max_pages=max_pages, log=log)
+        if root is None:
+            if log:
+                log(f"Scoped remote index folder was not found: {folder_path}")
+            return {}
+        files = self.list_descendant_files(root, log=log)
+        return {
+            entry.rel_path: RemoteFile(id=entry.id, size=entry.size, name=entry.name, rel_path=entry.rel_path)
+            for entry in files
+            if entry.is_file
+        }
+
+    def resolve_folder_path(
+        self,
+        folder_path: str,
+        *,
+        per_page: int = 200,
+        max_pages: int = 200,
+        log: Any = None,
+    ) -> MszEntry | None:
+        parts = [part.strip() for part in norm_rel(folder_path).split("/") if part.strip()]
+        if not parts:
+            return None
+
+        parent_id: Any = None
+        current: MszEntry | None = None
+        current_rel = ""
+        for index, part in enumerate(parts):
+            children = (
+                self.list_entries(per_page=per_page, max_pages=max_pages)
+                if parent_id is None
+                else self._list_child_entries(parent_id, per_page=per_page, max_pages=max_pages)
+            )
+            matches = [
+                child
+                for child in children
+                if str(child.get("type") or "") == "folder" and str(child.get("name") or "") == part
+            ]
+            if not matches:
+                if log:
+                    log(f"Scoped folder path segment was not found: {'/'.join(parts[: index + 1])}")
+                return None
+            raw = matches[0]
+            current_rel = norm_rel(f"{current_rel}/{part}")
+            current = self._entry_from_raw(raw, {raw.get("id"): raw})
+            current = MszEntry(
+                id=current.id,
+                name=current.name,
+                type=current.type,
+                rel_path=current_rel,
+                parent_id=current.parent_id,
+                size=current.size,
+                raw=current.raw,
+            )
+            parent_id = current.id
+        return current
+
     def resolve_source_entries(
         self,
         *,
@@ -468,6 +552,9 @@ class MszApiClient:
         queue: list[tuple[MszEntry, str]] = []
         visited_folders: set[Any] = {root.id}
 
+        def _raw_sort_key(raw: dict[str, Any]) -> tuple[tuple[int, object], ...]:
+            return natural_sort_key(raw.get("name") or raw.get("file_name") or raw.get("id") or "")
+
         def _append_child(raw: dict[str, Any], rel_prefix: str) -> None:
             child = self._entry_from_raw(raw, {raw.get("id"): raw})
             child_rel = norm_rel(f"{rel_prefix}/{child.name}")
@@ -485,7 +572,7 @@ class MszApiClient:
             else:
                 files.append(child)
 
-        for raw in seed_children:
+        for raw in sorted(seed_children, key=_raw_sort_key):
             _append_child(raw, "")
 
         while queue:
@@ -498,9 +585,9 @@ class MszApiClient:
             children = self._list_child_entries(folder.id, per_page=200, max_pages=50)
             if log:
                 log(f"Found {len(children)} child entries in: {folder.name}")
-            for raw in children:
+            for raw in sorted(children, key=_raw_sort_key):
                 _append_child(raw, rel_prefix)
-        files.sort(key=lambda entry: entry.rel_path.lower())
+        files.sort(key=lambda entry: natural_sort_key(entry.rel_path))
         return files
 
     def _entry_from_raw(self, raw: dict[str, Any], id_map: dict[Any, dict[str, Any]]) -> MszEntry:
@@ -538,6 +625,9 @@ class MszApiClient:
             if log:
                 log(message)
 
+        def _raw_sort_key(raw: dict[str, Any]) -> tuple[tuple[int, object], ...]:
+            return natural_sort_key(raw.get("name") or raw.get("file_name") or raw.get("id") or "")
+
         files: list[MszEntry] = []
         queue: list[tuple[MszEntry, str]] = [(root, "")]
         visited: set[Any] = set()
@@ -551,7 +641,7 @@ class MszApiClient:
             _log(f"Found {len(children_raw)} child entries in: {folder.name}")
             id_map = {child.get("id"): child for child in children_raw if child.get("id") is not None}
             id_map[folder.id] = folder.raw or {"id": folder.id, "name": folder.name, "type": "folder"}
-            for child_raw in children_raw:
+            for child_raw in sorted(children_raw, key=_raw_sort_key):
                 child = self._entry_from_raw(child_raw, id_map)
                 child_rel = norm_rel(f"{rel_prefix}/{child.name}")
                 child = MszEntry(
@@ -567,7 +657,7 @@ class MszApiClient:
                     queue.append((child, child_rel))
                 else:
                     files.append(child)
-        files.sort(key=lambda entry: entry.rel_path.lower())
+        files.sort(key=lambda entry: natural_sort_key(entry.rel_path))
         return files
 
     @staticmethod

@@ -5,6 +5,7 @@ import pickle
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import parse_qs, urlparse
 
 
 GDRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -105,6 +106,108 @@ class GoogleDriveResumableUploader:
         for segment in [part for part in rel_folder.replace("\\", "/").split("/") if part.strip()]:
             current_id = self.ensure_folder(current_id, segment.strip())
         return current_id
+
+    @staticmethod
+    def extract_folder_id(value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        if not value.startswith(("http://", "https://")):
+            return value
+        parsed = urlparse(value)
+        parts = [part for part in parsed.path.split("/") if part]
+        for marker in ("folders", "d"):
+            if marker in parts:
+                index = parts.index(marker)
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+        query = parse_qs(parsed.query)
+        for key in ("id", "folder_id"):
+            if query.get(key):
+                return query[key][0]
+        return value
+
+    def get_file_metadata(self, file_id: str) -> dict:
+        return (
+            self.service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, mimeType, size",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+
+    def list_children(self, parent_id: str) -> list[dict]:
+        files: list[dict] = []
+        page_token = None
+        while True:
+            response = (
+                self.service.files()
+                .list(
+                    q=f"'{parent_id}' in parents and trashed = false",
+                    spaces="drive",
+                    pageSize=1000,
+                    pageToken=page_token,
+                    fields="nextPageToken, files(id, name, mimeType, size)",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            files.extend(response.get("files", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                return files
+
+    def iter_files_under(self, root_id: str):
+        root = self.get_file_metadata(root_id)
+        root_name = Path(root.get("name") or "Google Drive Source").name
+        if root.get("mimeType") != GDRIVE_FOLDER_MIME:
+            yield root, root_name
+            return
+
+        stack: list[tuple[str, str]] = [(root_id, root_name)]
+        while stack:
+            folder_id, folder_rel = stack.pop()
+            children = sorted(
+                self.list_children(folder_id),
+                key=lambda item: (item.get("mimeType") != GDRIVE_FOLDER_MIME, str(item.get("name", "")).lower()),
+            )
+            for child in reversed(children):
+                child_name = Path(child.get("name") or child["id"]).name
+                child_rel = f"{folder_rel}/{child_name}"
+                if child.get("mimeType") == GDRIVE_FOLDER_MIME:
+                    stack.append((child["id"], child_rel))
+                else:
+                    yield child, child_rel
+
+    def download_file(
+        self,
+        file_id: str,
+        output_path: Path,
+        *,
+        progress_callback: Callable[[int, int | None], None] | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> Path:
+        from googleapiclient.http import MediaIoBaseDownload
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_suffix(output_path.suffix + ".part")
+        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with temp_path.open("wb") as handle:
+            downloader = MediaIoBaseDownload(handle, request, chunksize=chunk_size)
+            done = False
+            total_size = None
+            while not done:
+                status, done = downloader.next_chunk()
+                if status is not None:
+                    total_size = int(getattr(status, "total_size", 0) or 0) or total_size
+                    if progress_callback is not None:
+                        uploaded = int((total_size or 0) * status.progress()) if total_size else temp_path.stat().st_size
+                        progress_callback(uploaded, total_size)
+        temp_path.replace(output_path)
+        return output_path
 
     def existing_file_matches(self, parent_id: str, name: str, size: int | None) -> dict | None:
         existing = self.find_child(parent_id, name)

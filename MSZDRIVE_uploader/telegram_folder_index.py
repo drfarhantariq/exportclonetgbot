@@ -8,8 +8,7 @@ import re
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
-
+from .env_utils import load_msz_env_files
 from .telegram_index import FolderHeading, format_index, normalize_heading_text
 
 
@@ -18,9 +17,7 @@ def _runtime_dir() -> Path:
 
 
 def _load_env_files() -> None:
-    for env_path in (Path("MSZDRIVE_uploader/.env"), Path(".env"), Path("heroku_bot/.env")):
-        if env_path.exists():
-            load_dotenv(env_path, override=False)
+    load_msz_env_files()
 
 
 def _heroku_imports():

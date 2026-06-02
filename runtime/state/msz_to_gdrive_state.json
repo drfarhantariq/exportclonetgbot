@@ -434,7 +434,44 @@
       "attempts": 1,
       "gdrive_file_id": "1krLRzc2ikldkEwU1-DXH4KHfJ2JDGqUB",
       "uploaded_at": "2026-05-27T06:18:40.582404Z"
+    },
+    "84014": {
+      "status": "uploaded",
+      "msz_id": 84014,
+      "msz_rel_path": "ENT/115. Physiology of Hearing.mp4",
+      "rel_path": "ENT/115. Physiology of Hearing.mp4",
+      "size": 76706832,
+      "local_path": "/workspaces/exportclonetgbot/runtime/msz_to_gdrive_staging/ENT/115. Physiology of Hearing.mp4",
+      "updated_at": "2026-06-02T07:10:23.144211Z",
+      "gdrive_parent_id": "177yUNc4BcRYkybY89ICfF9783qtsA_uo",
+      "attempts": 2,
+      "gdrive_file_id": "1NBBjO6epwY_hYv938WE3-m9Okxol0SSB",
+      "uploaded_at": "2026-06-02T07:10:29.296881Z"
+    },
+    "84013": {
+      "status": "uploaded",
+      "msz_id": 84013,
+      "msz_rel_path": "ENT/331_114. Anatomy of Ear.mp4",
+      "rel_path": "ENT/331_114. Anatomy of Ear.mp4",
+      "size": 217604464,
+      "local_path": "/workspaces/exportclonetgbot/runtime/msz_to_gdrive_staging/ENT/331_114. Anatomy of Ear.mp4",
+      "updated_at": "2026-06-02T07:10:49.603751Z",
+      "gdrive_parent_id": "177yUNc4BcRYkybY89ICfF9783qtsA_uo",
+      "attempts": 2,
+      "gdrive_file_id": "1Sfgzrw-r-s8GSMrm7Fm12Ccjbr8ahEiQ",
+      "uploaded_at": "2026-06-02T07:11:01.659762Z"
+    },
+    "84015": {
+      "status": "downloading",
+      "msz_id": 84015,
+      "msz_rel_path": "ENT/333_116. Assessment of Hearing.mp4",
+      "rel_path": "ENT/333_116. Assessment of Hearing.mp4",
+      "size": 301824118,
+      "local_path": "/workspaces/exportclonetgbot/runtime/msz_to_gdrive_staging/ENT/333_116. Assessment of Hearing.mp4",
+      "updated_at": "2026-06-02T07:11:01.704867Z",
+      "gdrive_parent_id": "1eYP02_DoT6Il09y488olzJC1U6B_h34j",
+      "attempts": 1
     }
   },
-  "updated_at": "2026-05-27T06:18:40.582484Z"
+  "updated_at": "2026-06-02T07:11:01.704914Z"
 }

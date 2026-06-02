@@ -7,13 +7,12 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
-
-from .telegram_index import parse_index
-
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "MSZDRIVE_uploader"
+
+from .env_utils import load_msz_env_files
+from .telegram_index import parse_index
 
 
 def _runtime_dir() -> Path:
@@ -21,9 +20,7 @@ def _runtime_dir() -> Path:
 
 
 def _load_env_files() -> None:
-    for env_path in (Path("MSZDRIVE_uploader/.env"), Path(".env"), Path("heroku_bot/.env")):
-        if env_path.exists():
-            load_dotenv(env_path, override=False)
+    load_msz_env_files()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -73,13 +70,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--retry-failed-only", action="store_true")
-    parser.add_argument("--no-resume", action="store_true")
+    parser.set_defaults(no_resume=True)
+    parser.add_argument("--no-resume", dest="no_resume", action="store_true", help="Ignore previous transfer state. Default.")
+    parser.add_argument("--resume", dest="no_resume", action="store_false", help="Resume from previous successful transfer state.")
+    parser.add_argument("--caption-file-names", action="store_true", help="Use Telegram media captions as file names.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-downloads", action="store_true")
     parser.add_argument("--delete-failed-downloads", action="store_true")
     parser.add_argument("--browser-headed", action="store_true")
     parser.add_argument("--browser-folder-url", default=os.getenv("MSZ_BROWSER_FOLDER_URL", ""))
     parser.add_argument("--chromium-executable", default=os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE", ""))
+    parser.add_argument("--no-browser-folder-title", action="store_true")
+    parser.add_argument("--strict-browser-verify", action="store_true")
+    parser.add_argument("--verify-remote", action="store_true")
     return parser
 
 
@@ -100,6 +103,8 @@ def _is_telegram(value: str) -> bool:
 
 
 def _is_gdrive(value: str) -> bool:
+    if value.lower().startswith("gdrive:"):
+        return True
     host = _host(value)
     return "drive.google.com" in host or "docs.google.com" in host
 
@@ -171,6 +176,44 @@ def _telegram_index_topic_folder(index_path: str) -> str:
     return ""
 
 
+def _safe_default_folder_name(value: str) -> str:
+    cleaned = Path(value.replace("\x00", "")).name.strip()
+    return cleaned.strip(" .") or ""
+
+
+def _gdrive_source_folder_name(source: str, token_pickle: str = "") -> str:
+    source = _strip_prefix(source.strip(), "gdrive:")
+    if not source:
+        return ""
+    try:
+        from .gdrive_upload import GoogleDriveResumableUploader
+
+        folder_id = GoogleDriveResumableUploader.extract_folder_id(source)
+        token_path = Path(token_pickle or os.getenv("GDRIVE_TOKEN_PICKLE", "token.pickle"))
+        if folder_id and token_path.expanduser().exists():
+            gdrive = GoogleDriveResumableUploader(token_path)
+            metadata = gdrive.get_file_metadata(folder_id)
+            name = _safe_default_folder_name(str(metadata.get("name", "")))
+            if name:
+                return name
+    except Exception:
+        pass
+    if source.startswith(("http://", "https://")):
+        parts = [part for part in urlparse(source).path.split("/") if part]
+        if "folders" in parts and parts.index("folders") + 1 < len(parts):
+            return f"Google Drive {parts[parts.index('folders') + 1]}"
+    return _safe_default_folder_name(source) or "Google Drive Upload"
+
+
+def _source_default_msz_folder(args: argparse.Namespace) -> str:
+    source_type = _source_type(args.source, args.source_type)
+    if source_type == "gdrive":
+        return _gdrive_source_folder_name(args.source, args.gdrive_token_pickle)
+    if source_type == "local":
+        return _safe_default_folder_name(args.source)
+    return ""
+
+
 def _msz_dest(args: argparse.Namespace, index_path: str = "") -> str:
     if args.msz_target_folder:
         return args.msz_target_folder
@@ -181,7 +224,20 @@ def _msz_dest(args: argparse.Namespace, index_path: str = "") -> str:
     topic_folder = _telegram_index_topic_folder(index_path)
     if topic_folder:
         return topic_folder
+    source_folder = _source_default_msz_folder(args)
+    if source_folder:
+        return source_folder
     raise ValueError("MSZ destination is missing. Use dest 'msz:<folder>' or --msz-target-folder.")
+
+
+def _has_explicit_msz_dest(args: argparse.Namespace) -> bool:
+    if args.msz_target_folder:
+        return True
+    if args.dest.lower().startswith("msz:"):
+        return bool(_strip_prefix(args.dest, "msz:").strip())
+    if args.dest and not args.dest.lower().startswith(("gdrive:", "index:", "both")) and not _is_gdrive(args.dest):
+        return True
+    return False
 
 
 def _gdrive_dest(args: argparse.Namespace) -> str:
@@ -191,7 +247,7 @@ def _gdrive_dest(args: argparse.Namespace) -> str:
         return _strip_prefix(args.dest, "gdrive:").strip()
     if args.dest and not args.dest.lower().startswith(("msz:", "index:", "both")):
         return args.dest
-    raise ValueError("Google Drive destination is missing. Use dest 'gdrive:<folder_id>' or --gdrive-folder-id.")
+    return "root"
 
 
 def _index_out(args: argparse.Namespace) -> str:
@@ -225,6 +281,10 @@ def _common_flags(args: argparse.Namespace) -> list[str]:
         flags.append("--retry-failed-only")
     if args.no_resume:
         flags.append("--no-resume")
+    else:
+        flags.append("--resume")
+    if args.caption_file_names:
+        flags.append("--caption-file-names")
     if args.dry_run:
         flags.append("--dry-run")
     if args.keep_downloads:
@@ -265,9 +325,16 @@ async def _run_telegram_index(args: argparse.Namespace) -> int:
 async def _run_telegram_upload(args: argparse.Namespace, target: str, index_path: str) -> int:
     from . import telegram_to_drive
 
-    cli = ["--index", index_path, "--target", target]
+    cli = ["--target", target]
+    if index_path:
+        cli.extend(["--index", index_path])
+    else:
+        cli.extend(["--topic-link", args.source, "--flat-folder", "__topic_title__"])
     if target in {"msz", "both"}:
-        cli.extend(["--target-folder", _msz_dest(args, index_path)])
+        if index_path or _has_explicit_msz_dest(args):
+            cli.extend(["--target-folder", _msz_dest(args, index_path)])
+        else:
+            cli.extend(["--target-folder", ""])
     if target in {"gdrive", "both"}:
         cli.extend(["--gdrive-folder-id", _gdrive_dest(args), "--gdrive-token-pickle", args.gdrive_token_pickle])
     cli.extend(_common_flags(args))
@@ -297,6 +364,8 @@ async def _run_gdrive_to_msz(args: argparse.Namespace) -> int:
         cli.append("--retry-failed-only")
     if args.no_resume:
         cli.append("--no-resume")
+    else:
+        cli.append("--resume")
     if args.dry_run:
         cli.append("--dry-run")
     if args.delete_failed_downloads:
@@ -307,6 +376,10 @@ async def _run_gdrive_to_msz(args: argparse.Namespace) -> int:
         cli.extend(["--browser-folder-url", args.browser_folder_url])
     if args.chromium_executable:
         cli.extend(["--chromium-executable", args.chromium_executable])
+    if args.strict_browser_verify:
+        cli.append("--strict-browser-verify")
+    if args.verify_remote:
+        cli.append("--verify-remote")
     return await msz_upload.run(msz_upload._build_parser().parse_args(cli))
 
 
@@ -320,8 +393,20 @@ async def _run_local_to_msz(args: argparse.Namespace) -> int:
         cli.append("--retry-failed-only")
     if args.no_resume:
         cli.append("--no-resume")
+    else:
+        cli.append("--resume")
     if args.dry_run:
         cli.append("--dry-run")
+    if args.browser_headed:
+        cli.append("--browser-headed")
+    if args.browser_folder_url:
+        cli.extend(["--browser-folder-url", args.browser_folder_url])
+    if args.chromium_executable:
+        cli.extend(["--chromium-executable", args.chromium_executable])
+    if args.strict_browser_verify:
+        cli.append("--strict-browser-verify")
+    if args.verify_remote:
+        cli.append("--verify-remote")
     return await msz_upload.run(msz_upload._build_parser().parse_args(cli))
 
 
@@ -336,11 +421,52 @@ async def _run_msz_to_gdrive(args: argparse.Namespace) -> int:
         cli.append("--retry-failed-only")
     if args.no_resume:
         cli.append("--no-resume")
+    else:
+        cli.append("--resume")
     if args.dry_run:
         cli.append("--dry-run")
     if args.delete_failed_downloads:
         cli.append("--delete-failed-downloads")
+    if args.browser_headed:
+        cli.append("--browser-headed")
+    if args.chromium_executable:
+        cli.extend(["--chromium-executable", args.chromium_executable])
+    if args.no_browser_folder_title:
+        cli.append("--no-browser-folder-title")
     return await msz_to_gdrive.run(msz_to_gdrive._build_parser().parse_args(cli))
+
+
+async def _run_drive_to_telegram(args: argparse.Namespace, source_type: str) -> int:
+    from . import drive_to_telegram
+
+    source = _strip_prefix(args.source, f"{source_type}:")
+    cli = [
+        source,
+        args.dest,
+        "--source-type",
+        source_type,
+        "--config",
+        args.config,
+        "--runtime-dir",
+        args.runtime_dir,
+        "--gdrive-token-pickle",
+        args.gdrive_token_pickle,
+    ]
+    if args.continue_on_error:
+        cli.append("--continue-on-error")
+    if args.retry_failed_only:
+        cli.append("--retry-failed-only")
+    if args.no_resume:
+        cli.append("--no-resume")
+    else:
+        cli.append("--resume")
+    if args.dry_run:
+        cli.append("--dry-run")
+    if args.keep_downloads:
+        cli.append("--keep-downloads")
+    if args.delete_failed_downloads:
+        cli.append("--delete-failed-downloads")
+    return await drive_to_telegram.run(drive_to_telegram._build_parser().parse_args(cli))
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -358,11 +484,6 @@ async def run(args: argparse.Namespace) -> int:
 
     if source_type == "telegram":
         index_path = args.index_done
-        if not index_path:
-            raise ValueError(
-                "Telegram upload needs an edited index. First run with --index, "
-                "edit the generated file, then run again with --index-done <path>."
-            )
         return await _run_telegram_upload(args, target, index_path)
 
     if source_type == "index":
@@ -377,10 +498,13 @@ async def run(args: argparse.Namespace) -> int:
     if source_type == "msz" and target == "gdrive":
         return await _run_msz_to_gdrive(args)
 
+    if source_type in {"gdrive", "msz"} and target == "telegram":
+        return await _run_drive_to_telegram(args, source_type)
+
     if target == "telegram":
         raise ValueError(
-            "Telegram upload destination is not implemented yet. "
-            "Currently supported upload destinations are --up msz, --up gd, and --up both."
+            "Telegram upload destination supports Google Drive and MSZ sources. "
+            "Examples: gdrive:<folder> --up telegram <telegram_topic_link>, or msz:<folder> --up telegram <telegram_topic_link>."
         )
 
     raise ValueError(

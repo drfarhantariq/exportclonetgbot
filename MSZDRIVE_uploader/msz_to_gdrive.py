@@ -7,11 +7,12 @@ import os
 import shutil
 import time
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
+from .browser_source import MszBrowserSource
+from .env_utils import load_msz_env_files
 from .gdrive_upload import GoogleDriveResumableUploader
 from .msz_api import MszApiClient, MszEntry, ensure_disk_space, norm_rel
 
@@ -25,9 +26,7 @@ def _runtime_dir() -> Path:
 
 
 def _load_env_files() -> None:
-    for env_path in (Path("MSZDRIVE_uploader/.env"), Path(".env"), Path("heroku_bot/.env")):
-        if env_path.exists():
-            load_dotenv(env_path, override=False)
+    load_msz_env_files()
 
 
 class ReverseSyncState:
@@ -147,6 +146,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gdrive-token-pickle", default=os.getenv("GDRIVE_TOKEN_PICKLE", "token.pickle"))
     parser.add_argument("--base-url", default=os.getenv("MSZ_BASE_URL", "https://cloud.medicalstudyzone.com"))
     parser.add_argument("--api-token", default=os.getenv("MSZ_API_TOKEN", ""))
+    parser.add_argument("--email", default=os.getenv("MSZ_EMAIL", ""))
+    parser.add_argument("--password", default=os.getenv("MSZ_PASSWORD", ""))
+    parser.add_argument("--browser-state-file", default="")
+    parser.add_argument("--browser-headed", action="store_true")
+    parser.add_argument("--chromium-executable", default=os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE", ""))
+    parser.add_argument("--no-browser-folder-title", action="store_true")
     parser.add_argument("--runtime-dir", default=str(_runtime_dir()))
     parser.add_argument("--state-file", default="")
     parser.add_argument("--failed-log", default="")
@@ -154,7 +159,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-failed-only", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--delete-failed-downloads", action="store_true")
-    parser.add_argument("--no-resume", action="store_true")
+    parser.set_defaults(no_resume=True)
+    parser.add_argument("--no-resume", dest="no_resume", action="store_true", help="Ignore previous transfer state. Default.")
+    parser.add_argument("--resume", dest="no_resume", action="store_false", help="Resume from previous successful transfer state.")
     parser.add_argument("--public", action="store_true", help="Set uploaded Google Drive files/folders public.")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -206,6 +213,57 @@ def _gdrive_rel_path(root: MszEntry, entry: MszEntry) -> str:
 
 def _gdrive_root_folder_name(root: MszEntry) -> str:
     return Path(root.name).name or "MSZ Source"
+
+
+def _looks_like_fallback_msz_name(root: MszEntry) -> bool:
+    return root.is_folder and str(root.name).startswith("MSZ Folder ")
+
+
+async def _resolve_browser_folder_title(
+    args: argparse.Namespace,
+    *,
+    source_url: str,
+    root: MszEntry,
+    entries: list[MszEntry],
+    runtime_dir: Path,
+    log: Any,
+) -> tuple[MszEntry, list[MszEntry]]:
+    if args.no_browser_folder_title or not source_url or not _looks_like_fallback_msz_name(root):
+        return root, entries
+    if not (args.email or os.getenv("MSZ_EMAIL", "")) or not (args.password or os.getenv("MSZ_PASSWORD", "")):
+        log("Browser folder-title lookup skipped: MSZ_EMAIL/MSZ_PASSWORD are not configured.")
+        return root, entries
+
+    state_file = (
+        Path(args.browser_state_file).expanduser()
+        if args.browser_state_file
+        else runtime_dir / "state" / "msz_browser_state.json"
+    )
+    browser = MszBrowserSource(
+        base_url=args.base_url,
+        email=args.email or os.getenv("MSZ_EMAIL", ""),
+        password=args.password or os.getenv("MSZ_PASSWORD", ""),
+        storage_state_path=state_file,
+        headless=not args.browser_headed,
+        executable_path=args.chromium_executable,
+        verbose=True,
+    )
+    try:
+        title = await browser.resolve_folder_title(source_url)
+    except Exception as exc:
+        log(f"Browser folder-title lookup failed: {exc}")
+        return root, entries
+    title = Path(str(title).replace("\x00", "")).name.strip().strip(" .")
+    if not title or title == root.name:
+        return root, entries
+
+    log(f"Browser resolved folder title: {title}")
+    new_root = replace(root, name=title, rel_path=title)
+    new_entries = []
+    for entry in entries:
+        child_rel = MszApiClient.rel_path_under(root, entry)
+        new_entries.append(replace(entry, rel_path=norm_rel(f"{new_root.rel_path}/{child_rel}")))
+    return new_root, new_entries
 
 
 def _append_failed_log(path: Path, payload: dict[str, Any]) -> None:
@@ -309,6 +367,14 @@ async def run(args: argparse.Namespace) -> int:
         source_path=source_path,
         source_id=source_id,
         source_url=source_url,
+        log=_log,
+    )
+    root, entries = await _resolve_browser_folder_title(
+        args,
+        source_url=source_url,
+        root=root,
+        entries=entries,
+        runtime_dir=runtime_dir,
         log=_log,
     )
     print(f"MSZ source resolved: {root.type} id={root.id} path={root.rel_path}")

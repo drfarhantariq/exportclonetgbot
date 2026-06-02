@@ -16,7 +16,61 @@
       "retries": 2,
       "last_error": "BrowserContext.close: Target page, context or browser has been closed",
       "updated_at": "2026-05-26T09:35:39.263072Z"
+    },
+    "Prepladder RR Version X/Anatomy 👆/1 - Embryology.mp4": {
+      "status": "uploaded",
+      "size": 319527316,
+      "mtime": 1779885512,
+      "method": "browser",
+      "remote_id": null,
+      "attempts": 2,
+      "uploaded_at": "2026-06-02T10:52:55.466613Z"
+    },
+    "Prepladder RR Version X/Anatomy 👆/2 - General Histology.mp4": {
+      "status": "uploaded",
+      "size": 57102142,
+      "mtime": 1779885434,
+      "method": "api",
+      "remote_id": 84024,
+      "attempts": 2,
+      "uploaded_at": "2026-06-02T10:53:16.147811Z"
+    },
+    "Prepladder RR Version X/Anatomy 👆/3 - Types of Joint and Epiphysis.mp4": {
+      "status": "uploaded",
+      "size": 68707283,
+      "mtime": 1779885463,
+      "method": "api",
+      "remote_id": 84025,
+      "attempts": 1,
+      "uploaded_at": "2026-06-02T10:53:40.755277Z"
+    },
+    "Prepladder RR Version X/Anatomy 👆/4 - Upper Limb.mp4": {
+      "status": "uploaded",
+      "size": 230518221,
+      "mtime": 1779885594,
+      "method": "browser",
+      "remote_id": null,
+      "attempts": 2,
+      "uploaded_at": "2026-06-02T11:00:50.950062Z"
+    },
+    "Prepladder RR Version X/Anatomy 👆/5 - Abdomen.mp4": {
+      "status": "uploaded",
+      "size": 139665182,
+      "mtime": 1779885563,
+      "method": "browser",
+      "remote_id": null,
+      "attempts": 1,
+      "uploaded_at": "2026-06-02T11:01:24.342874Z"
+    },
+    "Prepladder RR Version X/Anatomy 👆/6 - Pelvis and Perineum.mp4": {
+      "status": "uploaded",
+      "size": 55389790,
+      "mtime": 1779885530,
+      "method": "api",
+      "remote_id": 84028,
+      "attempts": 1,
+      "uploaded_at": "2026-06-02T11:01:48.381559Z"
     }
   },
-  "updated_at": "2026-05-26T09:49:24.312210Z"
+  "updated_at": "2026-06-02T11:01:48.381735Z"
 }

@@ -134,18 +134,52 @@ class MszBrowserUploader:
         await password_input.fill(self.password)
 
         self._log("submitting login form")
-        button = page.get_by_role("button", name="Continue").or_(
-            page.get_by_role("button", name="Sign in")
-        ).or_(page.get_by_role("button", name="Login"))
-        await button.first.click()
-        await page.wait_for_load_state("networkidle")
+        await self._click_login_submit(page)
+        await self._wait_after_login_submit(page)
         if not await self._looks_logged_in(page):
-            await page.goto(self.base_url, wait_until="networkidle")
+            self._log("login submit did not land on drive; trying /drive once more")
+            await page.goto(self.base_url + "/drive", wait_until="networkidle")
         if not await self._looks_logged_in(page):
-            raise RuntimeError("MSZ browser login did not reach the drive UI.")
+            visible = await self._visible_text_sample(page)
+            raise RuntimeError(
+                f"MSZ browser login did not reach the drive UI. Current URL: {page.url}. "
+                f"Visible text sample: {visible}"
+            )
         self._log("login succeeded")
         self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
         await context.storage_state(path=str(self.storage_state_path))
+
+    async def _click_login_submit(self, page) -> None:
+        candidates = [
+            page.locator('form button[type="submit"]').first,
+            page.locator('button[type="submit"]').first,
+            page.get_by_role("button", name="Continue", exact=True).first,
+            page.get_by_role("button", name="Sign in", exact=True).first,
+            page.get_by_role("button", name="Login", exact=True).first,
+        ]
+        last_error = None
+        for button in candidates:
+            try:
+                if await button.count() == 0:
+                    continue
+                await button.click(timeout=15_000)
+                return
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Could not click MSZ login submit button. Last error: {last_error}")
+
+    async def _wait_after_login_submit(self, page) -> None:
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass
+            if await self._looks_logged_in(page):
+                return
+            if "/login" not in page.url.lower():
+                break
+            await asyncio.sleep(1)
 
     async def _looks_logged_in(self, page) -> bool:
         try:
@@ -176,14 +210,18 @@ class MszBrowserUploader:
         await page.goto(self.base_url + "/drive", wait_until="networkidle")
         for segment in [part for part in target_folder.split("/") if part.strip()]:
             folder_name = segment.strip()
+            await self._close_dialog_if_open(page)
             if not await self._open_folder_if_visible(page, folder_name):
                 await self._create_folder(page, folder_name)
+                await self._close_dialog_if_open(page)
+                await page.wait_for_timeout(1_000)
                 if not await self._open_folder_if_visible(page, folder_name):
                     raise RuntimeError(f"Created or searched for folder, but could not open it: {folder_name}")
 
     async def _open_folder_if_visible(self, page, folder_name: str) -> bool:
         candidates = [
-            page.locator('[role="row"]').filter(has_text=folder_name).first,
+            page.locator('[role="row"], .grid-item, a[href*="/drive/folders/"]').filter(has_text=folder_name).first,
+            page.locator('[data-testid*="file"], [class*="file"]').filter(has_text=folder_name).first,
             page.get_by_text(folder_name, exact=True).first,
         ]
         for locator in candidates:
@@ -198,6 +236,20 @@ class MszBrowserUploader:
                 continue
         self._log(f"folder not visible yet: {folder_name}")
         return False
+
+    async def _close_dialog_if_open(self, page) -> None:
+        dialog = page.locator('[role="dialog"], .modal, [class*="modal"]').first
+        try:
+            if await dialog.count() == 0:
+                return
+            close = page.get_by_role("button", name="Cancel").or_(
+                page.get_by_role("button", name="Close")
+            ).or_(page.locator('[aria-label="Close"], button:has(svg)').last).first
+            if await close.count() > 0:
+                await close.click(timeout=5_000)
+                await page.wait_for_timeout(500)
+        except Exception:
+            return
 
     async def _open_upload_menu(self, page) -> None:
         self._log("opening Upload menu")
@@ -221,8 +273,31 @@ class MszBrowserUploader:
             page.get_by_role("button", name="Create folder")
         ).or_(page.get_by_role("button", name="Save")).first
         await submit.click(timeout=15_000)
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_create_folder_result(page, folder_name)
         await page.wait_for_timeout(1_000)
+
+    async def _wait_for_create_folder_result(self, page, folder_name: str) -> None:
+        deadline = asyncio.get_running_loop().time() + 20
+        duplicate_patterns = (
+            "Folder with same name already exists",
+            "same name already exists",
+            "already exists",
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                body = await page.locator("body").inner_text(timeout=1_000)
+            except Exception:
+                body = ""
+            if any(pattern.lower() in body.lower() for pattern in duplicate_patterns):
+                self._log(f"folder already exists: {folder_name}")
+                return
+            try:
+                if await page.locator('[role="dialog"], .modal, [class*="modal"]').count() == 0:
+                    await page.wait_for_load_state("networkidle", timeout=2_000)
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(0.5)
 
     async def _choose_upload_file(self, page, file_path: Path, timeout_error) -> None:
         self._log("looking for upload control")

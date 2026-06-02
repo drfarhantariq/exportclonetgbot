@@ -100,7 +100,87 @@
       "attempts": 0,
       "updated_at": "2026-05-27T12:45:50.777270Z",
       "error": "Hyper Telegram download returned no file."
+    },
+    "331|gdrive|ENT/114. Anatomy of Ear.mp4|217604464": {
+      "status": "uploaded",
+      "message_id": 331,
+      "target": "gdrive",
+      "destination_path": "ENT/114. Anatomy of Ear.mp4",
+      "size": 217604464,
+      "attempts": 1,
+      "updated_at": "2026-06-02T06:45:07.234930Z",
+      "remote_id": "1VKP9ha6OrkmTSSc9zQux12pSm8nQZIOY"
+    },
+    "332|gdrive|ENT/115. Physiology of Hearing.mp4|76706832": {
+      "status": "uploaded",
+      "message_id": 332,
+      "target": "gdrive",
+      "destination_path": "ENT/115. Physiology of Hearing.mp4",
+      "size": 76706832,
+      "attempts": 1,
+      "updated_at": "2026-06-02T06:45:31.489787Z",
+      "remote_id": "1W37yB4IoBkY3ykwQM0cW_EsUTffchqKr"
+    },
+    "333|gdrive|ENT/116. Assessment of Hearing.mp4|301824118": {
+      "status": "uploading",
+      "message_id": 333,
+      "target": "gdrive",
+      "destination_path": "ENT/116. Assessment of Hearing.mp4",
+      "size": 301824118,
+      "attempts": 1,
+      "updated_at": "2026-06-02T06:46:33.740745Z",
+      "local_path": "/workspaces/exportclonetgbot/runtime/telegram_to_drive_staging/333_116. Assessment of Hearing.mp4"
+    },
+    "331|msz|ENT/114. Anatomy of Ear.mp4|217604464": {
+      "status": "uploaded",
+      "message_id": 331,
+      "target": "msz",
+      "destination_path": "ENT/114. Anatomy of Ear.mp4",
+      "size": 217604464,
+      "attempts": 2,
+      "updated_at": "2026-06-02T06:51:37.479624Z",
+      "remote_id": null
+    },
+    "332|msz|ENT/115. Physiology of Hearing.mp4|76706832": {
+      "status": "uploaded",
+      "message_id": 332,
+      "target": "msz",
+      "destination_path": "ENT/115. Physiology of Hearing.mp4",
+      "size": 76706832,
+      "attempts": 1,
+      "updated_at": "2026-06-02T06:52:13.138938Z",
+      "remote_id": 84014
+    },
+    "333|msz|ENT/116. Assessment of Hearing.mp4|301824118": {
+      "status": "uploaded",
+      "message_id": 333,
+      "target": "msz",
+      "destination_path": "ENT/116. Assessment of Hearing.mp4",
+      "size": 301824118,
+      "attempts": 1,
+      "updated_at": "2026-06-02T06:53:38.047346Z",
+      "remote_id": null
+    },
+    "334|msz|ENT/117. Assessment of Vestibular System.mp4|158723310": {
+      "status": "failed",
+      "message_id": 334,
+      "target": "msz",
+      "destination_path": "ENT/117. Assessment of Vestibular System.mp4",
+      "size": 158723310,
+      "attempts": 0,
+      "updated_at": "2026-06-02T06:53:56.064961Z",
+      "error": "Hyper Telegram download returned no file."
+    },
+    "331|msz|ENT/ᴛɪᴛʟᴇ : 114. Anatomy of Ear ᴄᴏᴜʀsᴇ : \"Rapid Revision Version XI (English)\".mp4|217604464": {
+      "status": "failed",
+      "message_id": 331,
+      "target": "msz",
+      "destination_path": "ENT/ᴛɪᴛʟᴇ : 114. Anatomy of Ear ᴄᴏᴜʀsᴇ : \"Rapid Revision Version XI (English)\".mp4",
+      "size": 217604464,
+      "attempts": 0,
+      "updated_at": "2026-06-02T06:59:33.380683Z",
+      "error": "Hyper Telegram download returned no file."
     }
   },
-  "updated_at": "2026-05-27T12:45:50.777337Z"
+  "updated_at": "2026-06-02T06:59:33.380750Z"
 }

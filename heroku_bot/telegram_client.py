@@ -1406,10 +1406,28 @@ class TelegramService:
                 chat_id=chat_id,
                 text=text,
                 entities=entities,
-                reply_to_message_id=topic_id,
-                disable_web_page_preview=disable_web_page_preview,
+                **self._reply_kwargs(topic_id),
+                **self._link_preview_kwargs(disable_web_page_preview),
             ),
         )
+
+    @staticmethod
+    def _reply_kwargs(message_id: int) -> dict[str, object]:
+        try:
+            from pyrogram.types import ReplyParameters
+
+            return {"reply_parameters": ReplyParameters(message_id=message_id)}
+        except Exception:
+            return {"reply_to_message_id": message_id}
+
+    @staticmethod
+    def _link_preview_kwargs(disabled: bool) -> dict[str, object]:
+        try:
+            from pyrogram.types import LinkPreviewOptions
+
+            return {"link_preview_options": LinkPreviewOptions(is_disabled=disabled)}
+        except Exception:
+            return {"disable_web_page_preview": disabled}
 
     async def send_cached_media_to_topic(
         self,

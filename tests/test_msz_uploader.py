@@ -3,18 +3,28 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sys
+import os
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
-from MSZDRIVE_uploader.msz_api import MszEntry, RemoteFile, infer_extension_from_signature, norm_rel, parse_entries
+from MSZDRIVE_uploader.env_utils import apply_msz_telegram_session_alias
+from MSZDRIVE_uploader.drive_to_telegram import _folders_for_path
+from MSZDRIVE_uploader.drive_to_telegram import _media_kind_for_file
+from MSZDRIVE_uploader.drive_to_telegram import _resolve_msz_source_args as _telegram_msz_source_args
+from MSZDRIVE_uploader.drive_to_telegram import _send_folder_heading, TelegramUploadState
+from MSZDRIVE_uploader.gdrive_upload import GoogleDriveResumableUploader
+from MSZDRIVE_uploader.msz_api import MszApiClient, MszEntry, RemoteFile, infer_extension_from_signature, natural_sort_key, norm_rel, parse_entries
 from MSZDRIVE_uploader.msz_to_gdrive import (
     ReverseSyncState,
     _gdrive_rel_path,
     _gdrive_root_folder_name,
+    _looks_like_fallback_msz_name,
     _resolve_source_args,
     _safe_local_path,
 )
+from MSZDRIVE_uploader.msz_upload import _build_parser as _msz_upload_parser
 from MSZDRIVE_uploader.msz_upload import _find_remote_match, _remote_parent_folder, _target_rel
 from MSZDRIVE_uploader.sources import SourceItem, telegram_media_filename
 from MSZDRIVE_uploader.state import FailedUploadLog, UploadState
@@ -31,7 +41,7 @@ from MSZDRIVE_uploader.telegram_folder_index import _default_output_path as _tel
 from MSZDRIVE_uploader.telegram_folder_index import _safe_filename
 from MSZDRIVE_uploader.telegram_to_drive import _media_folder_assignments, _root_heading_paths, _topic_root, _topic_root_from_headings
 from MSZDRIVE_uploader.transfer import _build_parser as _transfer_parser
-from MSZDRIVE_uploader.transfer import _common_flags, _dest_target, _msz_dest, _source_type, _target_alias
+from MSZDRIVE_uploader.transfer import _common_flags, _dest_target, _gdrive_dest, _msz_dest, _source_type, _target_alias
 
 
 class DummyMediaKind:
@@ -64,6 +74,13 @@ class DummyVideoMessage:
     video = DummyVideo()
 
 
+class DummyCaptionVideoMessage:
+    id = 44
+    media = DummyVideoKind()
+    video = DummyVideo()
+    caption = "Custom Caption Name"
+
+
 class DummyTextMessage:
     media = None
 
@@ -80,8 +97,39 @@ class DummyMediaMessage:
 
 
 class UploaderLogicTests(unittest.TestCase):
+    def test_msz_telegram_session_alias_overrides_telegram_session(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"TG_SESSION_STRING": "heroku-session", "TG_SESSION_STRING_MSZ": "msz-session"},
+            clear=False,
+        ):
+            apply_msz_telegram_session_alias()
+            self.assertEqual(os.environ["TG_SESSION_STRING"], "msz-session")
+
     def test_norm_rel(self) -> None:
         self.assertEqual(norm_rel("./Folder\\File.pdf"), "Folder/File.pdf")
+
+    def test_natural_sort_key_orders_numbered_names(self) -> None:
+        names = ["1. Intro", "11. Later", "12. Later", "2. Next", "20. End", "3. Middle"]
+        self.assertEqual(
+            sorted(names, key=natural_sort_key),
+            ["1. Intro", "2. Next", "3. Middle", "11. Later", "12. Later", "20. End"],
+        )
+        paths = [
+            "Course/1. Biochemistry/11. Lesson.mp4",
+            "Course/1. Biochemistry/2. Lesson.mp4",
+            "Course/10. Final/1. Lesson.mp4",
+            "Course/2. Anatomy/1. Lesson.mp4",
+        ]
+        self.assertEqual(
+            sorted(paths, key=natural_sort_key),
+            [
+                "Course/1. Biochemistry/2. Lesson.mp4",
+                "Course/1. Biochemistry/11. Lesson.mp4",
+                "Course/2. Anatomy/1. Lesson.mp4",
+                "Course/10. Final/1. Lesson.mp4",
+            ],
+        )
 
     def test_parse_entries(self) -> None:
         self.assertEqual(parse_entries({"data": [{"id": 1}]}), [{"id": 1}])
@@ -153,19 +201,27 @@ class UploaderLogicTests(unittest.TestCase):
     def test_telegram_filename(self) -> None:
         self.assertEqual(telegram_media_filename(DummyMessage()), "lecture.pdf")
         self.assertEqual(telegram_media_filename(DummyVideoMessage()), "1. Embryology.mp4")
+        self.assertEqual(
+            telegram_media_filename(DummyCaptionVideoMessage(), use_caption=True),
+            "Custom Caption Name.mp4",
+        )
 
     def test_msz_rel_path_under_folder_and_file(self) -> None:
         folder = MszEntry(id=1, name="Root", type="folder", rel_path="Root")
         child = MszEntry(id=2, name="Video.mp4", type="file", rel_path="Root/Sub/Video.mp4", size=123)
         self.assertEqual(type(folder).__module__, "MSZDRIVE_uploader.msz_api")
-        from MSZDRIVE_uploader.msz_api import MszApiClient
-
         self.assertEqual(MszApiClient.rel_path_under(folder, child), "Sub/Video.mp4")
         self.assertEqual(MszApiClient.rel_path_under(child, child), "Video.mp4")
         self.assertEqual(
             MszApiClient._extract_entry_id_from_url("https://cloud.medicalstudyzone.com/drive/folders/ODQwMDl8cGFkZA"),
             "ODQwMDl8cGFkZA",
         )
+
+    def test_msz_fallback_folder_name_detection(self) -> None:
+        fallback = MszEntry(id=84012, name="MSZ Folder 84012", type="folder", rel_path="MSZ Folder 84012")
+        real = MszEntry(id=84012, name="ENT", type="folder", rel_path="ENT")
+        self.assertTrue(_looks_like_fallback_msz_name(fallback))
+        self.assertFalse(_looks_like_fallback_msz_name(real))
         self.assertEqual(
             MszApiClient._extract_entry_id_from_url("https://cloud.medicalstudyzone.com/drive/files/abc123?x=1"),
             "abc123",
@@ -189,6 +245,33 @@ class UploaderLogicTests(unittest.TestCase):
             ),
             {"id": 34376, "name": "3. Genetics", "type": "folder"},
         )
+
+    def test_scoped_remote_index_resolves_target_folder_only(self) -> None:
+        class FakeClient(MszApiClient):
+            def __init__(self) -> None:
+                pass
+
+            def list_entries(self, per_page=200, max_pages=200, extra_params=None):
+                return [
+                    {"id": 1, "name": "Target", "type": "folder"},
+                    {"id": 99, "name": "Other", "type": "folder"},
+                ]
+
+            def _list_child_entries(self, parent_id, per_page=200, max_pages=200):
+                if parent_id == 1:
+                    return [{"id": 2, "name": "Sub", "type": "folder", "parent_id": 1}]
+                if parent_id == 2:
+                    return [{"id": 3, "name": "Video.mp4", "type": "file", "parent_id": 2, "size": 10}]
+                if parent_id == 99:
+                    self.fail("Scoped index should not list unrelated folders")
+                return []
+
+        client = FakeClient()
+        root = client.resolve_folder_path("Target/Sub")
+        self.assertIsNotNone(root)
+        self.assertEqual(root.rel_path, "Target/Sub")
+        index = client.build_remote_index_for_folder("Target/Sub")
+        self.assertEqual(index["Target/Sub/Video.mp4"].size, 10)
 
     def test_reverse_state_and_safe_local_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,6 +396,106 @@ class UploaderLogicTests(unittest.TestCase):
         self.assertEqual(_target_alias("gd"), "gdrive")
         self.assertEqual(_dest_target("", "gd"), "gdrive")
         self.assertEqual(_dest_target("", "telegram"), "telegram")
+        self.assertEqual(_source_type("gdrive:folder_id", "auto"), "gdrive")
+        self.assertEqual(
+            _source_type("https://drive.google.com/drive/folders/abc", "auto"),
+            "gdrive",
+        )
+        self.assertEqual(
+            _source_type("https://cloud.medicalstudyzone.com/drive/folders/abc", "auto"),
+            "msz",
+        )
+
+    def test_drive_to_telegram_folder_headings(self) -> None:
+        self.assertEqual(
+            _folders_for_path("Course/Anatomy/Upper Limb"),
+            [
+                ("Course", "Course"),
+                ("Course/Anatomy", "Anatomy"),
+                ("Course/Anatomy/Upper Limb", "Upper Limb"),
+            ],
+        )
+
+    def test_drive_to_telegram_media_kind_detection(self) -> None:
+        self.assertEqual(_media_kind_for_file(Path("lecture.mp4")), "video")
+        self.assertEqual(_media_kind_for_file(Path("image.jpg")), "photo")
+        self.assertEqual(_media_kind_for_file(Path("voice.mp3")), "audio")
+        self.assertEqual(_media_kind_for_file(Path("notes.pdf")), "document")
+
+    def test_gdrive_folder_id_extraction(self) -> None:
+        self.assertEqual(
+            GoogleDriveResumableUploader.extract_folder_id("https://drive.google.com/drive/folders/abc123?usp=sharing"),
+            "abc123",
+        )
+        self.assertEqual(GoogleDriveResumableUploader.extract_folder_id("plain_id"), "plain_id")
+
+    def test_drive_to_telegram_msz_source_args_do_not_require_gdrive_dest(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "source": "https://cloud.medicalstudyzone.com/drive/folders/MzQyMDF8cGFkZA",
+                "msz_source_path": "",
+                "msz_source_id": "",
+                "msz_source_url": "",
+            },
+        )()
+        self.assertEqual(
+            _telegram_msz_source_args(args),
+            ("", "", "https://cloud.medicalstudyzone.com/drive/folders/MzQyMDF8cGFkZA"),
+        )
+
+    def test_drive_to_telegram_folder_headings_dedupe_in_current_run(self) -> None:
+        import asyncio
+
+        class Message:
+            id = 123
+
+        class FakeTelegram:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def send_text_to_topic(self, *args, **kwargs):
+                self.calls += 1
+                return Message()
+
+        async def scenario() -> int:
+            with tempfile.TemporaryDirectory() as tmp:
+                state = TelegramUploadState(Path(tmp) / "telegram.json")
+                sent: set[str] = set()
+                telegram = FakeTelegram()
+                await _send_folder_heading(
+                    telegram,
+                    source_type="msz",
+                    chat_id=1,
+                    topic_id=2,
+                    folder_path="Course/Folder",
+                    folder_name="Folder",
+                    state=state,
+                    no_resume=True,
+                    sent_folder_keys=sent,
+                )
+                await _send_folder_heading(
+                    telegram,
+                    source_type="msz",
+                    chat_id=1,
+                    topic_id=2,
+                    folder_path="Course/Folder",
+                    folder_name="Folder",
+                    state=state,
+                    no_resume=True,
+                    sent_folder_keys=sent,
+                )
+                return telegram.calls
+
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(loop.run_until_complete(scenario()), 1)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
     def test_unified_transfer_forwards_telegram_download_mode(self) -> None:
         args = _transfer_parser().parse_args(
@@ -329,6 +512,36 @@ class UploaderLogicTests(unittest.TestCase):
         flags = _common_flags(args)
         self.assertEqual(args.tg_download, "normal")
         self.assertEqual(flags[flags.index("--tg-download") + 1], "normal")
+        self.assertIn("--no-resume", flags)
+
+    def test_unified_transfer_resume_and_caption_flags(self) -> None:
+        args = _transfer_parser().parse_args(
+            [
+                "https://t.me/c/3541699273/105135/105136",
+                "--index-done",
+                "topic.txt",
+                "--up",
+                "gd",
+                "--resume",
+                "--caption-file-names",
+            ]
+        )
+        flags = _common_flags(args)
+        self.assertIn("--resume", flags)
+        self.assertNotIn("--no-resume", flags)
+        self.assertIn("--caption-file-names", flags)
+
+    def test_msz_upload_no_resume_default_and_resume_flag(self) -> None:
+        default_args = _msz_upload_parser().parse_args(
+            ["--source", "local", "--path", "/tmp/files", "--target-folder", "Target"]
+        )
+        resume_args = _msz_upload_parser().parse_args(
+            ["--source", "local", "--path", "/tmp/files", "--target-folder", "Target", "--resume", "--verify-remote"]
+        )
+        self.assertTrue(default_args.no_resume)
+        self.assertTrue(default_args.no_verify_remote)
+        self.assertFalse(resume_args.no_resume)
+        self.assertFalse(resume_args.no_verify_remote)
 
     def test_unified_transfer_uses_index_topic_title_as_msz_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -355,6 +568,23 @@ class UploaderLogicTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(_msz_dest(args, str(index_path)), "Prepladder RR Version X")
+
+    def test_unified_transfer_defaults_gdrive_source_name_as_msz_destination(self) -> None:
+        args = _transfer_parser().parse_args(
+            [
+                "gdrive:1ExampleFolderId",
+                "--up",
+                "msz",
+                "--gdrive-token-pickle",
+                "/tmp/missing-token.pickle",
+            ]
+        )
+        self.assertEqual(_msz_dest(args), "1ExampleFolderId")
+
+    def test_unified_transfer_defaults_gdrive_destination_to_root(self) -> None:
+        args = _transfer_parser().parse_args(["msz:TestUpload", "--up", "gd"])
+        args.gdrive_folder_id = ""
+        self.assertEqual(_gdrive_dest(args), "root")
 
     def test_hyper_telegram_download_requires_helpers(self) -> None:
         import asyncio
@@ -455,6 +685,18 @@ class UploaderLogicTests(unittest.TestCase):
             above = _media_folder_assignments(messages, paths, heading_ids, above=True)
         self.assertEqual([(message.id, folder) for message, folder in below], [(2, "Course/Anatomy"), (3, "Course/Anatomy"), (5, "Course/Physiology")])
         self.assertEqual([(message.id, folder) for message, folder in above], [(2, "Course/Physiology"), (3, "Course/Physiology"), (5, "_Unsorted")])
+
+    def test_telegram_media_assignment_flat_default_folder(self) -> None:
+        messages = [
+            DummyMediaMessage(10),
+            DummyMediaMessage(11),
+        ]
+        with redirect_stdout(StringIO()):
+            below = _media_folder_assignments(messages, {}, set(), above=False, default_folder="Topic Title")
+            above = _media_folder_assignments(messages, {}, set(), above=True, default_folder="Topic Title")
+        expected = [(10, "Topic Title"), (11, "Topic Title")]
+        self.assertEqual([(message.id, folder) for message, folder in below], expected)
+        self.assertEqual([(message.id, folder) for message, folder in above], expected)
 
 
 if __name__ == "__main__":
