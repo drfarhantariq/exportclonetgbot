@@ -125,13 +125,19 @@ def _invalidate_heroku_prefix() -> None:
 def _windows_standalone_heroku() -> list[str] | None:
     if os.name != "nt":
         return None
-    for name in ("heroku.exe", "heroku.cmd"):
-        for base in (
-            Path(os.environ.get("ProgramFiles", "")) / "Heroku" / "bin",
-            Path(os.environ.get("ProgramFiles(x86)", "")) / "Heroku" / "bin",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "heroku" / "bin",
-        ):
-            candidate = base / name
+    for base in (
+        Path(os.environ.get("ProgramFiles", "")) / "Heroku",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Heroku",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "heroku",
+    ):
+        node = base / "client" / "bin" / "node.exe"
+        run_js = base / "client" / "bin" / "run"
+        if node.is_file() and run_js.is_file():
+            return [str(node), str(run_js)]
+
+        bin_dir = base / "bin"
+        for name in ("heroku.exe", "heroku.cmd"):
+            candidate = bin_dir / name
             if candidate.is_file():
                 return [str(candidate)]
     return None
@@ -476,7 +482,7 @@ def set_config(app: str, config: dict[str, str]) -> None:
     print(f"Set {len(config)} Heroku config var(s) for {app}.")
 
 
-def add_apt_buildpack(app: str) -> None:
+def ensure_buildpacks(app: str) -> None:
     prefix = get_heroku_prefix()
     result = subprocess.run(
         prefix + ["buildpacks", "-a", app],
@@ -484,9 +490,11 @@ def add_apt_buildpack(app: str) -> None:
         check=False,
         capture_output=True,
     )
-    if "heroku-community/apt" in (result.stdout or ""):
-        return
-    run_heroku(["buildpacks:add", "--index", "1", "heroku-community/apt", "-a", app])
+    buildpacks = result.stdout or ""
+    if "heroku-community/apt" not in buildpacks:
+        run_heroku(["buildpacks:add", "--index", "1", "heroku-community/apt", "-a", app])
+    if "heroku/python" not in buildpacks:
+        run_heroku(["buildpacks:add", "--index", "2", "heroku/python", "-a", app])
 
 
 def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
@@ -595,7 +603,7 @@ def main() -> int:
         prepare_deploy_dir(args.source_dir.resolve(), args.deploy_dir.resolve())
 
         if not args.skip_apt_buildpack:
-            add_apt_buildpack(args.app)
+            ensure_buildpacks(args.app)
         if not args.skip_config:
             set_config(args.app, config)
         if not args.skip_deploy:
