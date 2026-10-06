@@ -542,6 +542,37 @@ changes. Listings are cached for 15 minutes and run separately from the live
 activity refresh. For **MSZ + Google Drive**, browse a destination for each
 provider; the choices fill the corresponding folder overrides in Options.
 
+## Whole forum group cloning
+
+In **New task → Clone**, set **Clone scope** to **Whole forum group**, then
+browse and select the source and destination forum groups. **Load topics &
+mappings** lets you map source topics to existing destination topics. Unmapped
+topics are created with their source names; General maps to General by default.
+Both groups must have topics enabled and be different groups. The connected
+Telegram account needs access to source history and permission to create topics
+and send messages in the destination. Open closed destination topics in Telegram
+before starting or resuming.
+
+The task indexes a snapshot of accessible messages, including General, and
+clones messages chronologically within each topic. New messages arriving after
+the snapshot are left for a later task. Topic creation and membership service
+events are excluded. Leave the per-topic message limit blank or set it to 0 to
+clone all indexed messages. A dry run indexes and previews without creating
+topics or copying messages.
+
+The website and Telegram panels show total messages, completed topics, current
+topic progress, and current-file progress. Message-index chunks, topic mappings,
+creation IDs, and per-topic checkpoints use the existing MongoDB store. An
+interrupted task auto-resumes after a restart; `/clone resume` also continues a
+failed or cancelled group job. Running a saved completed group profile starts a
+new snapshot. File fallback checkpoints can survive a local process restart,
+but MongoDB is needed across Heroku dyno replacement.
+
+Command example:
+`/clone --whole-group --source-link https://t.me/c/SOURCE_CHAT/1 --destination-link https://t.me/c/DEST_CHAT/1`
+Optional mapping: `--topic-map '{"10":99}'` maps source topic 10 to destination
+topic 99. Specific message IDs are available only in single-topic/channel mode.
+
 ## Standalone browser login
 
 The same workspace also supports website sessions. In BotFather, send

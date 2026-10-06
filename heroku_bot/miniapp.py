@@ -76,7 +76,7 @@ def task_view(engine, kind, state):
         view = {"percent": min(100, processed / total * 100) if total else 0, "elapsed": elapsed, "eta": eta}
         source = (engine._format_clone_endpoint(p, "source") or p.get("source_link", "")) if kind == "clone" else p.get("topic_link", "")
         destination = (engine._format_clone_endpoint(p, "destination") or p.get("destination_link", "")) if kind == "clone" else p.get("upload_topic_link", "")
-        stage = state.get("transfer_stage") or state.get("stage") or phase
+        stage = state.get("transfer_stage") or state.get("group_phase") or state.get("stage") or phase
         current, file_total = state.get(f"{stage}_current"), state.get(f"{stage}_total")
         speed = float(state.get(f"{stage}_speed_bps", 0) or 0)
         file_eta = max(0, (file_total - current) / speed) if speed and file_total and current is not None else None
@@ -91,7 +91,10 @@ def task_view(engine, kind, state):
             "elapsed": view["elapsed"], "eta": view["eta"], "file": state.get("file_name") or state.get("current_file_name") or "",
             "file_type": state.get("current_message_type", ""), "file_done": current, "file_total": file_total,
             "speed": speed, "file_eta": file_eta, "started_at": state.get("started_at"), "finished_at": state.get("finished_at"),
-            "flood_wait": max(0, float(state.get("flood_wait_until", 0) or 0) - time.time())}
+            "flood_wait": max(0, float(state.get("flood_wait_until", 0) or 0) - time.time()),
+            "whole_group": bool(p.get("whole_group")), "topics_done": state.get("group_topics_done", 0),
+            "topics_total": state.get("group_topics_total", 0), "topic": plain(state.get("group_topic_title", "")),
+            "topic_processed": state.get("group_topic_processed", 0), "topic_total": state.get("group_topic_total", 0)}
 
 
 class BridgeMessage:

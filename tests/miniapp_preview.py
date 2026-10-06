@@ -65,8 +65,14 @@ async def main():
         handler_mock.side_effect = handler
     async def catalog_telegram(parent, *_):
         if parent == "root":
-            return {"items": [{"id": "-100123", "name": "PG NEET SS", "kind": "chat", "expandable": True,
-                "forum": True, "description": "Forum · choose a topic", "can_select": False}], "next": None}
+            return {"items": [{"id": cid, "name": name, "kind": "chat", "expandable": True,
+                "forum": True, "description": "Forum · choose a topic", "can_select": False,
+                "source": f"https://t.me/c/{cid[4:]}/1", "destination": f"https://t.me/c/{cid[4:]}/1"}
+                for cid, name in (("-100123", "PG NEET SS"), ("-100456", "Target academy"))], "next": None}
+        if parent == "-100456":
+            return {"items": [{"id": "-100456:99", "name": "Existing anatomy", "kind": "topic", "expandable": False,
+                "description": "Topic #99", "source": "https://t.me/c/456/99/99", "destination": "https://t.me/c/456/99/99",
+                "topic": True, "can_select": True}], "next": None}
         return {"items": [{"id": "-100123:10", "name": "Anatomy", "kind": "topic", "expandable": False,
             "description": "Topic #10", "source": "https://t.me/c/123/10/10", "destination": "https://t.me/c/123/10/10",
             "topic": True, "can_select": True}], "next": None}

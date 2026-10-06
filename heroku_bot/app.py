@@ -46,6 +46,7 @@ from pyrogram.errors import (
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from clone_topic_by_link import _build_endpoint_labels, _resolve_endpoints, run_clone
+from group_clone import run_group_clone, group_endpoints, topic_map
 from config import ConfigError, load_settings
 from export_topic_list import run_export, run_index
 from telegram_client import TelegramService
@@ -314,6 +315,8 @@ def _build_clone_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--source-link", default="")
     parser.add_argument("--destination-link", default="")
+    parser.add_argument("--whole-group", action="store_true")
+    parser.add_argument("--topic-map", default="{}")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--start-id", type=int, default=0)
     parser.add_argument("--limit", type=int, default=10000)
@@ -350,6 +353,7 @@ def _bundle_help_text() -> str:
         "[--continue-on-error] [--hide-sender-name] [--filename-prefix TEXT] [--filename-suffix TEXT] "
         "[--text-prefix TEXT] [--text-suffix TEXT]\n"
         "/clone <source_link> <destination_link>\n"
+        "/clone --whole-group --source-link <group_link> --destination-link <group_link> [--topic-map '{\"source_topic_id\":destination_topic_id}']\n"
         "/clone status\n"
         "/clone queue - List pending clone jobs (FIFO)\n"
         "/clone last or /clone resume\n\n"
@@ -915,6 +919,9 @@ def _resume_clone_payload_from_state(state: dict[str, Any]) -> dict[str, Any] | 
         return None
 
     resumed = dict(payload)
+    if resumed.get("whole_group"):
+        resumed["resume_from_restart"] = True
+        return resumed
     resume_after_id = _resume_source_message_id_from_state(state)
     completed_count = (
         _safe_int(state.get("success"))
@@ -1492,6 +1499,8 @@ async def _fetch_clone_topic_labels_for_payload(payload: dict[str, Any]) -> dict
         if endpoints.destination_topic_id is not None:
             await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
         labels = await _build_endpoint_labels(telegram, endpoints)
+        if merged.get("whole_group"):
+            labels.update(source_topic_title="All topics", destination_topic_title="All topics")
         merged.update(labels)
     except Exception:
         logging.getLogger("heroku_bot").debug("clone topic label prefetch failed", exc_info=True)
@@ -1826,6 +1835,8 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
         task += f" • Source #{_html(state['current_message_id'])}"
     separator = "━━━━━━━━━━━━━━━━━━━━"
     stage_icon, stage_label = {"download": ("⬇", "Downloading"), "upload": ("⬆", "Uploading")}.get(stage, ("🔄", "Cloning"))
+    if not stage and state.get("group_phase"):
+        stage_label = {"indexing": "Indexing group", "creating_topic": "Creating destination topic"}.get(state["group_phase"], "Cloning topics")
     lines = ["<blockquote>⚡ <b>MSZ CLONE BOT</b></blockquote>", "",
              "🟢 <b>CLONING IN PROGRESS</b>" if phase == "running" else f"⏳ <b>{_html(phase.upper())}</b>",
              task, f"👤 {requester}", "", separator, "",
@@ -1837,6 +1848,13 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
              f"⏱ <b>ETA</b> → {_clone_panel_time(overall['eta_seconds'])}",
              f"⌛ <b>Elapsed</b> → {_clone_panel_time(elapsed)}"]
     until = _safe_float(state.get("flood_wait_until"))
+    if payload.get("whole_group"):
+        lines.append(f"🗂 <b>Topics completed</b> → {_safe_int(state.get('group_topics_done'))} / {_safe_int(state.get('group_topics_total'))}")
+        if state.get("group_topic_title"):
+            topic_done, topic_total = _safe_int(state.get("group_topic_processed")), _safe_int(state.get("group_topic_total"))
+            percent = min(100, 100 * topic_done / topic_total) if topic_total else 0
+            lines += [f"📌 <b>Current topic</b> → {_html(state['group_topic_title'])}",
+                      f"{_clone_progress_bar(percent)} {_format_percent(percent)} · {topic_done} / {topic_total} messages"]
     wait = _safe_float(state.get("flood_wait_seconds"))
     if until > time.time() or (wait > 0 and not until):
         remaining = max(until - time.time(), 0) if until else wait
@@ -1977,6 +1995,8 @@ def _format_clone_completion_message(state: dict[str, Any]) -> str:
             f"┠ <b>Skipped</b> → <i>{_html(skipped)}</i>",
             f"┖ <b>Time taken</b> → <i>{_html(_readable_time(elapsed))}</i>",
         ]
+    if payload.get("whole_group"):
+        lines.append(f"🗂 <b>Topics completed</b> → {_safe_int(state.get('group_topics_done'))} / {_safe_int(state.get('group_topics_total'))}")
     if phase in {"failed", "cancelled"}:
         if state.get("error"):
             lines.append(f"<b>Reason</b> → {_html(str(state['error'])[:500])}")
@@ -2145,6 +2165,28 @@ def _format_clone_endpoint(payload: dict[str, Any], prefix: str) -> str:
     if chat_title and topic_title:
         return f"{chat_title} / {topic_title}"
     return chat_title or topic_title
+
+
+class _GroupManifestStore:
+    def __init__(self, store):
+        self.store = store
+
+    async def save(self, key, value):
+        try:
+            await self.store.save(key, value)
+        except Exception:
+            _write_json_file(_snapshot_path(key.replace(":", "_")), value)
+
+    async def load(self, key):
+        try:
+            value = await self.store.load(key)
+        except Exception:
+            value = None
+        return value or _read_json_file(_snapshot_path(key.replace(":", "_")))
+
+
+def _copy_group_progress(source, destination):
+    destination.update({key: value for key, value in source.items() if key.startswith("group_")})
 
 
 async def _save_clone_state(store: MongoStateStore, label: str, state: dict[str, Any]) -> None:
@@ -2771,7 +2813,7 @@ async def _run_clone_job(
                     enriched_payload[key] = state[key]
             wrapper["payload"] = enriched_payload
         if str(wrapper.get("phase", "")).lower() == "running":
-            wrapper["started_at"] = latest_runtime_state.get("started_at") or job_started_at
+            wrapper["started_at"] = (state.get("started_at") if payload.get("whole_group") else None) or latest_runtime_state.get("started_at") or job_started_at
         latest_state_payload = dict(wrapper["payload"])
         latest_runtime_state = dict(wrapper)
         ACTIVE_CLONE_LATEST_STATE = dict(wrapper)
@@ -2854,6 +2896,8 @@ async def _run_clone_job(
                     last_reported_flood_wait_until = flood_wait_until
 
         should_persist = (
+            wrapper.get("force_checkpoint")
+            or
             terminal_checkpoint
             or phase != "running"
             or success != last_persisted_success
@@ -2922,30 +2966,34 @@ async def _run_clone_job(
                 sticky_message_id = None
 
     try:
-        success, failed = await run_clone(
-            source_link=payload["source_link"],
-            destination_link=payload["destination_link"],
-            config_path=payload["config_path"],
-            start_id=int(payload["start_id"]),
-            limit=int(payload["limit"]),
-            delay_sec=float(payload["delay_sec"]),
-            batch_size=int(payload["batch_size"]),
-            message_ids=payload["message_ids"],
-            dry_run=bool(payload["dry_run"]),
-            continue_on_error=bool(payload["continue_on_error"]),
-            hide_sender_name=bool(payload["hide_sender_name"]),
-            filename_prefix=str(payload.get("filename_prefix", "") or ""),
-            filename_suffix=str(payload.get("filename_suffix", "") or ""),
-            text_prefix=str(payload.get("text_prefix", "") or ""),
-            text_suffix=str(payload.get("text_suffix", "") or ""),
-            status_callback=_save_state_inner,
-            cancel_event=ACTIVE_CLONE_CANCEL_EVENT,
-        )
+        if payload.get("whole_group"):
+            success, failed = await run_group_clone(payload, _GroupManifestStore(store), _save_state_inner, ACTIVE_CLONE_CANCEL_EVENT)
+        else:
+            success, failed = await run_clone(
+                source_link=payload["source_link"],
+                destination_link=payload["destination_link"],
+                config_path=payload["config_path"],
+                start_id=int(payload["start_id"]),
+                limit=int(payload["limit"]),
+                delay_sec=float(payload["delay_sec"]),
+                batch_size=int(payload["batch_size"]),
+                message_ids=payload["message_ids"],
+                dry_run=bool(payload["dry_run"]),
+                continue_on_error=bool(payload["continue_on_error"]),
+                hide_sender_name=bool(payload["hide_sender_name"]),
+                filename_prefix=str(payload.get("filename_prefix", "") or ""),
+                filename_suffix=str(payload.get("filename_suffix", "") or ""),
+                text_prefix=str(payload.get("text_prefix", "") or ""),
+                text_suffix=str(payload.get("text_suffix", "") or ""),
+                status_callback=_save_state_inner,
+                cancel_event=ACTIVE_CLONE_CANCEL_EVENT,
+            )
     except asyncio.CancelledError:
+        interrupted_group = payload.get("whole_group") and not ACTIVE_CLONE_CANCEL_EVENT.is_set()
         cancelled_state = {
-            "phase": "cancelled",
+            "phase": "running" if interrupted_group else "cancelled",
             "payload": latest_state_payload,
-            "error": "Cancelled by user",
+            "error": "Interrupted; waiting to resume after restart" if interrupted_group else "Cancelled by user",
             "started_at": latest_runtime_state.get("started_at", job_started_at),
             "current_index": latest_runtime_state.get("current_index", 0),
             "total_messages": latest_runtime_state.get("total_messages", 0),
@@ -2969,6 +3017,7 @@ async def _run_clone_job(
         ):
             if latest_runtime_state.get(key):
                 cancelled_state[key] = latest_runtime_state[key]
+        _copy_group_progress(latest_runtime_state, cancelled_state)
         await _save_clone_state(
             store,
             "last",
@@ -3006,6 +3055,7 @@ async def _run_clone_job(
         ):
             if latest_runtime_state.get(key):
                 failed_state[key] = latest_runtime_state[key]
+        _copy_group_progress(latest_runtime_state, failed_state)
         await _save_clone_state(
             store,
             "last",
@@ -3034,6 +3084,7 @@ async def _run_clone_job(
             result["last_processed_source_message_id"] = latest_runtime_state["last_processed_source_message_id"]
         if latest_runtime_state.get("resume_after_source_message_id"):
             result["resume_after_source_message_id"] = latest_runtime_state["resume_after_source_message_id"]
+        _copy_group_progress(latest_runtime_state, result)
         await _save_clone_state(store, "last", result)
         ACTIVE_CLONE_LATEST_STATE = dict(result)
         latest_runtime_state = dict(result)
@@ -4913,6 +4964,9 @@ async def run_bot() -> None:
             if not isinstance(payload, dict):
                 await message.reply_text("Saved clone profile is invalid or already fully resumed.")
                 return
+            if payload.get("whole_group") and stored.get("phase") == "completed":
+                payload = dict(payload)
+                payload.pop("group_plan", None)
         else:
             normalized = _normalize_clone_command(command_text)
             try:
@@ -4925,7 +4979,9 @@ async def run_bot() -> None:
                 "destination_link": parsed.destination_link,
                 "config_path": parsed.config,
                 "start_id": parsed.start_id,
-                "limit": parsed.limit,
+                "limit": 0 if parsed.whole_group and "--limit" not in normalized else parsed.limit,
+                "whole_group": parsed.whole_group,
+                "topic_map": parsed.topic_map,
                 "delay_sec": parsed.delay_sec
                 if "--delay-sec" in normalized
                 else float(bot_settings["clone_default_delay_sec"]),
@@ -4953,6 +5009,14 @@ async def run_bot() -> None:
                 if "--text-suffix" in normalized
                 else str(bot_settings["clone_text_suffix_default"]),
             }
+
+            if payload.get("whole_group"):
+                try:
+                    group_endpoints(payload)
+                    topic_map(payload.get("topic_map"))
+                except (ValueError, TypeError) as exc:
+                    await message.reply_text(str(exc))
+                    return
 
         user = getattr(message, "from_user", None)
         payload = dict(payload)

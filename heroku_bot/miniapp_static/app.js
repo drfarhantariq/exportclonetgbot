@@ -205,11 +205,16 @@ function route(task) {
 function results(t) {
   return `<div class="results"><span><b>${["export", "index"].includes(t.kind) ? t.processed || 0 : t.success || 0}</b> ${t.kind === "clone" ? "forwarded" : t.kind === "transfer" ? "uploaded" : "processed"}</span><span><b>${t.skipped || 0}</b> skipped</span><span><b>${t.failed || 0}</b> failed</span></div>`;
 }
+function groupTopicProgress(t) {
+  if (!t.whole_group) return "";
+  const percent = t.topic_total ? Math.min(100, 100 * t.topic_processed / t.topic_total) : 0;
+  return `<div class="group-topic-progress"><div class="progress-header"><span>Topics completed · ${t.topics_done} / ${t.topics_total || "…"}</span></div>${t.topic ? `<div class="progress-header"><span>${escape(t.topic)} · ${t.topic_processed} / ${t.topic_total} messages</span><b>${percent.toFixed(1)}%</b></div>${progress(percent, "file")}` : ""}</div>`;
+}
 function taskCard(t) {
   const filePercent = t.file_total
     ? Math.min(100, ((t.file_done || 0) / t.file_total) * 100)
     : 0;
-  return `<article class="panel task-card"><div class="task-head"><div class="task-ident"><div class="kind-icon ${escape(t.kind)}">${icon(t.kind)}</div><div><h3>${types[t.kind]?.label || "Task"} in progress</h3><div class="tiny">TASK #${escape(String(t.id).slice(0, 8))}</div></div></div>${badge(t.flood_wait ? "waiting" : t.stage || t.phase)}</div>${route(t)}<div class="progress-header"><span>Overall progress · ${t.processed} / ${t.total || "…"} ${t.kind === "transfer" ? "files" : "messages"}</span><b>${Number(t.percent || 0).toFixed(1)}%</b></div>${progress(t.percent)}<div class="task-times"><span>Elapsed ${duration(t.elapsed)}</span><span>${t.flood_wait ? "Flood wait " + duration(t.flood_wait) : t.eta == null ? "Estimating remaining time" : "About " + duration(t.eta) + " remaining"}</span></div>${t.file ? `<div class="current-file"><div class="file-head">${icon("file")}<span title="${escape(t.file)}">${escape(t.file)}</span></div>${t.file_total ? progress(filePercent, "file") : ""}<div class="file-meta"><span>${filePercent.toFixed(1)}% · ${bytes(t.file_done)} / ${bytes(t.file_total)}</span><span>${t.speed ? bytes(t.speed) + "/s" : "—"}</span><span>ETA ${t.file_eta == null ? "—" : duration(t.file_eta)}</span></div></div>` : ""}<div class="task-bottom">${results(t)}<div class="task-actions"><button class="button small ghost" data-detail="${escape(t.id)}">Details</button><button class="icon-button" aria-label="Cancel ${escape(t.kind)} task" data-cancel="${escape(t.kind)}">${icon("stop")}</button></div></div></article>`;
+  return `<article class="panel task-card"><div class="task-head"><div class="task-ident"><div class="kind-icon ${escape(t.kind)}">${icon(t.kind)}</div><div><h3>${types[t.kind]?.label || "Task"} in progress</h3><div class="tiny">TASK #${escape(String(t.id).slice(0, 8))}</div></div></div>${badge(t.flood_wait ? "waiting" : t.stage || t.phase)}</div>${route(t)}<div class="progress-header"><span>Overall progress · ${t.processed} / ${t.total || "…"} ${t.kind === "transfer" ? "files" : "messages"}</span><b>${Number(t.percent || 0).toFixed(1)}%</b></div>${progress(t.percent)}<div class="task-times"><span>Elapsed ${duration(t.elapsed)}</span><span>${t.flood_wait ? "Flood wait " + duration(t.flood_wait) : t.eta == null ? "Estimating remaining time" : "About " + duration(t.eta) + " remaining"}</span></div>${groupTopicProgress(t)}${t.file ? `<div class="current-file"><div class="file-head">${icon("file")}<span title="${escape(t.file)}">${escape(t.file)}</span></div>${t.file_total ? progress(filePercent, "file") : ""}<div class="file-meta"><span>${filePercent.toFixed(1)}% · ${bytes(t.file_done)} / ${bytes(t.file_total)}</span><span>${t.speed ? bytes(t.speed) + "/s" : "—"}</span><span>ETA ${t.file_eta == null ? "—" : duration(t.file_eta)}</span></div></div>` : ""}<div class="task-bottom">${results(t)}<div class="task-actions"><button class="button small ghost" data-detail="${escape(t.id)}">Details</button><button class="icon-button" aria-label="Cancel ${escape(t.kind)} task" data-cancel="${escape(t.kind)}">${icon("stop")}</button></div></div></article>`;
 }
 function historyTable(tasks) {
   if (!tasks.length)
@@ -293,7 +298,7 @@ function create() {
     true,
   );
   if (k === "clone")
-    fields += field(
+    fields = `<div class="field full"><label for="clone_scope">Clone scope</label><select id="clone_scope" name="clone_scope"><option value="single">Single topic or channel</option><option value="group">Whole forum group · preserve topics</option></select><small>Whole group mode creates matching topics. General maps to General by default.</small></div>` + fields + field(
       "destination",
       "Destination Telegram chat or topic",
       "https://t.me/c/…",
@@ -322,6 +327,7 @@ function create() {
       "",
       true,
     );
+  if (k === "clone") fields += `<section id="group-mapping" class="full" hidden><input type="hidden" id="topic_map" name="topic_map" value="{}"><div class="section-heading"><h3>Topic mapping</h3><button type="button" id="group-load-topics" class="button secondary small">Load topics & mappings</button></div><p class="muted">New topics keep the source names. You can choose an existing destination for each topic. Messages are copied in order within each topic.</p><div id="group-mapping-list" role="status"></div></section>`;
   let advanced = "";
   if (k === "clone") {
     advanced =
@@ -400,6 +406,10 @@ function buildCommand(form) {
     destination = String(data.get("destination") || "").trim();
   let args = ["/" + k];
   if (k === "clone") {
+    if (data.get("clone_scope") === "group") {
+      args.push("--whole-group");
+      if (data.get("topic_map") && data.get("topic_map") !== "{}") args.push("--topic-map", quote(data.get("topic_map")));
+    }
     args.push(
       "--source-link",
       quote(source),
@@ -560,6 +570,7 @@ function render() {
   fillIcons();
   if (app.view === "create") {
     restoreDraft();
+    if (typeof syncCloneScope === "function") syncCloneScope();
     updatePreview();
   }
 }

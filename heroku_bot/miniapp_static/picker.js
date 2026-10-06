@@ -37,6 +37,8 @@ function allowedProviders(fieldName) {
 }
 
 function pickerSelectable(item) {
+  if (typeof wholeGroupMode === "function" && wholeGroupMode() && picker.provider === "telegram")
+    return item.kind === "chat" && item.forum;
   if (!item.can_select) return false;
   if (picker.provider === "telegram" && !item.topic && app.kind !== "clone")
     return false;
@@ -78,12 +80,14 @@ function renderPicker() {
           return "";
         const selectable = pickerSelectable(item);
         const selected = picker.selected?.id === item.id;
+        const description = item.forum && typeof wholeGroupMode === "function" && wholeGroupMode()
+          ? "Forum · all topics" : item.description || "";
         const unavailable = picker.field !== "source" && item.writable === false
           ? " · Read-only folder"
-          : !selectable && !item.expandable ? " · This workflow needs a forum topic" : "";
-        const create = picker.provider === "telegram" && picker.field === "destination" && item.forum
+          : !selectable && !item.expandable ? (typeof wholeGroupMode === "function" && wholeGroupMode() ? " · Choose a whole forum group" : " · This workflow needs a forum topic") : "";
+        const create = picker.provider === "telegram" && picker.field === "destination" && item.forum && !(typeof wholeGroupMode === "function" && wholeGroupMode())
           ? `<button type="button" class="button secondary small picker-new-topic" data-picker-new-topic="${escape(item.id)}" aria-label="New topic in ${escape(item.name)}" ${picker.creating ? "disabled" : ""}>+ New topic</button>` : "";
-        return `<div class="picker-node"><div class="picker-row ${selected ? "selected" : ""}"><span class="picker-indent" data-picker-depth="${depth}"></span>${item.expandable ? `<button class="icon-button picker-expand ${expanded ? "expanded" : ""}" type="button" data-picker-expand="${escape(item.id)}" aria-label="${expanded ? "Collapse" : "Expand"} ${escape(item.name)}" aria-expanded="${expanded}">${icon("chevron")}</button>` : '<span class="picker-spacer"></span>'}<button type="button" class="picker-entry" ${selectable ? `data-picker-select="${escape(item.id)}"` : item.expandable ? `data-picker-expand="${escape(item.id)}"` : "disabled"} aria-pressed="${selected}"><span class="picker-entry-icon">${icon(item.kind === "topic" ? "layers" : item.kind === "chat" ? "clone" : "folder")}</span><span><b>${escape(item.name)}</b><small>${escape(item.description || "")}${escape(unavailable)}</small></span>${selected ? icon("check") : ""}</button>${create}</div>${children}</div>`;
+        return `<div class="picker-node"><div class="picker-row ${selected ? "selected" : ""}"><span class="picker-indent" data-picker-depth="${depth}"></span>${item.expandable ? `<button class="icon-button picker-expand ${expanded ? "expanded" : ""}" type="button" data-picker-expand="${escape(item.id)}" aria-label="${expanded ? "Collapse" : "Expand"} ${escape(item.name)}" aria-expanded="${expanded}">${icon("chevron")}</button>` : '<span class="picker-spacer"></span>'}<button type="button" class="picker-entry" ${selectable ? `data-picker-select="${escape(item.id)}"` : item.expandable ? `data-picker-expand="${escape(item.id)}"` : "disabled"} aria-pressed="${selected}"><span class="picker-entry-icon">${icon(item.kind === "topic" ? "layers" : item.kind === "chat" ? "clone" : "folder")}</span><span><b>${escape(item.name)}</b><small>${escape(description)}${escape(unavailable)}</small></span>${selected ? icon("check") : ""}</button>${create}</div>${children}</div>`;
       })
       .join("");
     return (
@@ -312,6 +316,7 @@ $("#picker-choose").onclick = () => {
   const input = document.getElementById(fieldName);
   if (!input || !value) return;
   input.value = value;
+  if (typeof resetGroupMappings === "function") resetGroupMappings();
   const label = document.getElementById(fieldName + "-selection");
   if (label)
     label.textContent = `${providerLabels[picker.provider]} / ${item.name}`;

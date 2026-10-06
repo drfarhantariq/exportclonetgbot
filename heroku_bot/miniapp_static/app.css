@@ -2015,6 +2015,14 @@ dialog h2 {
 .picker-topic-form label { display: block; margin-bottom: 8px; }
 .picker-topic-form input { width: 100%; }
 .picker-new-topic { flex-shrink: 0; }
+.group-map-rows { margin-bottom: 16px; }
+#group-mapping { grid-column: 1 / -1; min-width: 0; }
+#group-mapping h3 { font-size: 15px; }
+.group-map-row { display: grid; grid-template-columns: 1fr 1.4fr; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.group-map-row b { display: block; overflow-wrap: anywhere; font-size: 13px; }
+.group-map-row small { display: block; color: var(--muted); font-size: 11px; }
+.group-topic-progress { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+@media (max-width: 600px) { .group-map-row { grid-template-columns: 1fr; } }
 .picker-more {
   padding: 12px 20px;
 }

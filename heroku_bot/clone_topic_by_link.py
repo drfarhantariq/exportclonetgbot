@@ -29,6 +29,7 @@ from models import MessageKind
 from telegram_client import TelegramService
 from topic_utils import (
     build_private_topic_link,
+    build_private_message_link,
     parse_private_chat_message_link,
     parse_private_topic_link,
 )
@@ -784,6 +785,8 @@ async def _clone_restricted_message(
 def _build_destination_message_link(endpoints: CloneEndpoints, destination_message_id: int | None) -> str | None:
     if not destination_message_id:
         return None
+    if endpoints.destination_topic_id is None:
+        return build_private_message_link(endpoints.destination_chat_id, destination_message_id)
     return build_private_topic_link(
         endpoints.destination_chat_id,
         endpoints.destination_topic_id,
