@@ -139,7 +139,12 @@ class BrowserLogin:
                     source = await response.text()
             if len(source) > 256 * 1024 or "Telegram" not in source:
                 raise ValueError("Could not load Telegram login.")
-            self.widget_source = source
+            # Telegram infers its OAuth host from currentScript.src. A local
+            # loader must retain the official default host for iframe/messages.
+            origin_line = "link.href = document.currentScript && document.currentScript.src || default_origin;"
+            if source.count(origin_line) != 1:
+                raise ValueError("Telegram login loader changed. Please use the Mini App for now.")
+            self.widget_source = source.replace(origin_line, "link.href = default_origin;")
         return web.Response(text=self.widget_source, content_type="application/javascript")
 
     def verify_legacy(self, request, flow):
