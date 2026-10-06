@@ -89,6 +89,7 @@ const app = {
   polling: false,
   seen: new Set(),
   drafts: {},
+  browserAuth: null,
   settingsLoaded: 0,
 };
 function fillIcons() {
@@ -136,7 +137,8 @@ function toast(text, error = false) {
 }
 async function api(path, options = {}) {
   const headers = {
-    Authorization: "tma " + (tg?.initData || ""),
+    ...(tg?.initData ? { Authorization: "tma " + tg.initData } : {}),
+    ...(app.browserAuth?.csrf ? { "X-CSRF-Token": app.browserAuth.csrf } : {}),
     ...(options.body instanceof FormData
       ? {}
       : { "Content-Type": "application/json" }),
@@ -520,6 +522,17 @@ function operationReplies() {
   );
 }
 function locked(message) {
+  if (!tg?.initData) {
+    const enabled = app.browserAuth?.enabled;
+    const errors = {
+      setup: "Website login needs to be configured in BotFather and Heroku.",
+      admin: "This Telegram account is not a bot admin.",
+      failed: "Login was cancelled or could not be verified. Please try again.",
+    };
+    const loginError =
+      errors[new URLSearchParams(location.search).get("login_error")];
+    return `<div class="panel locked"><span class="brand-icon">↗</span><div class="eyebrow">MSZ WORKSPACE</div><h1>Your bot’s control room.</h1><p>${escape(loginError || (enabled ? "Sign in with your Telegram admin account to manage tasks, queues and settings from your browser." : app.browserAuth ? "Website login is awaiting BotFather setup. You can still use the app inside Telegram." : "Connecting to your workspace…"))}</p>${enabled ? '<a class="button" href="/auth/login">Log in with Telegram</a>' : ""}<div class="history-section"><a class="text-button" href="https://t.me/mszec_bot">Open the bot in Telegram</a></div><p class="muted history-section">Admin access only · Sessions expire after 12 hours</p></div>`;
+  }
   return `<div class="panel locked"><span class="brand-icon">↗</span><div class="eyebrow">MSZ WORKSPACE</div><h1>Your bot’s control room.</h1><p>${escape(message || "Open this Mini App from your Telegram bot to securely access your tasks, queues and settings.")}</p><button class="button" id="retry-auth">${icon("refresh")} Try connecting again</button><p class="muted history-section">In your bot chat, send /app or tap Open App.</p></div>`;
 }
 function render() {
@@ -622,6 +635,21 @@ async function poll() {
   if (app.polling || document.hidden) return;
   app.polling = true;
   try {
+    if (!tg?.initData && (!app.browserAuth || app.locked)) {
+      const response = await fetch("/auth/session");
+      if (!response.ok)
+        throw new Error("Could not check your browser session.");
+      app.browserAuth = await response.json();
+      $("#browser-logout").hidden = !app.browserAuth.authenticated;
+      if (!app.browserAuth.authenticated) {
+        app.data = null;
+        app.locked = true;
+        $("#connection").textContent = "Sign in required";
+        $("#sync").textContent = "Signed out";
+        render();
+        return;
+      }
+    }
     const data = await api("state");
     app.data = data;
     app.connected = true;
@@ -665,6 +693,10 @@ async function poll() {
     $("#sync").textContent = "Offline";
     if (e.status === 401) {
       app.locked = true;
+      app.data = null;
+      app.settings = null;
+      $("#detail").close();
+      $("#confirm").close();
       app.error = e.message;
       render();
     } else if (!app.data) {
@@ -820,6 +852,19 @@ document.addEventListener("click", async (event) => {
   } catch (e) {
     button.disabled = false;
     toast(e.message, true);
+  }
+});
+$("#browser-logout").addEventListener("click", async () => {
+  try {
+    const response = await fetch("/auth/logout", {
+      method: "POST",
+      headers: { "X-CSRF-Token": app.browserAuth?.csrf || "" },
+    });
+    if (!response.ok)
+      throw new Error("Could not log out. Refresh the page and try again.");
+    location.replace("/");
+  } catch (error) {
+    toast(error.message, true);
   }
 });
 document.addEventListener("change", async (e) => {

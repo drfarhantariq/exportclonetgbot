@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qsl
 
 from aiohttp import ClientSession, web
+from browser_login import BrowserLogin
 
 STATIC = Path(__file__).with_name("miniapp_static")
 COMMANDS = {"clone", "transfer", "export", "index", "cancel", "settings", "login", "help", "log", "status", "restart"}
@@ -121,8 +122,16 @@ class MiniAppServer:
         self.tasks = set()
         self.runner = None
         self.ready = False
+        self.browser_login = BrowserLogin(self)
         self.app = web.Application(client_max_size=3 * 1024**2, middlewares=[self.middleware])
         self.app.add_routes([web.get("/", self.index), web.get("/health", self.health),
+                             web.get("/auth/session", self.browser_login.info),
+                             web.get("/auth/login", self.browser_login.start),
+                             web.get("/auth/callback", self.browser_login.callback),
+                             web.get("/auth/widget", self.browser_login.widget),
+                             web.get("/auth/widget-config", self.browser_login.widget_config),
+                             web.get("/auth/legacy-callback", self.browser_login.legacy_callback),
+                             web.post("/auth/logout", self.browser_login.logout),
                              web.get("/api/state", self.state), web.get("/api/settings", self.settings),
                              web.post("/api/command", self.command), web.post("/api/upload", self.upload),
                              web.post("/api/queue", self.queue_action), web.get("/api/logs", self.logs)])
@@ -135,9 +144,10 @@ class MiniAppServer:
                 if not self.ready:
                     return web.json_response({"error": "Bot is connecting. Try again shortly."}, status=503)
                 auth = request.headers.get("Authorization", "")
-                if not auth.startswith("tma "):
-                    raise ValueError("Open this app from the bot's Open App button.")
-                request["user"] = verify_init_data(auth.removeprefix("tma "), self.token, self.admins())
+                if auth.startswith("tma "):
+                    request["user"] = verify_init_data(auth.removeprefix("tma "), self.token, self.admins())
+                else:
+                    request["user"], _ = await self.browser_login.authenticate(request, mutation=request.method == "POST")
                 if request.method == "POST":
                     uid = request["user"]["id"]
                     hits = self.rates[uid]
@@ -158,7 +168,7 @@ class MiniAppServer:
             response = web.json_response({"error": "Action failed. Check the bot chat or try again."}, status=500)
         response.headers.update({"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                                  "Referrer-Policy": "no-referrer",
-                                 "Content-Security-Policy": "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'"})
+                                 "Content-Security-Policy": "default-src 'self'; script-src 'self' https://telegram.org; frame-src https://oauth.telegram.org; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"})
         return response
 
     async def index(self, request):

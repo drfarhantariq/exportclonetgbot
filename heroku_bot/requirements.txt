@@ -17,3 +17,4 @@ google-auth-httplib2
 google-auth-oauthlib
 tenacity
 aiohttp>=3.10,<4
+PyJWT[crypto]==2.10.1

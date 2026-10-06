@@ -1856,6 +1856,21 @@ dialog h2 {
   border-radius: 10px;
   flex-shrink: 0;
 }
+.browser-logout[hidden] {
+  display: none !important;
+}
+.browser-logout {
+  white-space: nowrap;
+}
+.locked a.button {
+  text-decoration: none;
+  display: inline-flex;
+}
+.browser-login-page {
+  max-width: 640px;
+  margin: 10vh auto;
+  padding: 20px;
+}
 @media (max-width: 720px) {
   .topbar-right {
     gap: 12px;

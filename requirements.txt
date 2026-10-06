@@ -13,3 +13,4 @@ google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 tenacity
+PyJWT[crypto]==2.10.1

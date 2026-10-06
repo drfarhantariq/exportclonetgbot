@@ -515,3 +515,28 @@ Combined panels limit custom emoji entities to 100 and use readable text for
 additional letters. If Telegram rejects or removes custom emoji entities, the panel automatically
 falls back to ordinary lettering. Emoji document IDs and their exact alt emoji
 are bundled in transfer_emoji_packs.json; no runtime pack download is needed.
+
+## Standalone browser login
+
+The same workspace also supports website sessions. In BotFather, send
+`/setdomain`, select `@mszec_bot`, and register
+`exportclonemszbot-49376411b650.herokuapp.com` (no scheme or path). Open
+`MINIAPP_URL` in a browser and choose **Log in with Telegram**. Approve using
+an account listed in `BOT_ADMIN_USER_IDS`. No extra Heroku credentials are
+needed for this login widget. Telegram Mini App authentication continues to
+work independently.
+
+Browser sessions expire after 12 hours. The opaque cookie is Secure, HttpOnly,
+and SameSite=Lax; only a hash of it is used to locate the saved session. Session
+records use the existing state store so sessions survive a deployment when
+MongoDB is available. Admin membership is checked on every API request.
+Browser mutations require a session CSRF token and the configured website
+Origin. **Log out** revokes the session on the server. Login errors never
+include OAuth codes, identity tokens, or credentials.
+
+For bots with BotFather's newer **Login Widget** menu, an optional OIDC flow
+is also available: register the website origin and `MINIAPP_URL/auth/callback`
+as Allowed URLs; set `TELEGRAM_LOGIN_CLIENT_ID` and
+`TELEGRAM_LOGIN_CLIENT_SECRET` in Heroku Config Vars and retain RS256 signing.
+Both vars must be present to select OIDC instead of the older widget. It uses
+state, PKCE, Telegram's signing keys, and issuer/audience/expiry validation.
