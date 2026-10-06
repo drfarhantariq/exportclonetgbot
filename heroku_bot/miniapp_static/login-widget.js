@@ -6,7 +6,7 @@
       throw new Error("Login expired. Return to the workspace and try again.");
     const config = await response.json();
     const script = document.createElement("script");
-    script.src = "https://telegram.org/js/telegram-widget.js?22";
+    script.src = "/auth/widget-script";
     script.async = true;
     script.setAttribute("data-telegram-login", config.bot);
     script.setAttribute("data-size", "large");

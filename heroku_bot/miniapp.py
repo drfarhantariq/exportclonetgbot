@@ -130,6 +130,7 @@ class MiniAppServer:
                              web.get("/auth/callback", self.browser_login.callback),
                              web.get("/auth/widget", self.browser_login.widget),
                              web.get("/auth/widget-config", self.browser_login.widget_config),
+                             web.get("/auth/widget-script", self.browser_login.widget_script),
                              web.get("/auth/legacy-callback", self.browser_login.legacy_callback),
                              web.post("/auth/logout", self.browser_login.logout),
                              web.get("/api/state", self.state), web.get("/api/settings", self.settings),

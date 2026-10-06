@@ -22,6 +22,7 @@ class BrowserLogin:
         self.server = server
         self.key = hmac.new(server.token.encode(), b"msz-browser-login-v1", hashlib.sha256).digest()
         self.keys, self.keys_until = {}, 0
+        self.widget_source = None
 
     def config(self):
         origin = self.origin()
@@ -127,6 +128,19 @@ class BrowserLogin:
         if not username:
             username = os.getenv("TELEGRAM_LOGIN_BOT_USERNAME", "mszec_bot").lstrip("@")
         return web.json_response({"bot": username, "callback": origin + "/auth/legacy-callback?" + urlencode({"state": flow["state"]})})
+
+    async def widget_script(self, request):
+        # Serve Telegram's fixed official loader through our HTTPS origin so
+        # browsers on networks blocking telegram.org can still reach the login UI.
+        if self.widget_source is None:
+            async with ClientSession() as session:
+                async with session.get("https://telegram.org/js/telegram-widget.js?22", timeout=20) as response:
+                    response.raise_for_status()
+                    source = await response.text()
+            if len(source) > 256 * 1024 or "Telegram" not in source:
+                raise ValueError("Could not load Telegram login.")
+            self.widget_source = source
+        return web.Response(text=self.widget_source, content_type="application/javascript")
 
     def verify_legacy(self, request, flow):
         if len(request.query) != len(set(request.query)) or len(request.query_string) > 16384:
