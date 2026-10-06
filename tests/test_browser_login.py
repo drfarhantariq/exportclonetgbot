@@ -54,7 +54,7 @@ class BrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cookie["secure"])
         self.assertTrue(cookie["httponly"])
         self.assertEqual(cookie["samesite"], "Lax")
-        self.assertEqual(cookie["max-age"], "43200")
+        self.assertEqual(cookie["max-age"], "432000")
         raw = cookie.value
         record = self.docs[self.login.session_key(raw)]
         self.assertNotIn(raw, json.dumps(self.docs))

@@ -526,7 +526,7 @@ an account listed in `BOT_ADMIN_USER_IDS`. No extra Heroku credentials are
 needed for this login widget. Telegram Mini App authentication continues to
 work independently.
 
-Browser sessions expire after 12 hours. The opaque cookie is Secure, HttpOnly,
+Browser sessions expire after 5 days. The opaque cookie is Secure, HttpOnly,
 and SameSite=Lax; only a hash of it is used to locate the saved session. Session
 records use the existing state store so sessions survive a deployment when
 MongoDB is available. Admin membership is checked on every API request.

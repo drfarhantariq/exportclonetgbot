@@ -13,7 +13,7 @@ from aiohttp import BasicAuth, ClientSession, web
 
 SESSION_COOKIE = "__Host-msz_session"
 FLOW_COOKIE = "__Host-msz_login"
-SESSION_AGE = 12 * 3600
+SESSION_AGE = 5 * 24 * 3600
 ISSUER = "https://oauth.telegram.org"
 
 
