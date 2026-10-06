@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl
 
 from aiohttp import ClientSession, web
 from browser_login import BrowserLogin
+from catalog import AccountCatalog
 
 STATIC = Path(__file__).with_name("miniapp_static")
 COMMANDS = {"clone", "transfer", "export", "index", "cancel", "settings", "login", "help", "log", "status", "restart"}
@@ -123,6 +124,7 @@ class MiniAppServer:
         self.runner = None
         self.ready = False
         self.browser_login = BrowserLogin(self)
+        self.catalog = AccountCatalog(self)
         self.app = web.Application(client_max_size=3 * 1024**2, middlewares=[self.middleware])
         self.app.add_routes([web.get("/", self.index), web.get("/health", self.health),
                              web.get("/auth/session", self.browser_login.info),
@@ -134,6 +136,7 @@ class MiniAppServer:
                              web.get("/auth/legacy-callback", self.browser_login.legacy_callback),
                              web.post("/auth/logout", self.browser_login.logout),
                              web.get("/api/state", self.state), web.get("/api/settings", self.settings),
+                             web.post("/api/catalog", self.catalog.request), web.get("/api/catalog", self.catalog.status),
                              web.post("/api/command", self.command), web.post("/api/upload", self.upload),
                              web.post("/api/queue", self.queue_action), web.get("/api/logs", self.logs)])
         self.app.router.add_static("/assets/", STATIC, show_index=False)
@@ -222,6 +225,7 @@ class MiniAppServer:
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*list(self.tasks), return_exceptions=True)
+        await self.catalog.close()
         if self.runner:
             await self.runner.cleanup()
 

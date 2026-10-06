@@ -1489,7 +1489,8 @@ async def _fetch_clone_topic_labels_for_payload(payload: dict[str, Any]) -> dict
         await telegram.start()
         if endpoints.source_topic_id is not None:
             await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
-        await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
+        if endpoints.destination_topic_id is not None:
+            await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
         labels = await _build_endpoint_labels(telegram, endpoints)
         merged.update(labels)
     except Exception:

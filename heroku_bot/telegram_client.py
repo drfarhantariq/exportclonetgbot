@@ -1413,6 +1413,8 @@ class TelegramService:
 
     @staticmethod
     def _reply_kwargs(message_id: int) -> dict[str, object]:
+        if not message_id:
+            return {}
         try:
             from pyrogram.types import ReplyParameters
 

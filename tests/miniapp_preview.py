@@ -61,6 +61,28 @@ async def main():
 
     for handler_mock in server.handlers.values():
         handler_mock.side_effect = handler
+    async def catalog_telegram(parent, *_):
+        if parent == "root":
+            return {"items": [{"id": "-100123", "name": "PG NEET SS", "kind": "chat", "expandable": True,
+                "forum": True, "description": "Forum · choose a topic", "can_select": False}], "next": None}
+        return {"items": [{"id": "-100123:10", "name": "Anatomy", "kind": "topic", "expandable": False,
+            "description": "Topic #10", "source": "https://t.me/c/123/10/10", "destination": "https://t.me/c/123/10/10",
+            "topic": True, "can_select": True}], "next": None}
+    def catalog_cloud(parent, *_):
+        name = "Lecture archives" if parent == "root" else "Surgery"
+        fid = "folder1" if parent == "root" else "folder2"
+        return {"items": [{"id": fid, "name": name, "kind": "folder", "expandable": parent == "root",
+            "description": name, "source": "https://drive.google.com/drive/folders/" + fid,
+            "destination": "gdrive:" + fid, "can_select": True, "writable": True}], "next": None}
+    def catalog_msz(parent, *_):
+        data = catalog_cloud(parent)
+        for item in data["items"]:
+            item["source"] = "msz:https://cloud.example/drive/folders/" + item["id"]
+            item["destination"] = "msz:" + ("Lecture archives" if parent == "root" else "Lecture archives/Surgery")
+        return data
+    server.catalog.telegram_items = catalog_telegram
+    server.catalog.drive_items = catalog_cloud
+    server.catalog.msz_items = catalog_msz
     runner = web.AppRunner(server.app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 8089).start()

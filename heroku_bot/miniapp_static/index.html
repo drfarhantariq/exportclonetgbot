@@ -109,6 +109,48 @@
       ></button>
       <div id="detail-body"></div>
     </dialog>
+    <dialog id="endpoint-picker" class="endpoint-picker">
+      <div class="picker-heading">
+        <div>
+          <div class="eyebrow">CONNECTED ACCOUNTS</div>
+          <h2 id="picker-title">Choose a source</h2>
+        </div>
+        <button
+          class="icon-button"
+          type="button"
+          id="picker-close"
+          aria-label="Close folder picker"
+          data-icon="close"
+        ></button>
+      </div>
+      <div id="picker-providers" class="picker-providers"></div>
+      <div class="picker-toolbar">
+        <input
+          type="search"
+          id="picker-search"
+          class="search"
+          placeholder="Search loaded chats, topics or folders"
+          aria-label="Search indexed entries"
+        /><button
+          class="button secondary small"
+          type="button"
+          id="picker-refresh"
+        >
+          Refresh index
+        </button>
+      </div>
+      <p id="picker-note" class="muted"></p>
+      <div id="picker-tree" class="picker-tree" aria-live="polite"></div>
+      <div class="picker-footer">
+        <div id="picker-selection" class="muted">
+          Choose an entry to continue.
+        </div>
+        <button class="button" type="button" id="picker-choose" disabled>
+          Use selection
+        </button>
+      </div>
+    </dialog>
+    <script src="/assets/picker.js" defer></script>
     <dialog id="confirm">
       <div class="confirm-icon" data-icon="alert"></div>
       <h2 id="confirm-title">Confirm action</h2>

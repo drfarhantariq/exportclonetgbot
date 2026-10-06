@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
+from types import SimpleNamespace
 
 from .msz_api import infer_extension_from_signature, norm_rel
 
@@ -75,6 +76,22 @@ async def iter_local(path: Path) -> AsyncIterator[SourceItem]:
 
 async def list_gdrive_folder(url: str, staging_dir: Path):
     stage('indexing')
+    token_path = Path(os.getenv("GDRIVE_TOKEN_PICKLE", "token.pickle"))
+    if os.getenv("GDRIVE_TOKEN_JSON", "").strip() or token_path.exists():
+        from .gdrive_upload import GoogleDriveResumableUploader
+        def list_authenticated():
+            drive = GoogleDriveResumableUploader(token_path)
+            folder_id = drive.extract_folder_id(url)
+            base = (staging_dir / "gdrive").resolve()
+            files = []
+            for metadata, rel_path in drive.iter_files_under(folder_id):
+                path = (base / rel_path).resolve()
+                if not path.is_relative_to(base):
+                    raise ValueError("Google Drive returned an unsafe file path.")
+                files.append(SimpleNamespace(id=metadata["id"], path=rel_path, local_path=str(path),
+                                             size=int(metadata.get("size") or 0) or None, uploader=drive))
+            return files
+        return await asyncio.to_thread(list_authenticated)
     try:
         import gdown
     except ImportError as exc:
@@ -118,6 +135,10 @@ async def download_gdrive_file(drive_file: object, rel_path: str, staging_dir: P
     if local_path.exists() and local_path.stat().st_size > 0:
         print(f"Reusing existing download: {local_path}", flush=True)
         downloaded_path = local_path
+    elif getattr(drive_file, "uploader", None):
+        reporter = ByteProgress('downloading', rel_path)
+        downloaded_path = await asyncio.to_thread(drive_file.uploader.download_file, str(drive_file.id), local_path,
+            progress_callback=reporter, expected_size=drive_file.size)
     else:
         download_output = str(local_path if local_path.suffix else local_path.parent)
         reporter = ByteProgress('downloading', rel_path)

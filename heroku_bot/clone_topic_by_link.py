@@ -49,7 +49,7 @@ class CloneEndpoints:
     source_topic_id: int | None
     source_start_message_id: int
     destination_chat_id: int
-    destination_topic_id: int
+    destination_topic_id: int | None
 
 
 def _get_readable_file_size(size_in_bytes: float) -> str:
@@ -527,8 +527,13 @@ def _parse_topic_link_or_fail(label: str, link: str):
     try:
         return parse_private_topic_link(stripped)
     except ValueError as exc:
+        if label == "destination":
+            try:
+                return parse_private_chat_message_link(stripped)
+            except ValueError:
+                pass
         raise ValueError(
-            f"Invalid {label} link format. Expected: https://t.me/c/<chat>/<topic>/<message>"
+            f"Invalid {label} link format. Expected: https://t.me/c/<chat>/<topic>/<message> or https://t.me/c/<chat>/<message>"
         ) from exc
 
 
@@ -572,7 +577,7 @@ def _resolve_endpoints(
         source_topic_id=getattr(source, "topic_id", None),
         source_start_message_id=start_message_id,
         destination_chat_id=destination.chat_id,
-        destination_topic_id=destination.topic_id,
+        destination_topic_id=getattr(destination, "topic_id", None),
     )
 
 
@@ -1379,17 +1384,8 @@ async def _build_endpoint_labels(
         telegram.get_chat(endpoints.source_chat_id),
         telegram.get_chat(endpoints.destination_chat_id),
     )
-    if endpoints.source_topic_id is None:
-        source_topic_title = None
-        destination_topic_title = await telegram.get_forum_topic_title(
-            endpoints.destination_chat_id,
-            endpoints.destination_topic_id,
-        )
-    else:
-        source_topic_title, destination_topic_title = await asyncio.gather(
-            telegram.get_forum_topic_title(endpoints.source_chat_id, endpoints.source_topic_id),
-            telegram.get_forum_topic_title(endpoints.destination_chat_id, endpoints.destination_topic_id),
-        )
+    source_topic_title = await telegram.get_forum_topic_title(endpoints.source_chat_id, endpoints.source_topic_id) if endpoints.source_topic_id else None
+    destination_topic_title = await telegram.get_forum_topic_title(endpoints.destination_chat_id, endpoints.destination_topic_id) if endpoints.destination_topic_id else None
 
     return {
         "source_chat_id": endpoints.source_chat_id,
@@ -1400,7 +1396,7 @@ async def _build_endpoint_labels(
         "destination_chat_id": endpoints.destination_chat_id,
         "destination_chat_title": _chat_display_name(destination_chat),
         "destination_topic_id": endpoints.destination_topic_id,
-        "destination_topic_title": destination_topic_title or f"Topic {endpoints.destination_topic_id}",
+        "destination_topic_title": destination_topic_title or (f"Topic {endpoints.destination_topic_id}" if endpoints.destination_topic_id else "Channel messages"),
     }
 
 
@@ -1439,7 +1435,8 @@ async def run_clone(
         # Validate source and destination topics before the clone loop.
         if endpoints.source_topic_id is not None:
             await telegram.get_topic_anchor(endpoints.source_chat_id, endpoints.source_topic_id)
-        await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
+        if endpoints.destination_topic_id is not None:
+            await telegram.get_topic_anchor(endpoints.destination_chat_id, endpoints.destination_topic_id)
         endpoint_labels = await _build_endpoint_labels(telegram, endpoints)
 
         return await _clone_topic_messages(

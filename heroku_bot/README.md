@@ -516,6 +516,26 @@ additional letters. If Telegram rejects or removes custom emoji entities, the pa
 falls back to ordinary lettering. Emoji document IDs and their exact alt emoji
 are bundled in transfer_emoji_packs.json; no runtime pack download is needed.
 
+## Source and destination pickers
+
+In the website or Telegram Mini App, open **New task** and use **Browse** beside
+the source or destination. Choose a provider, expand a chat or folder, select
+the required topic or folder, and press **Use selection**. The task preview
+updates immediately; **Add to queue** submits it through the existing bot queue.
+
+Telegram lists channels and groups accessible to the connected user account.
+Expand forum groups to choose the exact topic. Clone supports ordinary channels
+as well; export, index, and Telegram transfer workflows require a forum topic.
+Google Drive includes your folders, **Shared with me**, and **Shared drives**;
+read-only folders can be sources but cannot be upload destinations. MSZ Cloud
+loads subfolders as you expand them. These listings reuse the saved Telegram,
+Google OAuth, and MSZ API credentials; no separate account setup is needed.
+
+Search filters the entries already loaded. **Refresh index** retrieves recent
+changes. Listings are cached for 15 minutes and run separately from the live
+activity refresh. For **MSZ + Google Drive**, browse a destination for each
+provider; the choices fill the corresponding folder overrides in Options.
+
 ## Standalone browser login
 
 The same workspace also supports website sessions. In BotFather, send
