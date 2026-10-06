@@ -43,7 +43,7 @@ from pyrogram.errors import (
     RPCError,
     SessionPasswordNeeded,
 )
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from clone_topic_by_link import _build_endpoint_labels, _resolve_endpoints, run_clone
 from config import ConfigError, load_settings
@@ -2199,6 +2199,8 @@ async def _remember_finished_job(store, kind, state):
 
 
 async def _save_job_state(store, kind, state):
+    if state.get("phase") in FINISHED_JOB_PHASES:
+        state.setdefault("finished_at", time.time())
     await store.save(f"{kind}:last", state)
     await _remember_finished_job(store, kind, state)
 
@@ -3593,6 +3595,17 @@ async def run_bot() -> None:
             reply_markup=_start_help_markup(getattr(me, "username", "") or ""),
         )
 
+    @bot.on_message(filters.private & filters.command("app", prefixes="/"))
+    async def app_handler(client, message) -> None:
+        if not await _authorized(message):
+            return
+        url = os.getenv("MINIAPP_URL", "").strip()
+        if not url:
+            await message.reply_text("Mini App is not configured yet.")
+            return
+        await message.reply_text("Open your MSZ workspace to create tasks, manage queues and watch live progress.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open MSZ Workspace", web_app=WebAppInfo(url=url))]]))
+
     @bot.on_callback_query(filters.regex(r"^botfather:add$"))
     async def botfather_add_handler(client, callback_query) -> None:
         message = callback_query.message
@@ -4463,6 +4476,14 @@ async def run_bot() -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
             return
+        if getattr(message, "miniapp_confirmed_restart", False):
+            notice = await message.reply_text("Restarting the bot…")
+            _write_json_file(RESTART_MESSAGE_FILE, {
+                "chat_id": notice.chat.id, "message_id": notice.id,
+                "requested_at": time.time(),
+            })
+            asyncio.create_task(_restart_process())
+            return
         await message.reply_text(
             "<i>Are you sure you want to restart the bot?</i>",
             parse_mode=enums.ParseMode.HTML,
@@ -4532,6 +4553,10 @@ async def run_bot() -> None:
             await message.reply_text("Not authorized.")
             return
 
+        if miniapp and miniapp.ready and not getattr(message, "miniapp_dispatch", False):
+            await miniapp.enqueue_message("export", message)
+            return
+
         raw_text = message.text or ""
         parts = raw_text.split(maxsplit=1)
         command_text = parts[1].strip() if len(parts) > 1 else ""
@@ -4593,6 +4618,10 @@ async def run_bot() -> None:
     async def index_handler(client, message) -> None:
         if not await _authorized(message):
             await message.reply_text("Not authorized.")
+            return
+
+        if miniapp and miniapp.ready and not getattr(message, "miniapp_dispatch", False):
+            await miniapp.enqueue_message("index", message)
             return
 
         raw_text = message.text or ""
@@ -4759,7 +4788,7 @@ async def run_bot() -> None:
                     if document.file_size and document.file_size > 2 * 1024 * 1024:
                         raise ValueError("Folder index must be smaller than 2 MB.")
                     runtime.mkdir(parents=True, exist_ok=True)
-                    index_path = runtime / f"edited_index_{message.id}.txt"
+                    index_path = runtime / f"edited_index_{message.id or uuid.uuid4().hex}.txt"
                     if not await client.download_media(reply, file_name=str(index_path)):
                         raise ValueError("Could not download the edited index.")
                 argv = parse_transfer_command(text, config=DEFAULT_CONFIG_PATH, runtime=runtime, index_path=index_path, defaults=current_settings)
@@ -4940,17 +4969,36 @@ async def run_bot() -> None:
             payload=payload,
         )
 
-    await bot.start()
+    miniapp = None
+    if os.getenv("PORT") or os.getenv("MINIAPP_PORT"):
+        from miniapp import MiniAppServer
+        miniapp = MiniAppServer(sys.modules[__name__], bot, store,
+            {"clone": clone_handler, "transfer": transfer_handler, "export": export_handler,
+             "index": index_handler, "cancel": cancel_handler, "settings": settings_handler,
+             "login": login_handler, "login_step": login_step_handler, "help": help_handler,
+             "log": log_handler, "status": status_handler, "restart": restart_handler},
+            lambda: admin_ids, bot_token)
+        await miniapp.start(os.getenv("MINIAPP_PORT") or os.getenv("PORT"))
+    try:
+        await bot.start()
+    except BaseException:
+        if miniapp:
+            await miniapp.close()
+        raise
     print("Heroku topic bot is running.")
     await _hydrate_clone_queue_from_storage(store)
     await _hydrate_transfer_queue(store, admin_ids)
     TRANSFER_QUEUE_WORKER_TASK = asyncio.create_task(_transfer_queue_worker(bot, store))
     asyncio.create_task(_clone_queue_worker(bot, store, admin_ids))
     asyncio.create_task(_send_restart_notification())
+    if miniapp:
+        miniapp.track(miniapp.activate())
     try:
         await asyncio.Event().wait()
     finally:
         TRANSFER_SHUTTING_DOWN = True
+        if miniapp:
+            await miniapp.close()
         if TRANSFER_QUEUE_WORKER_TASK is not None:
             TRANSFER_QUEUE_WORKER_TASK.cancel()
             await asyncio.gather(TRANSFER_QUEUE_WORKER_TASK, return_exceptions=True)

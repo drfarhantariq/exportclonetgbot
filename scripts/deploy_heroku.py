@@ -25,6 +25,7 @@ REQUIRED_CONFIG_KEYS = (
 )
 
 CONFIG_KEYS = (
+    "MINIAPP_URL",
     "TG_API_ID",
     "TG_API_HASH",
     "TG_SESSION_STRING",
@@ -520,7 +521,7 @@ def ensure_buildpacks(app: str) -> None:
         run_heroku(["buildpacks:add", "--index", "2", "heroku/python", "-a", app])
 
 
-def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
+def deploy_bundle(app: str, deploy_dir: Path, worker_count: int, web_count: int = 0, web_size: str = "Basic") -> None:
     run(["git", "init"], cwd=deploy_dir)
     run(["git", "branch", "-M", "main"], cwd=deploy_dir)
     run(["git", "config", "user.email", "deploy@example.local"], cwd=deploy_dir)
@@ -529,7 +530,10 @@ def deploy_bundle(app: str, deploy_dir: Path, worker_count: int) -> None:
     run(["git", "commit", "-m", "Heroku deploy bundle"], cwd=deploy_dir)
     run_heroku(["git:remote", "-a", app], cwd=deploy_dir)
     run(["git", "push", "heroku", "main", "-f"], cwd=deploy_dir)
-    run_heroku(["ps:scale", f"worker={worker_count}", "-a", app])
+    formation = [f"worker={worker_count}"]
+    if "web:" in (deploy_dir / "Procfile").read_text(encoding="utf-8"):
+        formation.append(f"web={web_count}:{web_size}" if web_count else "web=0")
+    run_heroku(["ps:scale", *formation, "-a", app])
 
 
 def parse_args() -> argparse.Namespace:
@@ -567,6 +571,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-deploy", action="store_true", help="Prepare bundle/config only, do not push")
     parser.add_argument("--skip-apt-buildpack", action="store_true", help="Do not add heroku-community/apt buildpack")
     parser.add_argument("--worker-count", type=int, default=1, help="Worker dyno count after deploy")
+    parser.add_argument("--web-count", type=int, default=0, help="Web dyno count; use 1 with --worker-count 0 for the Mini App")
+    parser.add_argument("--web-size", default="Basic", help="Dyno size when enabling the Mini App web process")
     parser.add_argument("--logs", action="store_true", help="Tail logs after deploy")
     parser.add_argument("--install-heroku-cli", action="store_true", help="Compatibility option; Heroku CLI is installed automatically when missing")
     parser.add_argument("--write-netrc", action="store_true", help="Compatibility option; ~/.netrc is written automatically when Heroku credentials are available")
@@ -579,6 +585,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        if args.web_count and args.worker_count:
+            raise ValueError("Use --worker-count 0 with --web-count 1 so only one bot process runs.")
         require_tool("git")
         env_values = parse_env_file(args.env_file)
 
@@ -630,7 +638,7 @@ def main() -> int:
         if not args.skip_config:
             set_config(args.app, config)
         if not args.skip_deploy:
-            deploy_bundle(args.app, args.deploy_dir.resolve(), args.worker_count)
+            deploy_bundle(args.app, args.deploy_dir.resolve(), args.worker_count, args.web_count, args.web_size)
         if args.logs:
             run_heroku(["logs", "--tail", "-a", args.app], check=False)
 

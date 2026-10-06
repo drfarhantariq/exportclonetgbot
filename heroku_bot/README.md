@@ -7,7 +7,35 @@ This folder is a single Telegram control bot that does both jobs:
 - `/clone` using `run_clone`
 - `/transfer` using the shared `MSZDRIVE_uploader/transfer.py` entry point
 
-It is designed for Heroku worker dynos and persists last command profiles in MongoDB Data API, so restarts do not lose essential bot state.
+It persists task profiles and queues in MongoDB. Run one worker for chat-only use, or one web dyno for both the bot and its Telegram Mini App.
+
+## Telegram Mini App
+
+Send `/app` in a private bot chat, or tap the **Open App** menu button. MSZ Workspace includes:
+
+- A responsive dashboard with live overall and current-file progress, routes, timings, results, and system stats.
+- Builders for clone, transfer, export, and index tasks; edited-index uploads; shared task queues with reorder, remove, and clear controls.
+- Task history, details, cancellation, and saved-profile resume.
+- All saved settings, credential imports, Telegram account login, bot restart, logs, and a command console.
+
+The app verifies Telegram's signed `initData` on every API request and only admits `BOT_ADMIN_USER_IDS`. Existing secret values are masked, and the web client cannot select server credential, config, or output paths. Bot replies and generated documents remain available in the admin's bot chat. Sessions expire after 12 hours; reopen the app to refresh authentication.
+
+Set `MINIAPP_URL` to the app's public HTTPS address. The bot installs an **Open App** chat menu for its admins at startup. HTTPS is required by Telegram. For local development, `MINIAPP_PORT=8080` starts the HTTP server alongside the bot; Telegram access requires an HTTPS tunnel and the corresponding `MINIAPP_URL`. Do not run a second copy against the deployed bot's queues/session.
+
+Deploy the combined bot and Mini App from the repository root:
+
+```bash
+python scripts/deploy_heroku.py --app YOUR_APP --redeploy --worker-count 0 --web-count 1 --config MINIAPP_URL=https://YOUR_APP.herokuapp.com
+```
+
+Use **one web dyno and zero workers**: both process types run the same bot engine, so enabling both would run duplicate bot instances. Pending export/index Mini App jobs are persisted alongside the existing clone/transfer queues. Interrupted app export/index tasks can resume from their saved profiles after a process restart.
+
+API routes are `/api/state`, `/api/settings`, `/api/command`, `/api/upload`, `/api/queue`, and `/api/logs`, authenticated with `Authorization: tma <initData>`. `/health` reports connection readiness. The static shell contains no private bot data.
+
+For browser QA without live tasks or credentials, run `python tests/miniapp_preview.py`; it binds only to `127.0.0.1:8089` and writes a signed fixture launch URL to `output/playwright/fixture-url.txt`. Production authentication is unchanged.
+
+Telegram integration follows the [official Mini App documentation](https://core.telegram.org/bots/webapps).
+The client bundles the Telegram SDK source from `@twa-dev/sdk` 8.0.2 with its MIT license (`miniapp_static/telegram-sdk.LICENSE`), avoiding a third-party network dependency at launch.
 
 ## Essential Files Copied Here
 

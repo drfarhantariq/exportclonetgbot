@@ -6,3 +6,5 @@ __pycache__/
 logs/
 .heroku_deploy/
 MSZDRIVE_uploader/token.pickle
+output/playwright/
+.playwright-cli/
