@@ -140,6 +140,16 @@
         </button>
       </div>
       <p id="picker-note" class="muted"></p>
+      <form id="picker-topic-form" class="picker-topic-form field" hidden>
+        <label for="picker-topic-title" id="picker-topic-label">New topic name</label>
+        <input id="picker-topic-title" placeholder="Enter a topic name" maxlength="128" required autocomplete="off" />
+        <p class="muted">Creates a real Telegram topic using your connected account.</p>
+        <div class="button-row">
+          <button class="button small" id="picker-topic-submit" type="submit">Create & select</button>
+          <button class="button secondary small" id="picker-topic-cancel" type="button">Cancel</button>
+        </div>
+        <p id="picker-topic-error" class="picker-error" role="status"></p>
+      </form>
       <div id="picker-tree" class="picker-tree" aria-live="polite"></div>
       <div class="picker-footer">
         <div id="picker-selection" class="muted">

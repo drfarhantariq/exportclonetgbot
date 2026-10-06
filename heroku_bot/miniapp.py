@@ -137,6 +137,7 @@ class MiniAppServer:
                              web.post("/auth/logout", self.browser_login.logout),
                              web.get("/api/state", self.state), web.get("/api/settings", self.settings),
                              web.post("/api/catalog", self.catalog.request), web.get("/api/catalog", self.catalog.status),
+                             web.post("/api/topics", self.catalog.create_topic),
                              web.post("/api/command", self.command), web.post("/api/upload", self.upload),
                              web.post("/api/queue", self.queue_action), web.get("/api/logs", self.logs)])
         self.app.router.add_static("/assets/", STATIC, show_index=False)

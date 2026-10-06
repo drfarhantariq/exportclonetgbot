@@ -1,4 +1,4 @@
-"""Read-only account catalog for Telegram topics and cloud folder pickers."""
+"""Account catalog and destination topic creation for workspace pickers."""
 import asyncio
 import hashlib
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 
 from aiohttp import web
 from pyrogram import Client, raw
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
 
 TTL = 15 * 60
 PROVIDERS = {"telegram", "gdrive", "msz"}
@@ -26,6 +26,65 @@ class AccountCatalog:
         self.msz_index, self.msz_key, self.msz_time = None, None, 0
         self.msz_client = None
         self.cooldowns = {}
+        self.created_topics = OrderedDict()
+
+    async def create_topic(self, request):
+        body = await request.json()
+        parent, title, nonce = str(body.get("chat_id", "")), str(body.get("title", "")).strip(), str(body.get("request_id", ""))
+        if not re.fullmatch(r"-100\d{1,14}", parent):
+            raise ValueError("Choose a Telegram forum group.")
+        if not title or len(title.encode("utf-8")) > 128 or any(ord(c) < 32 for c in title):
+            raise ValueError("Enter a topic name of 1–128 UTF-8 bytes without line breaks.")
+        if not re.fullmatch(r"[a-f0-9-]{32,36}", nonce):
+            raise ValueError("Invalid creation request. Reopen the topic form.")
+        settings = await self.server.engine._load_bot_settings(self.server.store)
+        fingerprint = self.fingerprint("telegram", settings)
+        key = (fingerprint, request["user"]["id"], parent, nonce)
+        async with self.locks["telegram"]:
+            if key in self.created_topics:
+                saved_title, item = self.created_topics[key]
+                if saved_title != title:
+                    raise ValueError("This creation request already used a different topic name.")
+                return web.json_response({"item": item})
+            wait = int(self.cooldowns.get("telegram", 0) - time.time())
+            if wait > 0:
+                return web.json_response({"error": f"Telegram requested a wait. Try again in {wait}s."}, status=429)
+            try:
+                client = await self.telegram_client(settings, fingerprint)
+                peer = await client.resolve_peer(int(parent))
+                channel = raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
+                metadata = await client.invoke(raw.functions.channels.GetChannels(id=[channel]), sleep_threshold=0)
+                if not any(getattr(chat, "forum", False) for chat in metadata.chats):
+                    raise ValueError("Topics can only be created inside a Telegram forum group.")
+                # Retrying the same form uses Telegram's deduplication ID.
+                random_id = int.from_bytes(hashlib.sha256(repr(key).encode()).digest()[:8], "big", signed=True)
+                result = await client.invoke(raw.functions.channels.CreateForumTopic(channel=channel, title=title,
+                    random_id=random_id, icon_color=0x6FB9F0), sleep_threshold=0)
+                topic_id = next((u.message.id for u in getattr(result, "updates", [])
+                    if isinstance(getattr(getattr(u, "message", None), "action", None), raw.types.MessageActionTopicCreate)), None)
+                if topic_id is None:
+                    topic_id = next((u.id for u in getattr(result, "updates", [])
+                        if isinstance(u, raw.types.UpdateMessageID) and u.random_id == random_id), None)
+                if not topic_id:
+                    raise ValueError("Telegram did not return the new topic ID. Refresh topics before retrying.")
+            except FloodWait as exc:
+                wait = int(exc.value) + 1
+                self.cooldowns["telegram"] = time.time() + wait
+                return web.json_response({"error": f"Telegram requested a wait. Try again in {wait}s."}, status=429)
+            except RPCError as exc:
+                if getattr(exc, "ID", "") in {"CHAT_ADMIN_REQUIRED", "CHAT_WRITE_FORBIDDEN", "CHAT_SEND_PLAIN_FORBIDDEN", "TOPIC_CREATE_FORBIDDEN"}:
+                    raise ValueError("Your connected Telegram account needs permission to create topics in this group.") from None
+                raise ValueError("Telegram could not create the topic. Check group permissions and try again.") from None
+            link = f"https://t.me/c/{parent[4:]}/{topic_id}/{topic_id}"
+            item = {"id": f"{parent}:{topic_id}", "name": title, "kind": "topic", "expandable": False,
+                    "description": f"Topic #{topic_id}", "source": link, "destination": link, "topic": True, "can_select": True}
+            self.created_topics[key] = (title, item)
+            while len(self.created_topics) > 100:
+                self.created_topics.popitem(last=False)
+            for cache_key in list(self.cache):
+                if cache_key[:3] == ("telegram", fingerprint, parent):
+                    del self.cache[cache_key]
+            return web.json_response({"item": item}, status=201)
 
     async def close(self):
         if self.telegram:

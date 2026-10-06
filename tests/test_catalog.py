@@ -13,6 +13,7 @@ from catalog import AccountCatalog
 from clone_topic_by_link import _resolve_endpoints, _build_endpoint_labels
 from telegram_client import TelegramService
 from pyrogram import raw
+from pyrogram.errors import FloodWait, ChatAdminRequired
 
 
 class CatalogAPITests(unittest.IsolatedAsyncioTestCase):
@@ -81,6 +82,52 @@ class CatalogAPITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first["job"], second["job"])
             gate.set()
             await self.wait(first["job"])
+
+    async def test_create_topic_auth_validation_and_nonforum(self):
+        payload = {"chat_id": "-100123", "title": "New lectures", "request_id": "a" * 32}
+        self.assertEqual((await self.client.post("/api/topics", json=payload)).status, 401)
+        for invalid in ({"chat_id": "root"}, {"title": " "}, {"title": "🎬" * 33}, {"request_id": "wrong"}):
+            response = await self.client.post("/api/topics", json=dict(payload, **invalid), headers=self.headers)
+            self.assertEqual(response.status, 400)
+        client = SimpleNamespace(resolve_peer=AsyncMock(return_value=SimpleNamespace(channel_id=123, access_hash=1)),
+            invoke=AsyncMock(return_value=SimpleNamespace(chats=[SimpleNamespace(forum=False)])))
+        with patch.object(self.server.catalog, "telegram_client", AsyncMock(return_value=client)):
+            response = await self.client.post("/api/topics", json=payload, headers=self.headers)
+            self.assertEqual(response.status, 400)
+            self.assertEqual(client.invoke.await_count, 1)
+
+    async def test_created_topic_is_selectable_and_retries_deduplicated(self):
+        payload = {"chat_id": "-100123", "title": "New lectures", "request_id": "b" * 32}
+        client = SimpleNamespace(resolve_peer=AsyncMock(return_value=SimpleNamespace(channel_id=123, access_hash=1)),
+            invoke=AsyncMock(side_effect=[SimpleNamespace(chats=[SimpleNamespace(forum=True)]),
+                SimpleNamespace(updates=[SimpleNamespace(message=SimpleNamespace(id=44,
+                    action=raw.types.MessageActionTopicCreate(title="New lectures", icon_color=0x6FB9F0)))])]))
+        fingerprint = self.server.catalog.fingerprint("telegram", {"secret":"private-credential", "threads":8, "enabled":True})
+        self.server.catalog.cache[("telegram", fingerprint, "-100123", "")] = {"items":[]}
+        with patch.object(self.server.catalog, "telegram_client", AsyncMock(return_value=client)):
+            response = await self.client.post("/api/topics", json=payload, headers=self.headers)
+            self.assertEqual(response.status, 201)
+            item = (await response.json())["item"]
+            self.assertEqual(item["destination"], "https://t.me/c/123/44/44")
+            self.assertTrue(item["can_select"])
+            self.assertFalse(self.server.catalog.cache)
+            response = await self.client.post("/api/topics", json=payload, headers=self.headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["item"], item)
+            self.assertEqual(client.invoke.await_count, 2)
+            response = await self.client.post("/api/topics", json=dict(payload, title="Other"), headers=self.headers)
+            self.assertEqual(response.status, 400)
+
+    async def test_topic_permission_and_flood_wait_messages(self):
+        payload = {"chat_id": "-100123", "title": "New lectures", "request_id": "c" * 32}
+        for error, status, message in ((ChatAdminRequired(), 400, "permission"), (FloodWait(15), 429, "wait")):
+            self.server.catalog.cooldowns.clear()
+            client = SimpleNamespace(resolve_peer=AsyncMock(return_value=SimpleNamespace(channel_id=123, access_hash=1)),
+                invoke=AsyncMock(side_effect=error))
+            with patch.object(self.server.catalog, "telegram_client", AsyncMock(return_value=client)):
+                response = await self.client.post("/api/topics", json=payload, headers=self.headers)
+                self.assertEqual(response.status, status)
+                self.assertIn(message, (await response.json())["error"])
 
 
 class CatalogProviderTests(unittest.IsolatedAsyncioTestCase):

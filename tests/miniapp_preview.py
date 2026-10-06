@@ -5,6 +5,8 @@ import shlex
 import time
 from pathlib import Path
 from urllib.parse import quote
+from types import SimpleNamespace
+from pyrogram import raw
 
 from aiohttp import web
 from test_miniapp import fixture_server, signed_data, USER, bot_engine
@@ -83,6 +85,16 @@ async def main():
     server.catalog.telegram_items = catalog_telegram
     server.catalog.drive_items = catalog_cloud
     server.catalog.msz_items = catalog_msz
+    async def topic_invoke(query, **_):
+        if isinstance(query, raw.functions.channels.GetChannels):
+            return SimpleNamespace(chats=[SimpleNamespace(forum=True)])
+        return SimpleNamespace(updates=[SimpleNamespace(message=SimpleNamespace(id=45,
+            action=raw.types.MessageActionTopicCreate(title=query.title, icon_color=0x6FB9F0)))])
+    async def topic_peer(_):
+        return SimpleNamespace(channel_id=123, access_hash=1)
+    async def topic_client(*_):
+        return SimpleNamespace(resolve_peer=topic_peer, invoke=topic_invoke)
+    server.catalog.telegram_client = topic_client
     runner = web.AppRunner(server.app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 8089).start()

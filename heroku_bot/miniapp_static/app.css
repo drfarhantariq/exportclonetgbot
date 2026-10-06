@@ -2005,6 +2005,16 @@ dialog h2 {
 .picker-error {
   color: var(--red);
 }
+.picker-topic-form {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  background: var(--panel2);
+}
+.picker-topic-form[hidden] { display: none; }
+.picker-topic-form label { display: block; margin-bottom: 8px; }
+.picker-topic-form input { width: 100%; }
+.picker-new-topic { flex-shrink: 0; }
 .picker-more {
   padding: 12px 20px;
 }

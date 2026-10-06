@@ -8,6 +8,9 @@ const picker = {
   expanded: new Set(),
   selected: null,
   providers: [],
+  creating: false,
+  createChat: null,
+  createRequest: null,
 };
 const providerLabels = {
   telegram: "Telegram",
@@ -78,7 +81,9 @@ function renderPicker() {
         const unavailable = picker.field !== "source" && item.writable === false
           ? " · Read-only folder"
           : !selectable && !item.expandable ? " · This workflow needs a forum topic" : "";
-        return `<div class="picker-node"><div class="picker-row ${selected ? "selected" : ""}"><span class="picker-indent" data-picker-depth="${depth}"></span>${item.expandable ? `<button class="icon-button picker-expand ${expanded ? "expanded" : ""}" type="button" data-picker-expand="${escape(item.id)}" aria-label="${expanded ? "Collapse" : "Expand"} ${escape(item.name)}" aria-expanded="${expanded}">${icon("chevron")}</button>` : '<span class="picker-spacer"></span>'}<button type="button" class="picker-entry" ${selectable ? `data-picker-select="${escape(item.id)}"` : item.expandable ? `data-picker-expand="${escape(item.id)}"` : "disabled"} aria-pressed="${selected}"><span class="picker-entry-icon">${icon(item.kind === "topic" ? "layers" : item.kind === "chat" ? "clone" : "folder")}</span><span><b>${escape(item.name)}</b><small>${escape(item.description || "")}${escape(unavailable)}</small></span>${selected ? icon("check") : ""}</button></div>${children}</div>`;
+        const create = picker.provider === "telegram" && picker.field === "destination" && item.forum
+          ? `<button type="button" class="button secondary small picker-new-topic" data-picker-new-topic="${escape(item.id)}" aria-label="New topic in ${escape(item.name)}" ${picker.creating ? "disabled" : ""}>+ New topic</button>` : "";
+        return `<div class="picker-node"><div class="picker-row ${selected ? "selected" : ""}"><span class="picker-indent" data-picker-depth="${depth}"></span>${item.expandable ? `<button class="icon-button picker-expand ${expanded ? "expanded" : ""}" type="button" data-picker-expand="${escape(item.id)}" aria-label="${expanded ? "Collapse" : "Expand"} ${escape(item.name)}" aria-expanded="${expanded}">${icon("chevron")}</button>` : '<span class="picker-spacer"></span>'}<button type="button" class="picker-entry" ${selectable ? `data-picker-select="${escape(item.id)}"` : item.expandable ? `data-picker-expand="${escape(item.id)}"` : "disabled"} aria-pressed="${selected}"><span class="picker-entry-icon">${icon(item.kind === "topic" ? "layers" : item.kind === "chat" ? "clone" : "folder")}</span><span><b>${escape(item.name)}</b><small>${escape(item.description || "")}${escape(unavailable)}</small></span>${selected ? icon("check") : ""}</button>${create}</div>${children}</div>`;
       })
       .join("");
     return (
@@ -95,7 +100,15 @@ function renderPicker() {
   $$("[data-picker-depth]").forEach((el) => {
     el.style.width = `${Math.min(Number(el.dataset.pickerDepth), 8) * 18}px`;
   });
-  $("#picker-choose").disabled = !picker.selected;
+  $("#picker-choose").disabled = !picker.selected || picker.creating;
+  $("#picker-topic-form").hidden = !picker.createChat;
+  $("#picker-topic-submit").disabled = picker.creating || Boolean(picker.branches.get(picker.createChat?.id)?.loading);
+  $("#picker-topic-title").disabled = picker.creating;
+  $("#picker-topic-cancel").disabled = picker.creating;
+  $("#picker-topic-submit").textContent = picker.creating ? "Creating…" : "Create & select";
+  $("#picker-refresh").disabled = picker.creating;
+  $("#picker-close").disabled = picker.creating;
+  $$("[data-picker-provider]").forEach(button => button.disabled = picker.creating);
   $("#picker-selection").textContent = picker.selected
     ? `${providerLabels[picker.provider]} / ${picker.selected.description || picker.selected.name}`
     : "Choose a chat/topic or folder to continue.";
@@ -151,6 +164,8 @@ async function loadPickerBranch(
 }
 
 function switchPickerProvider(provider) {
+  if (picker.creating) return;
+  picker.createChat = null;
   picker.generation++;
   picker.provider = provider;
   picker.branches = new Map();
@@ -184,6 +199,17 @@ document.addEventListener("click", (event) => {
   if (button.dataset.browse) openPicker(button.dataset.browse);
   if (button.dataset.pickerProvider)
     switchPickerProvider(button.dataset.pickerProvider);
+  if (button.dataset.pickerNewTopic && !picker.creating) {
+    picker.createChat = picker.entries.get(button.dataset.pickerNewTopic);
+    picker.createRequest = null;
+    $("#picker-topic-label").textContent = `New topic in ${picker.createChat.name}`;
+    $("#picker-topic-title").value = "";
+    $("#picker-topic-error").textContent = "";
+    picker.expanded.add(picker.createChat.id);
+    renderPicker();
+    if (!picker.branches.has(picker.createChat.id)) loadPickerBranch(picker.createChat.id);
+    $("#picker-topic-title").focus();
+  }
   const expand = button.dataset.pickerExpand;
   if (expand) {
     if (picker.expanded.has(expand)) picker.expanded.delete(expand);
@@ -206,9 +232,14 @@ $("#picker-close").onclick = () => pickerDialog.close();
 pickerDialog.addEventListener("close", () => {
   picker.generation++;
 });
+pickerDialog.addEventListener("cancel", event => {
+  if (picker.creating) event.preventDefault();
+});
 $("#picker-search").oninput = renderPicker;
 $("#picker-refresh").onclick = () => switchPickerRefresh();
 function switchPickerRefresh() {
+  if (picker.creating) return;
+  picker.createChat = null;
   picker.generation++;
   picker.branches.clear();
   picker.entries.clear();
@@ -216,6 +247,52 @@ function switchPickerRefresh() {
   picker.selected = null;
   loadPickerBranch("root", true);
 }
+$("#picker-topic-cancel").onclick = () => {
+  picker.createChat = null;
+  renderPicker();
+};
+$("#picker-topic-form").onsubmit = async (event) => {
+  event.preventDefault();
+  if (picker.creating || !picker.createChat || picker.branches.get(picker.createChat.id)?.loading) return;
+  const title = $("#picker-topic-title").value.trim();
+  if (!title || new TextEncoder().encode(title).length > 128) {
+    $("#picker-topic-error").textContent = "Enter a topic name of up to 128 UTF-8 bytes.";
+    return;
+  }
+  const chat = picker.createChat;
+  const generation = picker.generation;
+  if (picker.createRequest?.title !== title || picker.createRequest?.chat !== chat.id)
+    picker.createRequest = {title, chat: chat.id, id: crypto.randomUUID()};
+  picker.creating = true;
+  $("#picker-topic-error").textContent = "";
+  renderPicker();
+  try {
+    const response = await api("topics", {method: "POST", body: JSON.stringify({
+      chat_id: chat.id, title, request_id: picker.createRequest.id,
+    })});
+    if (generation !== picker.generation || !pickerDialog.open) {
+      toast("Telegram topic created. Reopen the destination picker to choose it.");
+      return;
+    }
+    const item = response.item;
+    const branch = picker.branches.get(chat.id);
+    picker.branches.set(chat.id, {...branch, loading: false, items: [
+      ...(branch?.items || []).filter(existing => existing.id !== item.id), item,
+    ]});
+    picker.entries.set(item.id, item);
+    picker.expanded.add(chat.id);
+    picker.selected = item;
+    picker.createChat = null;
+    $("#picker-search").value = "";
+    $("#picker-note").textContent = `Created ${item.name}. Use selection to set this destination.`;
+  } catch (error) {
+    if (generation === picker.generation && pickerDialog.open)
+      $("#picker-topic-error").textContent = error.message;
+  } finally {
+    picker.creating = false;
+    renderPicker();
+  }
+};
 $("#picker-choose").onclick = () => {
   const item = picker.selected;
   if (!item) return;

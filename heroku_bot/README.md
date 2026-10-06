@@ -524,7 +524,13 @@ the required topic or folder, and press **Use selection**. The task preview
 updates immediately; **Add to queue** submits it through the existing bot queue.
 
 Telegram lists channels and groups accessible to the connected user account.
-Expand forum groups to choose the exact topic. Clone supports ordinary channels
+Expand forum groups to choose the exact topic.
+For Telegram destinations, use **+ New topic** beside a forum group, enter a
+name, and press **Create & select**. The new topic is selected immediately;
+press **Use selection** to fill the destination. Your connected Telegram
+account must have permission to create topics in that group.
+
+Clone supports ordinary channels
 as well; export, index, and Telegram transfer workflows require a forum topic.
 Google Drive includes your folders, **Shared with me**, and **Shared drives**;
 read-only folders can be sources but cannot be upload destinations. MSZ Cloud
