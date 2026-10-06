@@ -1798,7 +1798,7 @@ def _clone_panel_time(seconds: Any) -> str:
 
 
 def _format_clone_bot_stats() -> str:
-    return (_format_bot_stats().replace("⌬ <b><u>Bot Stats</u></b>", "⚙ <b>Bot Stats</b>")
+    return (_format_bot_stats().replace("⌬ <b><u>Bot Stats</u></b>", "<blockquote>⚙ <b>Bot Stats</b></blockquote>")
             .replace("\n┟", "\n├").replace("\n┖", "\n└"))
 
 
@@ -1825,10 +1825,10 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
         task += f" • Source #{_html(state['current_message_id'])}"
     separator = "━━━━━━━━━━━━━━━━━━━━"
     stage_icon, stage_label = {"download": ("⬇", "Downloading"), "upload": ("⬆", "Uploading")}.get(stage, ("🔄", "Cloning"))
-    lines = ["⚡ <b>MSZ CLONE BOT</b>", "",
+    lines = ["<blockquote>⚡ <b>MSZ CLONE BOT</b></blockquote>", "",
              "🟢 <b>CLONING IN PROGRESS</b>" if phase == "running" else f"⏳ <b>{_html(phase.upper())}</b>",
              task, f"👤 {requester}", "", separator, "",
-             "📊 <b>OVERALL PROGRESS</b>",
+             "<blockquote>📊 <b>OVERALL PROGRESS</b></blockquote>",
              f"{_clone_progress_bar(overall['percent'])}  <b>{_format_percent(overall['percent'])}</b>",
              f"{processed} / {total or '?'} messages",
              f"✅ Forwarded {_safe_int(state.get('success'))} | ⏭️ Skipped {_safe_int(state.get('skipped'))} | ❌ Failed {_safe_int(state.get('failed'))}", "",
@@ -1840,7 +1840,7 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
     if until > time.time() or (wait > 0 and not until):
         remaining = max(until - time.time(), 0) if until else wait
         lines.append(f"⏸ <b>FloodWait</b> → {_readable_time(remaining)} for {_html(state.get('flood_wait_operation') or 'telegram')}")
-    lines += ["", separator, "", "📍 <b>ROUTE &amp; QUEUE</b>",
+    lines += ["", separator, "", "<blockquote>📍 <b>ROUTE &amp; QUEUE</b></blockquote>",
               f"📤 <b>SOURCE</b> → {_html(source)}",
               f"📥 <b>DESTINATION</b> → {_html(destination)}",
               f"⏳ <b>Queue</b> → {len(_clone_pending_jobs)} waiting"]
@@ -1848,7 +1848,7 @@ def _format_clone_status_panel(state: dict[str, Any]) -> str:
     message_type = str(state.get("current_message_type") or "")
     if file_name or message_type:
         file_icon = {"video": "🎬", "audio": "🎵", "voice": "🎤", "photo": "🖼", "document": "📎"}.get(message_type.lower(), "📄")
-        lines += ["", separator, "", "📄 <b>CURRENT FILE</b>", f"{file_icon} {_html(file_name or message_type)}"]
+        lines += ["", separator, "", "<blockquote>📄 <b>CURRENT FILE</b></blockquote>", f"{file_icon} {_html(file_name or message_type)}"]
         if stage in {"download", "upload"}:
             lines += ["", f"{_clone_progress_bar(file_view['percent'])}  <b>{_format_percent(file_view['percent'])}</b>", "",
                       f"📦 {file_view['processed']} / {file_view['total']}",
@@ -1961,12 +1961,12 @@ def _format_clone_completion_message(state: dict[str, Any]) -> str:
              "failed": "Clone failed", "cancelled": "Clone cancelled"}.get(phase, "Clone summary")
 
     lines = [
-            f"<b>{title}</b>",
+            f"<blockquote><b>{title}</b></blockquote>",
             f"<b>Task By {_status_requester(payload)}</b>",
             "",
             f"┠ <b>Source</b> → <i>{_html(source_label)}</i>",
             f"┠ <b>Destination</b> → <i>{_html(destination_label)}</i>",
-            "<b>Total Summary</b>",
+            "<blockquote><b>Total Summary</b></blockquote>",
             f"┠ <b>Messages processed</b> → <i>{_html(processed_text)}</i>",
             "┠ <b>In Mode</b> → #Telegram",
             "┠ <b>Out Mode</b> → #Telegram",

@@ -69,9 +69,22 @@ class ClonePanelTests(unittest.IsolatedAsyncioTestCase):
         app = self.app
         with patch.object(app, '_format_bot_stats', return_value='⌬ <b><u>Bot Stats</u></b>\n┟ CPU\n┖ RAM'):
             panel = app._format_clone_status_with_stats(self.state())
-        self.assertTrue(panel.endswith('━━━━━━━━━━━━━━━━━━━━\n\n⚙ <b>Bot Stats</b>\n├ CPU\n└ RAM'))
+        self.assertTrue(panel.endswith('━━━━━━━━━━━━━━━━━━━━\n\n<blockquote>⚙ <b>Bot Stats</b></blockquote>\n├ CPU\n└ RAM'))
         self.assertEqual(app._clone_panel_time(29401), '8h10m')
         self.assertEqual(app._clone_panel_time(1141), '19m')
+
+    async def test_headings_parse_as_telegram_quotes(self):
+        from pyrogram.parser.html import HTML
+        from pyrogram.raw.types import MessageEntityBlockquote
+        app = self.app
+        with patch.object(app, '_format_bot_stats', return_value='⌬ <b><u>Bot Stats</u></b>\n┟ CPU\n┖ RAM'):
+            panel = app._format_clone_status_with_stats(self.state())
+        parsed = await HTML(None).parse(panel)
+        encoded = parsed['message'].encode('utf-16-le')
+        quotes = [encoded[e.offset * 2:(e.offset + e.length) * 2].decode('utf-16-le')
+                  for e in parsed['entities'] if isinstance(e, MessageEntityBlockquote)]
+        self.assertEqual(quotes, ['⚡ MSZ CLONE BOT', '📊 OVERALL PROGRESS',
+                                  '📍 ROUTE & QUEUE', '📄 CURRENT FILE', '⚙ Bot Stats'])
 
     async def test_terminal_checkpoint_records_finish_time_once(self):
         app = self.app
