@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import stage
 
 import argparse
 import asyncio
@@ -47,6 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="Generate a Telegram folder index from the Telegram source link. Optionally pass an output path.",
     )
+    parser.add_argument("--no-index", dest="index", action="store_const", const="", default=argparse.SUPPRESS)
     parser.add_argument("--index-done", default="", help="Edited Telegram folder index to use for upload.")
     parser.add_argument("--index-out", default="", help="Output path when generating a Telegram folder index.")
     parser.add_argument("--msz-target-folder", default=os.getenv("MSZ_TARGET_FOLDER", ""))
@@ -62,27 +64,28 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.getenv("TG_DOWNLOAD_MODE", "hyper"),
         help="Telegram media download mode for --index-done uploads. Default: hyper.",
     )
-    parser.add_argument("--onwards", action="store_true")
+    parser.add_argument("--onwards", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--above",
-        action="store_true",
+        action=argparse.BooleanOptionalAction, default=False,
         help="For Telegram uploads, assign media before each enabled text heading to that heading folder.",
     )
-    parser.add_argument("--continue-on-error", action="store_true")
-    parser.add_argument("--retry-failed-only", action="store_true")
+    parser.add_argument("--continue-on-error", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--retry-failed-only", action=argparse.BooleanOptionalAction, default=False)
     parser.set_defaults(no_resume=True)
     parser.add_argument("--no-resume", dest="no_resume", action="store_true", help="Ignore previous transfer state. Default.")
     parser.add_argument("--resume", dest="no_resume", action="store_false", help="Resume from previous successful transfer state.")
-    parser.add_argument("--caption-file-names", action="store_true", help="Use Telegram media captions as file names.")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--keep-downloads", action="store_true")
-    parser.add_argument("--delete-failed-downloads", action="store_true")
-    parser.add_argument("--browser-headed", action="store_true")
+    parser.add_argument("--caption-file-names", action=argparse.BooleanOptionalAction, default=False, help="Use Telegram media captions as file names.")
+    parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--keep-downloads", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--delete-failed-downloads", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--browser-headed", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--browser-folder-url", default=os.getenv("MSZ_BROWSER_FOLDER_URL", ""))
     parser.add_argument("--chromium-executable", default=os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE", ""))
     parser.add_argument("--no-browser-folder-title", action="store_true")
-    parser.add_argument("--strict-browser-verify", action="store_true")
-    parser.add_argument("--verify-remote", action="store_true")
+    parser.add_argument("--browser-folder-title", dest="no_browser_folder_title", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument("--strict-browser-verify", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--verify-remote", action=argparse.BooleanOptionalAction, default=False)
     return parser
 
 
@@ -190,7 +193,7 @@ def _gdrive_source_folder_name(source: str, token_pickle: str = "") -> str:
 
         folder_id = GoogleDriveResumableUploader.extract_folder_id(source)
         token_path = Path(token_pickle or os.getenv("GDRIVE_TOKEN_PICKLE", "token.pickle"))
-        if folder_id and token_path.expanduser().exists():
+        if folder_id and (token_path.expanduser().exists() or os.getenv("GDRIVE_TOKEN_JSON", "").strip()):
             gdrive = GoogleDriveResumableUploader(token_path)
             metadata = gdrive.get_file_metadata(folder_id)
             name = _safe_default_folder_name(str(metadata.get("name", "")))
@@ -470,6 +473,7 @@ async def _run_drive_to_telegram(args: argparse.Namespace, source_type: str) -> 
 
 
 async def run(args: argparse.Namespace) -> int:
+    stage('indexing')
     source_type = _source_type(args.source, args.source_type)
     if args.up and args.to != "auto" and _target_alias(args.up) != _target_alias(args.to):
         raise ValueError(f"Conflicting destination flags: --to {args.to} and --up {args.up}")

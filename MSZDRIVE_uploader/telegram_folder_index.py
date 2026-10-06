@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import emit, stage
 
 import argparse
 import asyncio
@@ -92,6 +93,7 @@ async def run(args: argparse.Namespace) -> int:
             output = Path.cwd() / output
         if topic_title:
             print(f"Topic title: {topic_title}", flush=True)
+        stage("indexing")
         print(f"Listing Telegram topic messages from {start_message_id}...", flush=True)
         message_ids = await telegram.list_topic_message_ids(
             parsed.chat_id,
@@ -102,6 +104,7 @@ async def run(args: argparse.Namespace) -> int:
         ordered_ids = sorted(set(message_ids))
         print(f"Found {len(ordered_ids)} topic messages. Fetching text messages...", flush=True)
         for start in range(0, len(ordered_ids), args.batch_size):
+            emit("scan", done=start, total=len(ordered_ids))
             chunk = ordered_ids[start : start + args.batch_size]
             messages = await telegram.get_messages_bulk(parsed.chat_id, chunk)
             by_id = {message.id: message for message in messages}
@@ -129,6 +132,7 @@ async def run(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     print(f"Wrote {len(headings)} text headings to: {output}")
+    emit("scan", done=len(ordered_ids), total=len(ordered_ids))
     return 0
 
 

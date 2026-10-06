@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import ByteProgress, emit, stage, totals, start_file, outcome
 
 import argparse
 import asyncio
@@ -79,10 +80,12 @@ class TransferLogger:
         self.file_name = file_name
         self.total_size = total_size
         self.started_at = time.monotonic()
+        self.bot_progress = ByteProgress("downloading" if "download" in label.lower() else "uploading", file_name, total_size, operation=label)
         self.last_log_at = 0.0
         self.last_done = -1
 
     def __call__(self, done: int, total_size: int | None = None, *args) -> None:
+        self.bot_progress(done, total_size)
         total = total_size or self.total_size
         now = time.monotonic()
         complete = total is not None and done >= total
@@ -496,6 +499,7 @@ async def run(args: argparse.Namespace) -> int:
             default_folder = _safe_folder_name(topic_title, f"Telegram Topic {parsed.topic_id}")
             print(f"Topic title: {default_folder}", flush=True)
 
+        stage("indexing")
         print(f"Listing Telegram topic messages from {start_message_id}...", flush=True)
         message_ids = await telegram.list_topic_message_ids(
             parsed.chat_id,
@@ -506,6 +510,7 @@ async def run(args: argparse.Namespace) -> int:
         ordered_ids = sorted(set(message_ids))
         ordered_messages: list[object] = []
         for start in range(0, len(ordered_ids), args.batch_size):
+            emit('scan', done=start, total=len(ordered_ids))
             chunk = ordered_ids[start : start + args.batch_size]
             messages = await telegram.get_messages_bulk(parsed.chat_id, chunk)
             by_id = {message.id: message for message in messages}
@@ -514,6 +519,7 @@ async def run(args: argparse.Namespace) -> int:
                 if message is None:
                     continue
                 ordered_messages.append(message)
+            emit('scan', done=min(start + args.batch_size, len(ordered_ids)), total=len(ordered_ids))
             if start + args.batch_size < len(ordered_ids) and args.batch_delay_sec > 0:
                 await asyncio.sleep(args.batch_delay_sec)
 
@@ -526,12 +532,14 @@ async def run(args: argparse.Namespace) -> int:
         )
         print(f"Media assignment mode: {'above' if args.above else 'below'}", flush=True)
         print(f"Found {len(assignments)} media messages to process.", flush=True)
+        totals(len(assignments), sum(_media_size(m) or 0 for m, _ in assignments) if all(_media_size(m) is not None for m, _ in assignments) else None)
 
         for message, active_folder in assignments:
             total += 1
             prefix = f"[{total}]"
             planned_name = telegram_media_filename(message, use_caption=args.caption_file_names)
             known_size = _media_size(message)
+            start_file(total, planned_name, known_size)
             msz_rel, gdrive_rel = _destination_paths(args.target_folder, active_folder, planned_name)
             targets = ("msz", "gdrive") if args.target == "both" else (args.target,)
             target_paths = {"msz": msz_rel, "gdrive": gdrive_rel}
@@ -561,9 +569,11 @@ async def run(args: argparse.Namespace) -> int:
             if not pending_targets:
                 skipped += 1
                 print(f"{prefix} Skipping already uploaded: {planned_name}", flush=True)
+                outcome("skipped")
                 continue
             if args.dry_run:
                 print(f"{prefix} DRY RUN: {message.id} -> {target_paths}", flush=True)
+                outcome("skipped")
                 skipped += 1
                 continue
 
@@ -603,6 +613,7 @@ async def run(args: argparse.Namespace) -> int:
                         if msz is None:
                             raise RuntimeError("MSZ API client is unavailable.")
                         print(f"{prefix} Uploading to MSZ: {destination}", flush=True)
+                        stage("uploading", destination, file_size=size, operation="MSZ upload")
                         remote_id = await _upload_msz(
                             local_path=local_path,
                             destination_path=destination,
@@ -634,8 +645,10 @@ async def run(args: argparse.Namespace) -> int:
                         state.mark(message.id, target, destination, size, "uploaded", remote_id=file_id)
                         uploaded_targets.add(target)
                 uploaded += 1
+                outcome("uploaded")
             except Exception as exc:
                 failed += 1
+                outcome("failed")
                 item_failed = True
                 for target in pending_targets:
                     if target in uploaded_targets:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import stage, totals, start_file, outcome
 
 import argparse
 import asyncio
@@ -264,11 +265,13 @@ async def run(args: argparse.Namespace) -> int:
             if not args.url:
                 raise ValueError("--url is required for --source gdrive")
             files = await list_gdrive_folder(args.url, staging_dir)
+            totals(len(files))
             for drive_file in files:
                 rel_path = norm_rel(getattr(drive_file, "path", "") or Path(getattr(drive_file, "local_path")).name)
                 planned_item = SourceItem(path=Path(getattr(drive_file, "local_path", rel_path)), rel_path=rel_path, cleanup=True)
                 target_rel = _target_rel(args.target_folder, planned_item)
                 total += 1
+                start_file(total, rel_path)
                 progress.total = total
                 progress.refresh()
                 reason = _pre_download_skip_reason(
@@ -281,6 +284,7 @@ async def run(args: argparse.Namespace) -> int:
                 )
                 if reason:
                     skipped += 1
+                    outcome('skipped')
                     progress.set_postfix_str(f"skipped:{reason}:pre-download")
                     progress.write(f"Skipping before Google Drive download ({reason}): {target_rel}")
                     progress.update(1)
@@ -305,6 +309,7 @@ async def run(args: argparse.Namespace) -> int:
                 size = int(stat.st_size)
                 mtime = int(stat.st_mtime)
                 target_rel = _target_rel(args.target_folder, item)
+                start_file(total, target_rel, size)
                 if args.retry_failed_only and target_rel not in failed_targets:
                     skipped += 1
                     progress.set_postfix_str("not-failed")
@@ -343,6 +348,7 @@ async def run(args: argparse.Namespace) -> int:
                     continue
 
                 ensure_disk_space(staging_dir, size)
+                stage('uploading', target_rel, file_size=size)
                 if size < args.api_max_bytes:
                     if client is None:
                         raise RuntimeError("MSZ API client is unavailable.")
@@ -376,6 +382,7 @@ async def run(args: argparse.Namespace) -> int:
                 if method == "browser" and not should_verify_remote:
                     progress.write("Skipping API verification for browser upload; UI reported upload complete.")
                 if should_verify_remote:
+                    stage('verifying', target_rel, file_size=size)
                     if client is None:
                         raise RuntimeError("MSZ API client is unavailable.")
                     verified, match_kind, remote_index = await _verify_remote_upload(
@@ -426,6 +433,7 @@ async def run(args: argparse.Namespace) -> int:
                     progress.write("Stopping after first error. Use --continue-on-error to keep going.")
                     break
             finally:
+                outcome('failed' if failed_this_item else 'uploaded' if uploaded_this_item else 'skipped')
                 if not failed_this_item or args.delete_failed_downloads:
                     await cleanup_item(item)
                 elif item.cleanup:

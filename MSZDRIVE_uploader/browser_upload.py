@@ -1,7 +1,9 @@
 from __future__ import annotations
+from .progress_events import ByteProgress
 
 import asyncio
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -341,6 +343,7 @@ class MszBrowserUploader:
         )
 
     async def _wait_for_upload_completion(self, page, file_name: str, size: int, timeout_error) -> None:
+        bot_progress = ByteProgress('uploading', file_name, size, operation='MSZ upload')
         deadline = asyncio.get_running_loop().time() + max(self.timeout_ms / 1000, 120)
         last_error = None
         last_report = 0.0
@@ -360,11 +363,15 @@ class MszBrowserUploader:
                     self._log(f"upload progress: {progress_text}")
 
                 if progress_text:
+                    match = re.search(r'(\d+(?:\.\d+)?)\s*%', progress_text)
+                    if match:
+                        bot_progress(int(size * min(100, float(match.group(1))) / 100), size)
                     saw_upload_toast = True
                     if self._progress_looks_done(progress_text, size):
                         if completed_at == 0.0:
                             completed_at = now
                         if now - completed_at >= 2.0:
+                            bot_progress(size, size)
                             return
                 elif saw_upload_toast:
                     # Some builds remove the upload toast immediately after completion.

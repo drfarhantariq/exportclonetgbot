@@ -100,16 +100,14 @@ class MszApiClient:
             raise ValueError("MSZ base URL is empty.")
         if not self.api_token:
             raise ValueError("MSZ API token is empty.")
-        self.headers = {"Authorization": f"Bearer {self.api_token}"}
+        self.headers = {"Authorization": f"Bearer {self.api_token}", "Accept": "application/json"}
         self.api_base = self._resolve_api_base()
 
     def _resolve_api_base(self) -> str:
         raw = self.base_url
         candidates = []
-        if not raw.endswith("/api"):
-            candidates.append(raw + "/api")
-        if not raw.endswith("/api/v1"):
-            candidates.append(raw + "/api/v1")
+        if not raw.endswith(("/api", "/api/v1")):
+            candidates.extend([raw + "/api/v1", raw + "/api"])
         candidates.append(raw)
 
         deduped: list[str] = []
@@ -124,7 +122,7 @@ class MszApiClient:
                 response = requests.get(
                     url,
                     headers=self.headers,
-                    params={"perPage": 1},
+                    params={"per_page": 1, "section": "all"},
                     timeout=self.timeout,
                 )
                 try:
@@ -152,7 +150,7 @@ class MszApiClient:
         seen_ids: set[Any] = set()
 
         for page in range(1, max_pages + 1):
-            params = {"perPage": per_page, "page": page}
+            params = {"per_page": per_page, "page": page, "section": "all"}
             if extra_params:
                 params.update(extra_params)
             response = requests.get(
@@ -168,7 +166,8 @@ class MszApiClient:
                     )
                 break
 
-            page_entries = parse_entries(response.json())
+            payload = response.json()
+            page_entries = parse_entries(payload)
             if not page_entries:
                 break
 
@@ -181,7 +180,10 @@ class MszApiClient:
                 entries.append(entry)
                 added += 1
 
-            if added == 0 or len(page_entries) < per_page:
+            meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+            last_page = meta.get("last_page") if isinstance(meta, dict) else None
+            has_next = page < int(last_page) if str(last_page).isdigit() else len(page_entries) >= per_page
+            if added == 0 or not has_next:
                 break
 
         return entries
@@ -190,12 +192,13 @@ class MszApiClient:
         entries = self.list_entries(
             per_page=per_page,
             max_pages=max_pages,
-            extra_params={"parentIds": str(parent_id)},
+            extra_params={"section": "folder", "folder_id": str(parent_id)},
         )
+        parent_ids = set(self._source_id_candidates(str(parent_id)))
         return [
             entry
             for entry in entries
-            if str(entry.get("parent_id") or entry.get("parentId") or parent_id) == str(parent_id)
+            if str(entry.get("parent_id") or entry.get("parentId") or parent_id) in parent_ids
         ]
 
     def _augment_entries_recursively(self, entries: list[dict[str, Any]], per_page: int, max_pages: int) -> list[dict[str, Any]]:
@@ -444,6 +447,7 @@ class MszApiClient:
     def get_entry(self, entry_id: Any) -> MszEntry | None:
         entry_id_encoded = quote(str(entry_id), safe="")
         candidates = [
+            f"{self.api_base}/drive/file-entries/{entry_id_encoded}/model",
             f"{self.api_base}/drive/file-entries/{entry_id_encoded}",
             f"{self.api_base}/file-entries/{entry_id_encoded}",
             f"{self.base_url}/api/v1/drive/file-entries/{entry_id_encoded}",

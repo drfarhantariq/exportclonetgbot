@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import ByteProgress, stage, totals
 
 import asyncio
 import logging
@@ -60,17 +61,20 @@ def _media_extension(message: object, media: object | None) -> str:
 async def iter_local(path: Path) -> AsyncIterator[SourceItem]:
     path = path.expanduser().resolve()
     if path.is_file():
+        totals(1, path.stat().st_size)
         yield SourceItem(path=path, rel_path=path.name, cleanup=False)
         return
     if not path.is_dir():
         raise FileNotFoundError(path)
 
     files = sorted((item for item in path.rglob("*") if item.is_file()), key=lambda p: str(p).lower())
+    totals(len(files), sum(p.stat().st_size for p in files))
     for file_path in files:
         yield SourceItem(path=file_path, rel_path=norm_rel(str(file_path.relative_to(path))), cleanup=False)
 
 
 async def list_gdrive_folder(url: str, staging_dir: Path):
+    stage('indexing')
     try:
         import gdown
     except ImportError as exc:
@@ -116,13 +120,19 @@ async def download_gdrive_file(drive_file: object, rel_path: str, staging_dir: P
         downloaded_path = local_path
     else:
         download_output = str(local_path if local_path.suffix else local_path.parent)
-        downloaded = await asyncio.to_thread(
+        reporter = ByteProgress('downloading', rel_path)
+        download_task = asyncio.create_task(asyncio.to_thread(
             gdown.download,
             url="https://drive.google.com/uc?id=" + str(getattr(drive_file, "id")),
             output=download_output,
             quiet=False,
             use_cookies=False,
-        )
+        ))
+        while not download_task.done():
+            if local_path.is_file():
+                reporter(local_path.stat().st_size)
+            await asyncio.sleep(1)
+        downloaded = await download_task
         if not downloaded:
             raise RuntimeError(f"Google Drive download failed: {rel_path}")
         downloaded_path = Path(downloaded)

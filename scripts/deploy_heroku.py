@@ -51,6 +51,22 @@ CONFIG_KEYS = (
     "FFMPEG_BINARY",
     "FFPROBE_BINARY",
     "LOG_FILE_PATH",
+    "MSZ_BASE_URL",
+    "MSZ_API_TOKEN",
+    "MSZ_EMAIL",
+    "MSZ_PASSWORD",
+    "MSZ_API_MAX_BYTES",
+    "MSZ_TARGET_FOLDER",
+    "MSZ_BROWSER_FOLDER_URL",
+    "PLAYWRIGHT_CHROMIUM_EXECUTABLE",
+    "GDRIVE_TOKEN_JSON",
+    "GDRIVE_TOKEN_PICKLE",
+    "GDRIVE_FOLDER_ID",
+    "TG_SESSION_STRING_MSZ",
+    "TG_USE_MAIN_SESSION_AS_HELPER",
+    "TG_HELPER_SESSION_STRINGS",
+    "TG_DOWNLOAD_MODE",
+    "TELEGRAM_TARGET_TOPIC_LINK",
 )
 
 EXCLUDED_NAMES = {
@@ -356,6 +372,13 @@ def prepare_deploy_dir(source_dir: Path, deploy_dir: Path) -> None:
             shutil.copy2(item, target)
 
     procfile = deploy_dir / "Procfile"
+    # The bot bundle is flattened on Heroku; ship the sibling transfer package too.
+    transfer_package = source_dir.parent / "MSZDRIVE_uploader"
+    if transfer_package.is_dir() and not (deploy_dir / "MSZDRIVE_uploader").exists():
+        shutil.copytree(
+            transfer_package, deploy_dir / "MSZDRIVE_uploader",
+            ignore=lambda directory, names: [name for name in names if not should_copy(Path(directory) / name) or name.endswith(".ipynb")],
+        )
     if not procfile.exists():
         procfile.write_text("worker: python app.py\n", encoding="utf-8")
 

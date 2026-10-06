@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import ByteProgress, emit, stage, totals, start_file, outcome
 
 import argparse
 import asyncio
@@ -311,9 +312,11 @@ class TransferLogger:
         self.last_done = -1
         self.last_log_at = 0.0
         self.started_at = time.monotonic()
+        self.bot_progress = ByteProgress("downloading" if "download" in label.lower() else "uploading", file_name, total_size, operation=label)
         self.started_done = 0
 
     def __call__(self, done: int, total_size: int | None = None) -> None:
+        self.bot_progress(done, total_size)
         total = total_size or self.total_size
         now = time.monotonic()
         complete = total is not None and done >= total
@@ -361,6 +364,7 @@ async def run(args: argparse.Namespace) -> int:
 
     msz = MszApiClient(args.base_url, args.api_token or os.getenv("MSZ_API_TOKEN", ""))
     def _log(message: str) -> None:
+        stage("indexing", message.removeprefix("Listing MSZ folder: ") if message.startswith("Listing MSZ folder: ") else "")
         print(f"[msz] {message}", flush=True)
 
     root, entries = msz.resolve_source_entries(
@@ -390,6 +394,8 @@ async def run(args: argparse.Namespace) -> int:
         )
 
     total_files = len(entries)
+    emit("stage", stage="preparing", source=root.rel_path)
+    totals(total_files, sum(e.size or 0 for e in entries) if all(e.size is not None for e in entries) else None)
     total = uploaded = skipped = failed = 0
     try:
         async def _iter_entries():
@@ -400,19 +406,23 @@ async def run(args: argparse.Namespace) -> int:
         async for entry, local_path, rel_path in _iter_entries():
             key = str(entry.id)
             total += 1
+            start_file(total, entry.rel_path, entry.size)
             prefix = f"[{total}/{total_files}]"
             file_name = Path(rel_path).name
             try:
                 if args.retry_failed_only and key not in failed_keys:
                     skipped += 1
                     print(f"{prefix} Skipping not-failed file: {entry.rel_path}", flush=True)
+                    outcome("skipped")
                     continue
                 if not args.no_resume and state.uploaded_key(key, entry.size, rel_path):
                     skipped += 1
                     print(f"{prefix} Skipping already uploaded from state: {entry.rel_path}", flush=True)
+                    outcome("skipped")
                     continue
                 if args.dry_run:
                     print(f"{prefix} DRY RUN: {entry.rel_path} -> gdrive:{gdrive_folder_id}/{rel_path}", flush=True)
+                    outcome("skipped")
                     skipped += 1
                     continue
 
@@ -443,6 +453,7 @@ async def run(args: argparse.Namespace) -> int:
                     state.mark_uploaded(key, existing["id"], local_path)
                     skipped += 1
                     print(f"{prefix} Skipping existing Google Drive file: {rel_path}", flush=True)
+                    outcome("skipped")
                     await asyncio.to_thread(local_path.unlink, missing_ok=True)
                     continue
 
@@ -462,10 +473,12 @@ async def run(args: argparse.Namespace) -> int:
                 upload_progress(entry.size or local_path.stat().st_size, entry.size)
                 state.mark_uploaded(key, file_id, local_path)
                 uploaded += 1
+                outcome("uploaded")
                 print(f"{prefix} Uploaded: {rel_path}", flush=True)
                 await asyncio.to_thread(local_path.unlink, missing_ok=True)
             except Exception as exc:
                 failed += 1
+                outcome("failed")
                 state.mark_failed(key, str(exc))
                 _append_failed_log(
                     failed_log,

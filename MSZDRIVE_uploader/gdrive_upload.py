@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import mimetypes
+import json
+import os
 import pickle
 import time
 from pathlib import Path
@@ -34,10 +36,17 @@ class GoogleDriveResumableUploader:
                 "google-auth-httplib2, and google-auth-oauthlib."
             ) from exc
 
-        if not self.token_pickle.exists():
+        token_json = os.getenv("GDRIVE_TOKEN_JSON", "").strip()
+        if token_json:
+            from google.oauth2.credentials import Credentials
+
+            credentials = Credentials.from_authorized_user_info(json.loads(token_json))
+        elif not self.token_pickle.exists():
             raise FileNotFoundError(f"Google Drive token pickle not found: {self.token_pickle}")
-        with self.token_pickle.open("rb") as handle:
-            credentials = pickle.load(handle)
+        else:
+            with self.token_pickle.open("rb") as handle:
+                credentials = pickle.load(handle)
+        self.credentials = credentials
         return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
     @staticmethod
@@ -188,26 +197,19 @@ class GoogleDriveResumableUploader:
         output_path: Path,
         *,
         progress_callback: Callable[[int, int | None], None] | None = None,
-        chunk_size: int = 8 * 1024 * 1024,
+        chunk_size: int = 100 * 1024 * 1024,
+        expected_size: int | None = None,
     ) -> Path:
-        from googleapiclient.http import MediaIoBaseDownload
+        from google.auth.transport.requests import AuthorizedSession
+        from .gdrive_download import download
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = output_path.with_suffix(output_path.suffix + ".part")
-        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        with temp_path.open("wb") as handle:
-            downloader = MediaIoBaseDownload(handle, request, chunksize=chunk_size)
-            done = False
-            total_size = None
-            while not done:
-                status, done = downloader.next_chunk()
-                if status is not None:
-                    total_size = int(getattr(status, "total_size", 0) or 0) or total_size
-                    if progress_callback is not None:
-                        uploaded = int((total_size or 0) * status.progress()) if total_size else temp_path.stat().st_size
-                        progress_callback(uploaded, total_size)
-        temp_path.replace(output_path)
-        return output_path
+        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True)
+        if expected_size is None:
+            metadata = self.get_file_metadata(file_id)
+            expected_size = int(metadata["size"]) if metadata.get("size") is not None else None
+        with AuthorizedSession(self.credentials) as session:
+            return download(session, request.uri, output_path, total_size=expected_size,
+                            chunk_size=chunk_size, progress_callback=progress_callback)
 
     def existing_file_matches(self, parent_id: str, name: str, size: int | None) -> dict | None:
         existing = self.find_child(parent_id, name)

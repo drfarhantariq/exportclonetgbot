@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the browser in the slug; Ubuntu's Chromium apt package is a Snap launcher.
+export PLAYWRIGHT_BROWSERS_PATH="${BUILD_DIR:-$PWD}/.playwright-browsers"
+python -m playwright install --only-shell chromium

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .progress_events import ByteProgress, emit, stage, totals, start_file, outcome
 
 import argparse
 import asyncio
@@ -169,10 +170,12 @@ class TransferLogger:
         self.file_name = file_name
         self.total_size = total_size
         self.started_at = time.monotonic()
+        self.bot_progress = ByteProgress("downloading" if "download" in label.lower() else "uploading", file_name, total_size, operation=label)
         self.last_log_at = 0.0
         self.last_done = -1
 
     def __call__(self, done: int, total_size: int | None = None, *args) -> None:
+        self.bot_progress(done, total_size)
         total = total_size or self.total_size
         now = time.monotonic()
         complete = total is not None and done >= total
@@ -448,6 +451,7 @@ async def run(args: argparse.Namespace) -> int:
     state_file = Path(args.state_file) if args.state_file else runtime_dir / "state" / "drive_to_telegram_state.json"
     failed_log = Path(args.failed_log) if args.failed_log else runtime_dir / "logs" / "drive_to_telegram_failed.jsonl"
     staging_dir.mkdir(parents=True, exist_ok=True)
+    stage("indexing")
 
     if args.source_type == "gdrive":
         source_client, files = _gdrive_source_files(args)
@@ -457,6 +461,7 @@ async def run(args: argparse.Namespace) -> int:
         download_label = "MSZ download"
 
     files = sorted(files, key=lambda item: natural_sort_key(item.rel_path))
+    totals(len(files), sum(e.size or 0 for e in files) if all(e.size is not None for e in files) else None)
     load_settings, parse_export_link, TelegramService = _heroku_imports()
     settings, _ = load_settings(args.config)
     parsed = parse_export_link(target_link)
@@ -473,6 +478,7 @@ async def run(args: argparse.Namespace) -> int:
     try:
         for source_file in files:
             total += 1
+            start_file(total, source_file.rel_path, source_file.size)
             prefix = f"[{total}/{len(files)}]"
             key = TelegramUploadState.file_key(
                 args.source_type,
@@ -487,14 +493,17 @@ async def run(args: argparse.Namespace) -> int:
                 if args.retry_failed_only and key not in failed_keys:
                     skipped += 1
                     print(f"{prefix} Skipping not-failed file: {source_file.rel_path}", flush=True)
+                    outcome("skipped")
                     continue
                 if not args.no_resume and state.uploaded_file(key):
                     skipped += 1
                     print(f"{prefix} Skipping already uploaded: {source_file.rel_path}", flush=True)
+                    outcome("skipped")
                     continue
                 folder_path = _folder_path(source_file.rel_path)
                 if args.dry_run:
                     print(f"{prefix} DRY RUN: folders={folder_path or '(root)'} file={source_file.rel_path}", flush=True)
+                    outcome("skipped")
                     skipped += 1
                     continue
                 for folder_full_path, folder_name in _folders_for_path(folder_path):
@@ -520,6 +529,7 @@ async def run(args: argparse.Namespace) -> int:
                             source_file.source_id,
                             local_path,
                             progress_callback=download_progress,
+                            expected_size=source_file.size,
                         )
                     else:
                         await asyncio.to_thread(
@@ -556,10 +566,12 @@ async def run(args: argparse.Namespace) -> int:
                     telegram_message_id=message_id,
                 )
                 uploaded += 1
+                outcome("uploaded")
                 if not args.keep_downloads:
                     await asyncio.to_thread(local_path.unlink, missing_ok=True)
             except Exception as exc:
                 failed += 1
+                outcome("failed")
                 state.mark_file(
                     key,
                     "failed",
