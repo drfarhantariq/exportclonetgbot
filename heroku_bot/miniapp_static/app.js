@@ -973,4 +973,4 @@ window.addEventListener("hashchange", () => {
 if (names[location.hash.slice(1)]) app.view = location.hash.slice(1);
 render();
 poll();
-setInterval(poll, 3000);
+setInterval(poll, 2000);
