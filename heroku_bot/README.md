@@ -14,6 +14,7 @@ It persists task profiles and queues in MongoDB. Run one worker for chat-only us
 Send `/app` in a private bot chat, or tap the **Open App** menu button. MSZ Workspace includes:
 
 - A responsive dashboard with live overall and current-file progress, routes, timings, results, and system stats.
+- Light and dark themes with a sun/moon switch in the top bar. The app initially follows Telegram's theme (or your device theme outside Telegram), then remembers your chosen appearance on that device.
 - Builders for clone, transfer, export, and index tasks; edited-index uploads; shared task queues with reorder, remove, and clear controls.
 - Task history, details, cancellation, and saved-profile resume.
 - All saved settings, credential imports, Telegram account login, bot restart, logs, and a command console.
